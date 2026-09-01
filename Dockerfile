@@ -5,6 +5,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Install Deno for yt-dlp YouTube EJS support
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl unzip ca-certificates \
+    && curl -fsSL https://deno.land/install.sh | sh \
+    && ln -s /root/.deno/bin/deno /usr/local/bin/deno \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+    
 COPY pyproject.toml ./
 COPY app ./app
 
