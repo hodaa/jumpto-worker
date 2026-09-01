@@ -54,9 +54,20 @@ def _fetch_from_yt_dlp(youtube_url: str) -> MediaInfo:
     """Fetch live metadata with yt-dlp (no download)."""
     import yt_dlp  # Optional dependency, only needed for live calls
 
-    options: dict = {"quiet": True, "no_warnings": True}
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(youtube_url, download=False)
-    title = str(info.get("title") or "Untitled video")
-    duration = int(info.get("duration") or 0)
-    return MediaInfo(title=title, duration_seconds=duration)
+    options: dict = {"quiet": True, "no_warnings": True,  "noplaylist": True}
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(youtube_url, download=False)
+        title = str(info.get("title") or "Untitled video")
+        duration = int(info.get("duration") or 0)
+        return MediaInfo(title=title, duration_seconds=duration)
+    except yt_dlp.utils.DownloadError as exc:
+        logger.exception(
+            "yt-dlp failed to fetch video metadata",
+            youtube_url=youtube_url,
+            error=str(exc),
+        )
+        raise ExternalServiceError(
+            "Could not fetch video metadata",
+            service="yt-dlp",
+        ) from exc
