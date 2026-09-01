@@ -45,6 +45,11 @@ class Settings(BaseSettings):
         default="redis://localhost:6379/0",
         description="Redis connection URL used as the Celery broker",
     )
+    celery_worker_concurrency: int = Field(
+        default=8,
+        ge=1,
+        description="How many worker processes Celery should spawn for this service",
+    )
 
     # Job / transcription timeout
     job_timeout_seconds: int = Field(

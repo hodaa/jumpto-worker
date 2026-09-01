@@ -24,3 +24,4 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_acks_late=True,
 )
+celery_app.conf.worker_concurrency = settings.celery_worker_concurrency
