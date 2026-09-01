@@ -18,6 +18,8 @@ celery_app.conf.broker_use_ssl = {
     "ssl_cert_reqs": ssl.CERT_REQUIRED,
 }
 
+celery_app.conf.broker_connection_retry_on_startup = True
+
 celery_app.conf.result_backend = None
 
 celery_app.conf.update(
