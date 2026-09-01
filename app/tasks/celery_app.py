@@ -1,7 +1,8 @@
 """Celery application configuration for the JumpTo worker."""
-import ssl
-from celery import Celery
 
+import ssl
+
+from celery import Celery
 
 from app.core.config import get_settings
 
@@ -10,16 +11,13 @@ settings = get_settings()
 celery_app = Celery(
     "jumpto-worker",
     broker=settings.redis_url,
-    backend=settings.redis_url,
     include=["app.tasks.transcription"],
 )
+
 celery_app.conf.broker_use_ssl = {
     "ssl_cert_reqs": ssl.CERT_REQUIRED,
 }
 
-celery_app.conf.redis_backend_use_ssl = {
-    "ssl_cert_reqs": ssl.CERT_REQUIRED,
-}
 celery_app.conf.result_backend = None
 
 celery_app.conf.update(
@@ -33,4 +31,5 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_acks_late=True,
 )
+
 celery_app.conf.worker_concurrency = settings.celery_worker_concurrency
