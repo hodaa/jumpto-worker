@@ -20,7 +20,7 @@ jobs:
           username: opc
           key: ${{ secrets.ORACLE_SSH_KEY }}
           script: |
-            cd ~/jumpto
+            cd ~/jumpto-worker
             git pull origin main
             docker stop jumpto-worker || true
             docker rm jumpto-worker || true
