@@ -10,6 +10,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Test SSH port
+        run: |
+          nc -vz -w 10 ${{ secrets.ORACLE_HOST }} 22
       - name: Deploy to Oracle
         uses: appleboy/ssh-action@v1
         with:
