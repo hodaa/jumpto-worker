@@ -1,6 +1,7 @@
 """Celery application configuration for the JumpTo worker."""
-
+import ssl
 from celery import Celery
+
 
 from app.core.config import get_settings
 
@@ -12,6 +13,14 @@ celery_app = Celery(
     backend=settings.redis_url,
     include=["app.tasks.transcription"],
 )
+celery_app.conf.broker_use_ssl = {
+    "ssl_cert_reqs": ssl.CERT_REQUIRED,
+}
+
+celery_app.conf.redis_backend_use_ssl = {
+    "ssl_cert_reqs": ssl.CERT_REQUIRED,
+}
+celery_app.conf.result_backend = None
 
 celery_app.conf.update(
     task_serializer="json",

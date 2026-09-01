@@ -7,3 +7,4 @@ __pycache__/
 htmlcov/
 *.egg-info/
 .DS_Store
+ssh-key.key
