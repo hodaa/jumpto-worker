@@ -1,7 +1,6 @@
 """Celery tasks for video transcription."""
 
 import asyncio
-import os
 from dataclasses import dataclass
 
 from app.core.config import get_settings
@@ -9,6 +8,7 @@ from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.client.backend import BackendClient
 from app.providers.media import get_media_info
+from app.tasks.celery_app import celery_app  # ✅ CORRECT IMPORT
 
 logger = get_logger(__name__)
 
@@ -27,12 +27,29 @@ class Job:
     status: str
 
 
+# ✅ CELERY TASK DECORATOR
+@celery_app.task(bind=True, max_retries=3)
 def download_and_transcribe(self, job_id: str) -> dict:
     """
     ✅ Celery task entry point.
-    Runs the async pipeline.
+    Runs the async transcription pipeline.
+    
+    Args:
+        job_id: ID of the job to process
+    
+    Returns:
+        Dictionary with completion status and video_id
     """
-    return asyncio.run(run_pipeline(job_id))
+    try:
+        logger.info("Starting task", job_id=job_id)
+        result = asyncio.run(run_pipeline(job_id))
+        logger.info("Task completed successfully", job_id=job_id)
+        return result
+        
+    except Exception as exc:
+        logger.error("Task failed", job_id=job_id, exc_info=True)
+        # Retry with exponential backoff
+        raise self.retry(exc=exc, countdown=60, max_retries=3)
 
 
 async def run_pipeline(job_id: str) -> dict:
@@ -55,7 +72,6 @@ async def run_pipeline(job_id: str) -> dict:
 
         await client.advance_job(job_id)
         
-        # ✅ NEW: Call async transcription directly (no timeout wrapper yet)
         submission = await asyncio.wait_for(
             _perform_transcription(job, report),
             timeout=settings.job_timeout_seconds,
@@ -101,7 +117,7 @@ async def _perform_transcription(
     report: callable,
 ) -> dict:
     """
-    ✅ NEW: Perform transcription using Assembly.ai YouTube support.
+    ✅ Perform transcription using Assembly.ai YouTube support.
     NO yt-dlp, NO bot detection, NO local audio download!
     """
     logger.info(
