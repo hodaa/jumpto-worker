@@ -280,16 +280,52 @@ class AssemblyTranscriptProvider(TranscriptProvider):
         self.base_url = base_url
 
     async def fetch(self, youtube_url: str) -> TranscriptData:
-        """Download the audio and transcribe it via Assembly.ai."""
-        audio_path = await asyncio.to_thread(_download_audio, youtube_url)
-        try:
-            headers = {"authorization": self.api_key}
-            async with httpx.AsyncClient() as client:
-                upload_url = await self._upload(client, headers, audio_path)
-                transcript_id = await self._submit(client, headers, upload_url)
-                return await self._poll(client, headers, transcript_id)
-        finally:
-            _remove_file(audio_path)
+        """
+        ✅ SOLUTION 1: Pass YouTube URL directly to Assembly.ai.
+        NO audio download, NO yt-dlp, NO bot detection!
+        """
+        headers = {"authorization": self.api_key}
+        async with httpx.AsyncClient() as client:
+            # ✅ Pass YouTube URL directly (skip download & upload)
+            transcript_id = await self._submit_youtube(client, headers, youtube_url)
+            # Poll for completion (same as before)
+            return await self._poll(client, headers, transcript_id)
+
+    async def _submit_youtube(
+        self, 
+        client: httpx.AsyncClient, 
+        headers: dict, 
+        youtube_url: str
+    ) -> str:
+        """
+        ✅ NEW: Submit YouTube URL directly to Assembly.ai.
+        Assembly.ai will download the audio internally.
+        """
+        logger.info("Submitting YouTube URL to Assembly.ai", youtube_url=youtube_url)
+        
+        response = await client.post(
+            f"{self.base_url}/transcript",
+            headers=headers,
+            json={
+                "audio_url": youtube_url,  # ← YouTube URL directly!
+                "language_detection": True,  # Auto-detect language
+            },
+        )
+        
+        if response.status_code != 200:
+            logger.error(
+                "Assembly submit failed", 
+                status_code=response.status_code, 
+                body=response.text[:300]
+            )
+            raise ExternalServiceError(
+                "Transcription service rejected the request", 
+                service="assemblyai"
+            )
+        
+        transcript_id = response.json()["id"]
+        logger.info("Assembly job created", transcript_id=transcript_id)
+        return transcript_id
 
     async def _upload(self, client: httpx.AsyncClient, headers: dict, path: str) -> str:
         """Upload an audio file and return its public upload_url."""
