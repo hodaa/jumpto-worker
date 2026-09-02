@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
+from app.providers.ytdlp import build_ydlp_options
 
 logger = get_logger(__name__)
 
@@ -54,7 +55,7 @@ def _fetch_from_yt_dlp(youtube_url: str) -> MediaInfo:
     """Fetch live metadata with yt-dlp (no download)."""
     import yt_dlp  # Optional dependency, only needed for live calls
 
-    options: dict = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    options = build_ydlp_options()
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(youtube_url, download=False)
