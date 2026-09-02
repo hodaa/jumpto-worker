@@ -58,6 +58,7 @@ async def run_pipeline(job_id: str) -> dict:
         await client.complete_job(job_id)
     except Exception as exc:
         error = _user_safe_message(exc)
+        logger.exception(exc)
         logger.exception("Transcription pipeline failed", job_id=job_id, error=error)
         try:
             await client.fail_job(job_id, error)

@@ -1,0 +1,21 @@
+services:
+  bgutil-pot:
+    image: brainicism/bgutil-ytdlp-pot-provider
+    container_name: bgutil-pot
+    restart: unless-stopped
+
+  worker:
+    build: .
+    container_name: jumpto-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      - bgutil-pot
+    command:
+      - celery
+      - -A
+      - app.tasks.celery_app.celery_app
+      - worker
+      - --loglevel=info
+      - --concurrency=8
