@@ -17,8 +17,6 @@ from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 
 
-COOKIE_FILE = os.environ.get("YTDLP_COOKIE_FILE") 
-
 logger = get_logger(__name__)
 
 _ASSEMBLY_BASE_URL = "https://api.assemblyai.com/v2"
@@ -358,8 +356,9 @@ def _download_audio(youtube_url: str) -> str:
         "format": "bestaudio/best",
         "outtmpl": path,
     }
-    if COOKIE_FILE:
-        options["cookiefile"] = COOKIE_FILE
+    cookie_file = get_settings().resolved_ytdlp_cookie_file
+    if cookie_file:
+        options["cookiefile"] = cookie_file
     try:
         _run_download(options, youtube_url)
         if not destination.exists() or destination.stat().st_size == 0:

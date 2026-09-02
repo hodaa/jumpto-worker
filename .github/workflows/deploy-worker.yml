@@ -22,12 +22,4 @@ jobs:
           script: |
             cd ~/jumpto-worker
             git pull origin main
-            docker stop jumpto-worker || true
-            docker rm jumpto-worker || true
-            docker build -t jumpto-worker .
-            docker run -d \
-              --name jumpto-worker \
-              --restart unless-stopped \
-              --env-file .env \
-              jumpto-worker
-              
+            docker compose up -d --build --force-recreate worker

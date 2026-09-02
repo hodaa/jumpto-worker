@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Annotated
 
@@ -80,6 +81,26 @@ class Settings(BaseSettings):
         default="real",
         description="Transcript mode: real or fake",
     )
+
+    # yt-dlp cookie file (shared across providers)
+    ytdlp_cookie_file: str = Field(
+        default="",
+        description="Path to a Netscape cookie file for yt-dlp (YTDLP_COOKIE_FILE env var)",
+    )
+
+    @property
+    def resolved_ytdlp_cookie_file(self) -> str | None:
+        """Return cookie file path if set and exists, else None."""
+        path = self.ytdlp_cookie_file or os.environ.get("YTDLP_COOKIE_FILE", "")
+        if path and os.path.isfile(path):
+            return path
+        if path:
+            from app.core.logging import get_logger
+
+            get_logger(__name__).warning(
+                "YTDLP_COOKIE_FILE set but file not found", path=path
+            )
+        return None
 
     @property
     def is_development(self) -> bool:
