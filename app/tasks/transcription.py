@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
-from app.infrastructure.clients.backend import BackendClient
+from app.client.backend import BackendClient
 from app.providers.media import get_media_info
 
 logger = get_logger(__name__)
