@@ -20,44 +20,26 @@ class MediaInfo:
     title: str
     duration_seconds: int
 
-
-def get_media_info(video_id: str, youtube_url: str) -> MediaInfo:
+async def get_media_info(youtube_video_id: str, youtube_url: str) -> dict:
     """
-    Return media info, using live yt-dlp only when explicitly enabled.
-
-    Args:
-        video_id: YouTube video ID
-        youtube_url: Original YouTube URL
-
-    Returns:
-        MediaInfo with title and duration
+    ✅ Get video metadata using Assembly.ai.
+    NO yt-dlp, NO bot detection!
     """
-    if get_settings().jumpto_live_external_calls:
-        try:
-            return _fetch_from_yt_dlp(youtube_url)
+    # Get the transcript provider
+    provider = get_transcript_provider()
+    
+    # Fetch transcript (Assembly.ai handles YouTube download)
+    transcript_data = await provider.fetch(youtube_url)
+    
+    # Return video info
+    return {
+        "video_id": youtube_video_id,
+        "youtube_url": youtube_url,
+        "language": transcript_data.language,
+        "text": transcript_data.text,
+        "words": transcript_data.words,
+    }
 
-        except ExternalServiceError as exc:
-            logger.error(
-                "yt-dlp media fetch failed",
-                video_id=video_id,
-                youtube_url=youtube_url,
-                error=str(exc),
-            )
-            raise
-
-        except Exception as exc:
-            logger.error(
-                "yt-dlp media fetch failed",
-                video_id=video_id,
-                youtube_url=youtube_url,
-                error=str(exc),
-            )
-            raise ExternalServiceError(
-                "Could not fetch video metadata",
-                service="yt-dlp",
-            ) from exc
-
-    return _fake_media_info(video_id)
 
 def _fake_media_info(video_id: str) -> MediaInfo:
     """Build deterministic media info without external calls."""
