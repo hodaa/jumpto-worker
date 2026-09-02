@@ -16,7 +16,6 @@ from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 
-
 logger = get_logger(__name__)
 
 _ASSEMBLY_BASE_URL = "https://api.assemblyai.com/v2"
@@ -100,7 +99,7 @@ class FakeTranscriptProvider(TranscriptProvider):
         return TranscriptData(language="en", text=text, words=words)
 
 
-_SUPPORTED_CAPTION_LANGUAGES = ("en", "ar", "de")
+_SUPPORTED_CAPTION_LANGUAGES = ("en", "ar")
 
 
 class YouTubeCaptionTranscriptProvider(TranscriptProvider):
@@ -280,52 +279,16 @@ class AssemblyTranscriptProvider(TranscriptProvider):
         self.base_url = base_url
 
     async def fetch(self, youtube_url: str) -> TranscriptData:
-        """
-        ✅ SOLUTION 1: Pass YouTube URL directly to Assembly.ai.
-        NO audio download, NO yt-dlp, NO bot detection!
-        """
-        headers = {"authorization": self.api_key}
-        async with httpx.AsyncClient() as client:
-            # ✅ Pass YouTube URL directly (skip download & upload)
-            transcript_id = await self._submit_youtube(client, headers, youtube_url)
-            # Poll for completion (same as before)
-            return await self._poll(client, headers, transcript_id)
-
-    async def _submit_youtube(
-        self, 
-        client: httpx.AsyncClient, 
-        headers: dict, 
-        youtube_url: str
-    ) -> str:
-        """
-        ✅ NEW: Submit YouTube URL directly to Assembly.ai.
-        Assembly.ai will download the audio internally.
-        """
-        logger.info("Submitting YouTube URL to Assembly.ai", youtube_url=youtube_url)
-        
-        response = await client.post(
-            f"{self.base_url}/transcript",
-            headers=headers,
-            json={
-                "audio_url": youtube_url,  # ← YouTube URL directly!
-                "language_detection": True,  # Auto-detect language
-            },
-        )
-        
-        if response.status_code != 200:
-            logger.error(
-                "Assembly submit failed", 
-                status_code=response.status_code, 
-                body=response.text[:300]
-            )
-            raise ExternalServiceError(
-                "Transcription service rejected the request", 
-                service="assemblyai"
-            )
-        
-        transcript_id = response.json()["id"]
-        logger.info("Assembly job created", transcript_id=transcript_id)
-        return transcript_id
+        """Download the audio and transcribe it via Assembly.ai."""
+        audio_path = await asyncio.to_thread(_download_audio, youtube_url)
+        try:
+            headers = {"authorization": self.api_key}
+            async with httpx.AsyncClient() as client:
+                upload_url = await self._upload(client, headers, audio_path)
+                transcript_id = await self._submit(client, headers, upload_url)
+                return await self._poll(client, headers, transcript_id)
+        finally:
+            _remove_file(audio_path)
 
     async def _upload(self, client: httpx.AsyncClient, headers: dict, path: str) -> str:
         """Upload an audio file and return its public upload_url."""
@@ -382,75 +345,31 @@ class AssemblyTranscriptProvider(TranscriptProvider):
 
 def _download_audio(youtube_url: str) -> str:
     """Download a YouTube audio stream to a temp file and return its path."""
-    import os
-    import shutil
-    import tempfile
-
     fd, path = tempfile.mkstemp(suffix=".webm")
     os.close(fd)
-
     destination = Path(path)
     destination.unlink(missing_ok=True)
-
     options: dict = {
         "quiet": True,
         "no_warnings": True,
         "format": "bestaudio/best",
         "outtmpl": path,
     }
-
-    cookie_file = get_settings().resolved_ytdlp_cookie_file
-    temp_cookie_file = None
-
     try:
-        if cookie_file:
-            fd, temp_cookie_file = tempfile.mkstemp(
-                prefix="jumpto-cookies-",
-                suffix=".txt",
-                dir="/tmp",
-            )
-            os.close(fd)
-
-            os.chmod(temp_cookie_file, 0o600)
-            shutil.copyfile(cookie_file, temp_cookie_file)
-
-            options["cookiefile"] = temp_cookie_file
-
         _run_download(options, youtube_url)
-
         if not destination.exists() or destination.stat().st_size == 0:
             logger.error("Audio download produced no file", path=path)
-            raise ExternalServiceError(
-                "Audio download produced no file",
-                service="yt-dlp",
-            )
-
+            raise ExternalServiceError("Audio download produced no file", service="yt-dlp")
         return path
-
     except ExternalServiceError:
         _remove_file(path)
         raise
-
     except Exception as exc:
         _remove_file(path)
-        logger.error(
-            "Audio download failed",
-            youtube_url=youtube_url,
-            error=str(exc),
-        )
-        raise ExternalServiceError(
-            "Could not download audio",
-            service="yt-dlp",
-        ) from exc
+        logger.error("Audio download failed", error=str(exc))
+        raise ExternalServiceError("Could not download audio", service="yt-dlp") from exc
 
-    finally:
-        if temp_cookie_file:
-            try:
-                os.remove(temp_cookie_file)
-            except FileNotFoundError:
-                pass
 
-            
 def _run_download(options: dict, youtube_url: str) -> None:
     """Run a yt-dlp audio download for a URL."""
     import yt_dlp
