@@ -5,7 +5,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install Deno for yt-dlp YouTube EJS support
 # Install ffmpeg + Deno for yt-dlp YouTube EJS support
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -17,11 +16,13 @@ RUN apt-get update \
     && ln -s /root/.deno/bin/deno /usr/local/bin/deno \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-    
+
 COPY pyproject.toml ./
 COPY app ./app
 
 RUN pip install --no-cache-dir .
 
-# Run the Celery worker (concurrency 8)
+# Install yt-dlp PO Token provider plugin
+RUN pip install --no-cache-dir bgutil-ytdlp-pot-provider
+
 CMD ["celery", "-A", "app.tasks.celery_app.celery_app", "worker", "--loglevel=info", "--concurrency=8"]
