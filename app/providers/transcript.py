@@ -346,34 +346,75 @@ class AssemblyTranscriptProvider(TranscriptProvider):
 
 def _download_audio(youtube_url: str) -> str:
     """Download a YouTube audio stream to a temp file and return its path."""
+    import os
+    import shutil
+    import tempfile
+
     fd, path = tempfile.mkstemp(suffix=".webm")
     os.close(fd)
+
     destination = Path(path)
     destination.unlink(missing_ok=True)
+
     options: dict = {
         "quiet": True,
         "no_warnings": True,
         "format": "bestaudio/best",
         "outtmpl": path,
     }
+
     cookie_file = get_settings().resolved_ytdlp_cookie_file
-    if cookie_file:
-        options["cookiefile"] = cookie_file
+    temp_cookie_file = None
+
     try:
+        if cookie_file:
+            fd, temp_cookie_file = tempfile.mkstemp(
+                prefix="jumpto-cookies-",
+                suffix=".txt",
+                dir="/tmp",
+            )
+            os.close(fd)
+
+            os.chmod(temp_cookie_file, 0o600)
+            shutil.copyfile(cookie_file, temp_cookie_file)
+
+            options["cookiefile"] = temp_cookie_file
+
         _run_download(options, youtube_url)
+
         if not destination.exists() or destination.stat().st_size == 0:
             logger.error("Audio download produced no file", path=path)
-            raise ExternalServiceError("Audio download produced no file", service="yt-dlp")
+            raise ExternalServiceError(
+                "Audio download produced no file",
+                service="yt-dlp",
+            )
+
         return path
+
     except ExternalServiceError:
         _remove_file(path)
         raise
+
     except Exception as exc:
         _remove_file(path)
-        logger.error("Audio download failed", error=str(exc))
-        raise ExternalServiceError("Could not download audio", service="yt-dlp") from exc
+        logger.error(
+            "Audio download failed",
+            youtube_url=youtube_url,
+            error=str(exc),
+        )
+        raise ExternalServiceError(
+            "Could not download audio",
+            service="yt-dlp",
+        ) from exc
 
+    finally:
+        if temp_cookie_file:
+            try:
+                os.remove(temp_cookie_file)
+            except FileNotFoundError:
+                pass
 
+            
 def _run_download(options: dict, youtube_url: str) -> None:
     """Run a yt-dlp audio download for a URL."""
     import yt_dlp
