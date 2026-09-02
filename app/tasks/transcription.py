@@ -1,12 +1,12 @@
 """Celery tasks for video transcription."""
 
 import asyncio
-from dataclasses import dataclass
 
 from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.client.backend import BackendClient
+from app.models import JobData
 from app.providers.media import get_media_info
 from app.tasks.celery_app import celery_app  # ✅ CORRECT IMPORT
 
@@ -16,15 +16,6 @@ logger = get_logger(__name__)
 PROGRESS_FETCH = 20
 PROGRESS_PARSE = 50
 PROGRESS_STORE = 80
-
-
-@dataclass
-class Job:
-    """Job data from backend."""
-    id: str
-    youtube_url: str
-    youtube_video_id: str
-    status: str
 
 
 # ✅ CELERY TASK DECORATOR
@@ -113,7 +104,7 @@ async def run_pipeline(job_id: str) -> dict:
 
 
 async def _perform_transcription(
-    job: Job,
+    job: JobData,
     report: callable,
 ) -> dict:
     """
@@ -122,7 +113,7 @@ async def _perform_transcription(
     """
     logger.info(
         "Starting transcription",
-        job_id=job.id,
+        job_id=job.job_id,
         youtube_url=job.youtube_url,
     )
     
@@ -130,7 +121,7 @@ async def _perform_transcription(
         # ✅ Step 1: Fetch media info and transcript from Assembly.ai
         await report(PROGRESS_FETCH)
         
-        logger.info("Fetching media from Assembly.ai", job_id=job.id)
+        logger.info("Fetching media from Assembly.ai", job_id=job.job_id)
         
         media = await get_media_info(
             job.youtube_video_id,
@@ -139,7 +130,7 @@ async def _perform_transcription(
         
         logger.info(
             "Media fetched successfully",
-            job_id=job.id,
+            job_id=job.job_id,
             language=media["language"],
             word_count=len(media["words"])
         )
@@ -164,14 +155,14 @@ async def _perform_transcription(
         
         logger.info(
             "Transcription completed successfully",
-            job_id=job.id,
+            job_id=job.job_id,
             word_count=len(submission["words"])
         )
         
         return submission
     
     except asyncio.TimeoutError:
-        logger.error("Assembly.ai transcription timed out", job_id=job.id)
+        logger.error("Assembly.ai transcription timed out", job_id=job.job_id)
         raise ExternalServiceError(
             "Transcription timed out - video too long or Assembly.ai unavailable",
             service="assembly"
@@ -180,7 +171,7 @@ async def _perform_transcription(
     except ExternalServiceError as e:
         logger.error(
             "Assembly.ai service error",
-            job_id=job.id,
+            job_id=job.job_id,
             error=str(e),
             service=e.service
         )
@@ -189,7 +180,7 @@ async def _perform_transcription(
     except Exception as e:
         logger.error(
             "Unexpected transcription error",
-            job_id=job.id,
+            job_id=job.job_id,
             error=str(e),
             exc_info=True
         )
