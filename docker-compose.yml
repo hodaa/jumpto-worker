@@ -3,7 +3,6 @@ services:
     image: brainicism/bgutil-ytdlp-pot-provider
     container_name: bgutil-pot
     restart: unless-stopped
-
   worker:
     build: .
     container_name: jumpto-worker
