@@ -90,7 +90,7 @@ class TestRunPipeline:
         settings = _settings(live_calls=False)
         monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
 
-        async def fake_fetch(url: str):
+        async def fake_fetch(url: str, on_progress=None):
             return _transcript()
 
         monkeypatch.setattr(transcription_module, "get_media_info", lambda *a: _media())
@@ -191,7 +191,7 @@ class TestFetchTranscriptWithRetry:
         monkeypatch.setattr(transcription_module, "_RETRY_ATTEMPTS", 2)
         monkeypatch.setattr(transcription_module, "_RETRY_DELAY_SECONDS", 0)
 
-        def fail(url):
+        def fail(url, on_progress=None):
             raise ExternalServiceError("boom", service="assemblyai")
 
         fallback = AsyncMock()

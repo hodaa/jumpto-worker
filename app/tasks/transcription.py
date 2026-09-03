@@ -1,6 +1,7 @@
 """Transcription pipeline task for the JumpTo worker."""
 
 import asyncio
+from collections.abc import Awaitable, Callable
 
 from app.client import BackendClient
 from app.core.config import get_settings
@@ -73,8 +74,18 @@ async def _perform_transcription(job, report) -> TranscriptSubmission:
     """Fetch media metadata and transcript, then build a submission payload."""
     await report(PROGRESS_MEDIA)
     media = await asyncio.to_thread(get_media_info, job.youtube_video_id, job.youtube_url)
-    transcript = await _fetch_transcript_with_retry(job.youtube_url)
-    await report(PROGRESS_TRANSCRIPT)
+
+    last_sent: int = PROGRESS_MEDIA
+
+    async def report_progress(progress: int) -> None:
+        """Report transcript progress only when it advances past the last value."""
+        nonlocal last_sent
+        if progress > last_sent:
+            last_sent = progress
+            await report(progress)
+
+    transcript = await _fetch_transcript_with_retry(job.youtube_url, report_progress)
+    await report_progress(PROGRESS_TRANSCRIPT)
     return _build_submission(media, transcript)
 
 
@@ -108,9 +119,17 @@ def download_and_transcribe(self, job_id: str) -> dict:
     return {"status": "completed"}
 
 
-async def _fetch_transcript_with_retry(youtube_url: str) -> TranscriptData:
+async def _fetch_transcript_with_retry(
+    youtube_url: str,
+    on_progress: Callable[[int], Awaitable[None]] | None = None,
+) -> TranscriptData:
     """Fetch a transcript, retrying transient external failures."""
     if _live_pipeline_enabled():
+        if on_progress is not None:
+            try:
+                await on_progress(50)
+            except Exception:
+                logger.warning("Progress callback failed", stage="captions-fast-path")
         try:
             return await YouTubeCaptionTranscriptProvider().fetch(youtube_url)
         except Exception:
@@ -122,7 +141,7 @@ async def _fetch_transcript_with_retry(youtube_url: str) -> TranscriptData:
     last_error: Exception | None = None
     for attempt in range(_RETRY_ATTEMPTS):
         try:
-            return await provider.fetch(youtube_url)
+            return await provider.fetch(youtube_url, on_progress=on_progress)
         except ExternalServiceError as exc:
             last_error = exc
             logger.warning("Transcript fetch attempt failed", attempt=attempt + 1)
@@ -130,7 +149,7 @@ async def _fetch_transcript_with_retry(youtube_url: str) -> TranscriptData:
                 await asyncio.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
     if last_error:
         raise last_error
-    return await provider.fetch(youtube_url)  # pragma: no cover
+    return await provider.fetch(youtube_url, on_progress=on_progress)  # pragma: no cover
 
 
 def _live_pipeline_enabled() -> bool:
