@@ -19,6 +19,7 @@ from app.providers.transcript import (
     _select_caption_language,
     get_transcript_provider,
 )
+from app.providers.ytdlp import build_ydlp_options
 
 _FAKE_SETTINGS_FAKE_MODE = SimpleNamespace(
     jumpto_transcript_mode="fake",
@@ -256,3 +257,44 @@ class TestYouTubeCaptionFetcher:
         assert isinstance(transcript, TranscriptData)
         assert transcript.words[0].word == "hi"
         assert transcript.words[0].start_time == pytest.approx(0.5)
+
+
+class TestYdlpOptions:
+    """Tests for the shared yt-dlp options builder."""
+
+    def test_sets_cookiefile_and_proxy_when_configured(self, monkeypatch) -> None:
+        settings = SimpleNamespace(
+            resolved_ytdlp_cookie_file="/etc/jumpto/cookies.txt",
+            ytdlp_proxy="http://user:pass@residential:8080",
+        )
+        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: settings)
+
+        options = build_ydlp_options()
+
+        assert options["cookiefile"] == "/etc/jumpto/cookies.txt"
+        assert options["proxy"] == "http://user:pass@residential:8080"
+
+    def test_omits_cookiefile_and_proxy_when_unset(self, monkeypatch) -> None:
+        settings = SimpleNamespace(
+            resolved_ytdlp_cookie_file=None,
+            ytdlp_proxy="",
+        )
+        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: settings)
+
+        options = build_ydlp_options()
+
+        assert "cookiefile" not in options
+        assert "proxy" not in options
+
+    def test_overrides_win_over_base_options(self, monkeypatch) -> None:
+        settings = SimpleNamespace(
+            resolved_ytdlp_cookie_file="/etc/jumpto/cookies.txt",
+            ytdlp_proxy="http://user:pass@residential:8080",
+        )
+        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: settings)
+
+        options = build_ydlp_options(proxy="http://override:3128", noplaylist=False)
+
+        assert options["proxy"] == "http://override:3128"
+        assert options["noplaylist"] is False
+        assert options["cookiefile"] == "/etc/jumpto/cookies.txt"

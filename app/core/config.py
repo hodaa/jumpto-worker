@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     # host cookies are mounted at a well-known path (see docker-compose.yml).
     mounted_ytdlp_cookie_file: str = "/etc/jumpto/cookies.txt"
 
+    # Optional HTTP(S)/SOCKS proxy for yt-dlp, e.g. a residential gateway, to
+    # avoid YouTube bot-blocks on datacenter IPs (YTDLP_PROXY env var).
+    ytdlp_proxy: str = Field(
+        default="",
+        description="Proxy URL for yt-dlp (e.g. http://user:pass@gateway:port)",
+    )
+
     @property
     def resolved_ytdlp_cookie_file(self) -> str | None:
         """Return cookie file path if set and exists, else None."""
