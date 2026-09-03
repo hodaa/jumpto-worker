@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import BeforeValidator, Field
@@ -88,18 +89,23 @@ class Settings(BaseSettings):
         description="Path to a Netscape cookie file for yt-dlp (YTDLP_COOKIE_FILE env var)",
     )
 
+    # Default cookie file location when running in the Docker worker, where the
+    # host cookies are mounted at a well-known path (see docker-compose.yml).
+    mounted_ytdlp_cookie_file: str = "/etc/jumpto/cookies.txt"
+
     @property
     def resolved_ytdlp_cookie_file(self) -> str | None:
         """Return cookie file path if set and exists, else None."""
         path = self.ytdlp_cookie_file or os.environ.get("YTDLP_COOKIE_FILE", "")
-        if path and os.path.isfile(path):
+        if path and Path(path).is_file():
             return path
         if path:
             from app.core.logging import get_logger
 
-            get_logger(__name__).warning(
-                "YTDLP_COOKIE_FILE set but file not found", path=path
-            )
+            get_logger(__name__).warning("YTDLP_COOKIE_FILE set but file not found", path=path)
+        mounted = self.mounted_ytdlp_cookie_file
+        if mounted and Path(mounted).is_file():
+            return mounted
         return None
 
     @property
