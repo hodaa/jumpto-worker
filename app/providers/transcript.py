@@ -135,8 +135,17 @@ def _download_caption(youtube_url: str, languages: tuple[str, ...]) -> tuple[str
     try:
         import yt_dlp  # Optional dependency, only needed for live calls
 
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.extract_info(youtube_url, download=True)
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                ydl.extract_info(youtube_url, download=True)
+        except yt_dlp.utils.DownloadError as exc:
+            logger.warning(
+                "yt-dlp failed to download captions",
+                error=str(exc),
+            )
+            raise ExternalServiceError(
+                "Failed to download captions", service="youtube-captions"
+            ) from exc
         vtt_files = sorted(Path(temp_dir).glob("*.vtt"))
         if not vtt_files:
             raise ExternalServiceError("No captions available", service="youtube-captions")

@@ -113,8 +113,11 @@ async def _fetch_transcript_with_retry(youtube_url: str) -> TranscriptData:
     if _live_pipeline_enabled():
         try:
             return await YouTubeCaptionTranscriptProvider().fetch(youtube_url)
-        except ExternalServiceError:
-            logger.info("Captions fast-path unavailable; falling back to audio transcription")
+        except Exception:
+            logger.exception(
+                "Captions fast-path failed; falling back to audio transcription",
+                youtube_url=youtube_url,
+            )
     provider = get_transcript_provider()
     last_error: Exception | None = None
     for attempt in range(_RETRY_ATTEMPTS):
