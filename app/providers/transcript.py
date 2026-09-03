@@ -15,6 +15,7 @@ import httpx
 from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
+from app.providers.ytdlp import build_ydlp_options
 
 logger = get_logger(__name__)
 
@@ -124,15 +125,13 @@ def _download_caption(youtube_url: str, languages: tuple[str, ...]) -> tuple[str
     info = _extract_video_info(youtube_url)
     target = _select_caption_language(info, languages)
     temp_dir = tempfile.mkdtemp(prefix="jumpto-captions-")
-    options: dict = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": [target],
-        "outtmpl": str(Path(temp_dir) / "%(id)s.%(ext)s"),
-    }
+    options = build_ydlp_options(
+        skip_download=True,
+        writesubtitles=True,
+        writeautomaticsub=True,
+        subtitleslangs=[target],
+        outtmpl=str(Path(temp_dir) / "%(id)s.%(ext)s"),
+    )
     try:
         import yt_dlp  # Optional dependency, only needed for live calls
 
@@ -152,7 +151,7 @@ def _extract_video_info(youtube_url: str) -> dict:
     """Extract full video metadata (including caption tracks) with yt-dlp."""
     import yt_dlp  # Optional dependency, only needed for live calls
 
-    options: dict = {"quiet": True, "no_warnings": True, "skip_download": True}
+    options = build_ydlp_options(skip_download=True)
     with yt_dlp.YoutubeDL(options) as ydl:
         return ydl.extract_info(youtube_url, download=False)
 
@@ -349,12 +348,10 @@ def _download_audio(youtube_url: str) -> str:
     os.close(fd)
     destination = Path(path)
     destination.unlink(missing_ok=True)
-    options: dict = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": "bestaudio/best",
-        "outtmpl": path,
-    }
+    options = build_ydlp_options(
+        format="bestaudio/best",
+        outtmpl=path,
+    )
     try:
         _run_download(options, youtube_url)
         if not destination.exists() or destination.stat().st_size == 0:
