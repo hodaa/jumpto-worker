@@ -9,6 +9,9 @@
       restart: unless-stopped
       env_file:
         - .env
+      environment:
+        # Point yt-dlp at the bgutil PO-token provider container (service DNS).
+        YTDLP_BGUTIL_URL: http://bgutil-pot:4416
       volumes:
         - /etc/jumpto/cookies.txt:/etc/jumpto/cookies.txt:ro
       depends_on:

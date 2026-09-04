@@ -100,6 +100,14 @@ class Settings(BaseSettings):
         description="Proxy URL for yt-dlp (e.g. http://user:pass@gateway:port)",
     )
 
+    # Optional bgutil PO-token provider base URL. When set, yt-dlp is wired to
+    # fetch proof-of-origin tokens from this server (YTDLP_BGUTIL_URL env var).
+    # Defaults to the plugin's 127.0.0.1:4416 lookup if left empty.
+    ytdlp_bgutil_url: str = Field(
+        default="",
+        description="Base URL of the bgutil-ytdlp-pot-provider server (e.g. http://bgutil-pot:4416)",
+    )
+
     @property
     def resolved_ytdlp_cookie_file(self) -> str | None:
         """Return cookie file path if set and exists, else None."""

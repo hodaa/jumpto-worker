@@ -302,6 +302,7 @@ class TestYdlpOptions:
         return SimpleNamespace(
             resolved_ytdlp_cookie_file=cookie_file,
             ytdlp_proxy="http://user:pass@residential:8080",
+            ytdlp_bgutil_url="",
         )
 
     def test_sets_writable_cookie_copy_and_proxy_when_configured(
@@ -323,6 +324,7 @@ class TestYdlpOptions:
         settings = SimpleNamespace(
             resolved_ytdlp_cookie_file=None,
             ytdlp_proxy="",
+            ytdlp_bgutil_url="",
         )
         monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: settings)
 
@@ -330,6 +332,23 @@ class TestYdlpOptions:
 
         assert "cookiefile" not in options
         assert "proxy" not in options
+        assert "extractor_args" not in options
+
+    def test_sets_bgutil_extractor_args_when_configured(self, monkeypatch, tmp_path) -> None:
+        source = tmp_path / "cookies.txt"
+        source.write_text("# Netscape HTTP Cookie File\n")
+        settings = SimpleNamespace(
+            resolved_ytdlp_cookie_file=str(source),
+            ytdlp_proxy="",
+            ytdlp_bgutil_url="http://bgutil-pot:4416",
+        )
+        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: settings)
+
+        options = build_ydlp_options()
+
+        assert options["extractor_args"] == {
+            "youtubepot-bgutilhttp": ["base_url=http://bgutil-pot:4416"],
+        }
 
     def test_overrides_win_over_base_options(self, monkeypatch, tmp_path) -> None:
         source = tmp_path / "cookies.txt"

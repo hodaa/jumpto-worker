@@ -58,5 +58,9 @@ def build_ydlp_options(**overrides: object) -> dict:
         options["cookiefile"] = _writable_cookie_copy(cookie_file)
     if settings.ytdlp_proxy:
         options["proxy"] = settings.ytdlp_proxy
+    if settings.ytdlp_bgutil_url:
+        options["extractor_args"] = {
+            "youtubepot-bgutilhttp": [f"base_url={settings.ytdlp_bgutil_url}"],
+        }
     options.update(overrides)
     return options
