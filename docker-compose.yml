@@ -10,7 +10,7 @@
       env_file:
         - .env
       volumes:
-        - /etc/jumpto/cookies.txt:/etc/jumpto/cookies.txt
+        - /etc/jumpto/cookies.txt:/etc/jumpto/cookies.txt:ro
       depends_on:
         - bgutil-pot
       command:
@@ -20,4 +20,4 @@
         - worker
         - --loglevel=info
         - --concurrency=8
-        - --hostname=jumpto-worker
+        - --hostname=jumpto-worker  
