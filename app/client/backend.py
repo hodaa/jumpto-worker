@@ -23,6 +23,11 @@ class BackendClient:
     def __init__(self, base_url: str, api_key: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS)
+
+    async def close(self) -> None:
+        """Close the underlying connection pool."""
+        await self._client.aclose()
 
     async def get_job(self, job_id: str) -> JobData:
         """Fetch job and video data for a job id."""
@@ -32,12 +37,6 @@ class BackendClient:
     async def advance_job(self, job_id: str) -> None:
         """Mark a job as processing."""
         await self._request("POST", f"/internal/jobs/{job_id}/advance")
-
-    async def report_progress(self, job_id: str, progress: int) -> None:
-        """Report intermediate progress for a job."""
-        await self._request(
-            "POST", f"/internal/jobs/{job_id}/progress", json={"progress": progress}
-        )
 
     async def store_transcript(self, job_id: str, submission: TranscriptSubmission) -> None:
         """Store a transcript (words + metadata) for a job."""
@@ -79,8 +78,7 @@ class BackendClient:
         last_error: Exception | None = None
         for attempt in range(_MAX_RETRIES):
             try:
-                async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-                    response = await client.request(method, url, headers=headers, json=json)
+                response = await self._client.request(method, url, headers=headers, json=json)
             except httpx.HTTPError as exc:
                 last_error = exc
                 logger.warning(

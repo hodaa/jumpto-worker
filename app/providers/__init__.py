@@ -1,6 +1,6 @@
 """External service providers for the transcription pipeline."""
 
-from app.providers.media import MediaInfo, get_media_info
+from app.providers.media import MediaInfo, get_media_info, get_media_info_with_raw
 from app.providers.transcript import (
     AssemblyTranscriptProvider,
     FakeTranscriptProvider,
@@ -20,5 +20,6 @@ __all__ = [
     "TranscriptWordData",
     "YouTubeCaptionTranscriptProvider",
     "get_media_info",
+    "get_media_info_with_raw",
     "get_transcript_provider",
 ]

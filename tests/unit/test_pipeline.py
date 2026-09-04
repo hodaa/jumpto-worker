@@ -79,30 +79,8 @@ class TestRunPipeline:
         result = await run_pipeline("job-1")
 
         assert result["status"] == "completed"
-        assert client.calls == ["get_job", "advance", "progress:90", "store", "complete"]
+        assert client.calls == ["get_job", "advance", "store", "complete"]
         assert client.failed is False
-
-    @pytest.mark.asyncio
-    async def test_reports_progress_at_each_stage(self, monkeypatch) -> None:
-        client = _FakeClient()
-        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
-
-        settings = _settings(live_calls=False)
-        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
-
-        async def fake_fetch(url: str, on_progress=None):
-            return _transcript()
-
-        monkeypatch.setattr(transcription_module, "get_media_info", lambda *a: _media())
-        monkeypatch.setattr(transcription_module, "_fetch_transcript_with_retry", fake_fetch)
-
-        await run_pipeline("job-1")
-
-        assert client.progress_reports == [
-            transcription_module.PROGRESS_MEDIA,
-            transcription_module.PROGRESS_TRANSCRIPT,
-            transcription_module.PROGRESS_STORE,
-        ]
 
     @pytest.mark.asyncio
     async def test_skips_non_pending_job(self, monkeypatch) -> None:
@@ -122,7 +100,7 @@ class TestRunPipeline:
         settings = _settings(live_calls=False)
         monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
 
-        def boom(job, report=None):
+        def boom(job):
             raise RuntimeError("boom")
 
         monkeypatch.setattr(transcription_module, "_perform_transcription", boom)
@@ -156,10 +134,29 @@ class TestFetchTranscriptWithRetry:
             lambda: youtube_provider,
         )
 
+        info = {"duration": 240}
+        result = await _fetch_transcript_with_retry("https://youtu.be/abcde12345", info)
+
+        assert result.text == "Hello, world!"
+        youtube_provider.fetch.assert_awaited_once_with("https://youtu.be/abcde12345", info=info)
+
+    @pytest.mark.asyncio
+    async def test_captions_fast_path_without_info_fetches_its_own(self, monkeypatch) -> None:
+        settings = _settings(live_calls=True, mode="real")
+        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
+
+        youtube_provider = AsyncMock()
+        youtube_provider.fetch.return_value = _transcript()
+        monkeypatch.setattr(
+            transcription_module,
+            "YouTubeCaptionTranscriptProvider",
+            lambda: youtube_provider,
+        )
+
         result = await _fetch_transcript_with_retry("https://youtu.be/abcde12345")
 
         assert result.text == "Hello, world!"
-        youtube_provider.fetch.assert_awaited_once()
+        youtube_provider.fetch.assert_awaited_once_with("https://youtu.be/abcde12345", info=None)
 
     @pytest.mark.asyncio
     async def test_falls_back_to_audio_provider_after_captions_fail(self, monkeypatch) -> None:
@@ -191,7 +188,7 @@ class TestFetchTranscriptWithRetry:
         monkeypatch.setattr(transcription_module, "_RETRY_ATTEMPTS", 2)
         monkeypatch.setattr(transcription_module, "_RETRY_DELAY_SECONDS", 0)
 
-        def fail(url, on_progress=None):
+        def fail(url):
             raise ExternalServiceError("boom", service="assemblyai")
 
         fallback = AsyncMock()
@@ -248,7 +245,7 @@ class TestFailureMarking:
         settings = _settings(live_calls=False)
         monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
 
-        def boom(job, report=None):
+        def boom(job):
             raise RuntimeError("transcription boom")
 
         monkeypatch.setattr(transcription_module, "_perform_transcription", boom)
@@ -265,7 +262,6 @@ class _FakeClient:
     def __init__(self, status: str = "pending") -> None:
         self.status = status
         self.calls: list[str] = []
-        self.progress_reports: list[int] = []
         self.failed = False
 
     async def get_job(self, job_id: str) -> JobData:
@@ -310,7 +306,7 @@ def _transcript():
     )
 
 
-async def _perform_mock(job, report=None):
+async def _perform_mock(job):
     """Mock the transcription step to return a submission."""
     return _build_submission(_media(), _transcript())
 

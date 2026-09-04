@@ -67,20 +67,6 @@ async def test_advance_job_sends_post(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_report_progress_sends_progress_payload(monkeypatch) -> None:
-    response = _json_response(200, {"status": "processing"})
-    client_context = _client_context(response)
-    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
-
-    client = BackendClient(_BASE, _API_KEY)
-    await client.report_progress("job-1", 70)
-
-    assert client_context.request.await_args.args[0] == "POST"
-    assert client_context.request.await_args.args[1].endswith("/progress")
-    assert client_context.request.await_args.kwargs["json"] == {"progress": 70}
-
-
-@pytest.mark.asyncio
 async def test_store_transcript_sends_words(monkeypatch) -> None:
     response = _json_response(200, {"status": "pending"})
     client_context = _client_context(response)

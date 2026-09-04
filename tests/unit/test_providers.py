@@ -15,6 +15,7 @@ from app.providers.transcript import (
     TranscriptData,
     YouTubeCaptionTranscriptProvider,
     _caption_language,
+    _download_caption,
     _parse_assembly_transcript,
     _parse_vtt,
     _preferred_vtt_file,
@@ -251,7 +252,10 @@ class TestYouTubeCaptionFetcher:
         provider = YouTubeCaptionTranscriptProvider()
         monkeypatch.setattr(
             "app.providers.transcript._download_caption",
-            lambda url, langs: ("00:00:00.000 --> 00:00:02.000\n<00:00:00.500><c> hi</c>", "en"),
+            lambda url, langs, info=None: (
+                "00:00:00.000 --> 00:00:02.000\n<00:00:00.500><c> hi</c>",
+                "en",
+            ),
         )
 
         transcript = await provider.fetch("https://www.youtube.com/watch?v=abcde12345")
@@ -259,6 +263,36 @@ class TestYouTubeCaptionFetcher:
         assert isinstance(transcript, TranscriptData)
         assert transcript.words[0].word == "hi"
         assert transcript.words[0].start_time == pytest.approx(0.5)
+
+
+class TestDownloadCaptionMetadataReuse:
+    """Tests that a pre-fetched metadata dict avoids a redundant extract_info."""
+
+    def test_reuses_provided_info_without_re_extracting(self, monkeypatch, tmp_path) -> None:
+        from unittest.mock import Mock
+
+        extract = Mock()
+        monkeypatch.setattr("app.providers.transcript._extract_video_info", extract)
+        info = {
+            "automatic_captions": {"en-orig": [{"ext": "vtt"}]},
+            "subtitles": {},
+        }
+
+        with pytest.raises(ExternalServiceError):  # no temp captions written
+            _download_caption("https://youtu.be/abcde12345", ("en", "ar"), info)
+
+        extract.assert_not_called()
+
+    def test_extracts_when_info_not_provided(self, monkeypatch, tmp_path) -> None:
+        from unittest.mock import Mock
+
+        extract = Mock(return_value={"automatic_captions": {}, "subtitles": {}})
+        monkeypatch.setattr("app.providers.transcript._extract_video_info", extract)
+
+        with pytest.raises(ExternalServiceError):
+            _download_caption("https://youtu.be/abcde12345", ("en", "ar"))
+
+        extract.assert_called_once_with("https://youtu.be/abcde12345")
 
 
 class TestYdlpOptions:

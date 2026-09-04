@@ -7,7 +7,6 @@ import re
 import shutil
 import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,8 +20,8 @@ from app.providers.ytdlp import build_ydlp_options
 logger = get_logger(__name__)
 
 _ASSEMBLY_BASE_URL = "https://api.assemblyai.com/v2"
-_POLL_INTERVAL_SECONDS = 5
-_MAX_POLL_ATTEMPTS = 120
+_POLL_INTERVAL_SECONDS = 1
+_MAX_POLL_ATTEMPTS = 600
 _UPLOAD_TIMEOUT_SECONDS = 300
 
 
@@ -51,7 +50,6 @@ class TranscriptProvider(ABC):
     async def fetch(
         self,
         youtube_url: str,
-        on_progress: Callable[[int], Awaitable[None]] | None = None,
     ) -> TranscriptData:
         """Fetch transcript data for a YouTube URL."""
 
@@ -94,7 +92,6 @@ class FakeTranscriptProvider(TranscriptProvider):
     async def fetch(
         self,
         youtube_url: str,
-        on_progress: Callable[[int], Awaitable[None]] | None = None,
     ) -> TranscriptData:
         """Build a deterministic transcript from a fixed corpus."""
         words = [
@@ -118,16 +115,18 @@ class YouTubeCaptionTranscriptProvider(TranscriptProvider):
     async def fetch(
         self,
         youtube_url: str,
-        on_progress: Callable[[int], Awaitable[None]] | None = None,
+        info: dict | None = None,
     ) -> TranscriptData:
         """Download and parse the best available caption track for a video."""
         vtt_text, language_code = await asyncio.to_thread(
-            _download_caption, youtube_url, _SUPPORTED_CAPTION_LANGUAGES
+            _download_caption, youtube_url, _SUPPORTED_CAPTION_LANGUAGES, info
         )
         return _parse_vtt(vtt_text, language_code)
 
 
-def _download_caption(youtube_url: str, languages: tuple[str, ...]) -> tuple[str, str]:
+def _download_caption(
+    youtube_url: str, languages: tuple[str, ...], info: dict | None = None
+) -> tuple[str, str]:
     """
     Download a caption track with yt-dlp and return its (text, language).
 
@@ -135,7 +134,8 @@ def _download_caption(youtube_url: str, languages: tuple[str, ...]) -> tuple[str
     endpoint is reached without the rate limiting that raw HTTP fetches hit.
     A single best-language track is downloaded to minimize caption requests.
     """
-    info = _extract_video_info(youtube_url)
+    if info is None:
+        info = _extract_video_info(youtube_url)
     target = _select_caption_language(info, languages)
     temp_dir = tempfile.mkdtemp(prefix="jumpto-captions-")
     options = build_ydlp_options(
@@ -302,17 +302,15 @@ class AssemblyTranscriptProvider(TranscriptProvider):
     async def fetch(
         self,
         youtube_url: str,
-        on_progress: Callable[[int], Awaitable[None]] | None = None,
     ) -> TranscriptData:
         """Download the audio and transcribe it via Assembly.ai."""
-        await _report_progress(on_progress, 58, "downloading audio")
         audio_path = await asyncio.to_thread(_download_audio, youtube_url)
         try:
             headers = {"authorization": self.api_key}
             async with httpx.AsyncClient() as client:
-                upload_url = await self._upload(client, headers, audio_path, on_progress)
-                transcript_id = await self._submit(client, headers, upload_url, on_progress)
-                return await self._poll(client, headers, transcript_id, on_progress)
+                upload_url = await self._upload(client, headers, audio_path)
+                transcript_id = await self._submit(client, headers, upload_url)
+                return await self._poll(client, headers, transcript_id)
         finally:
             _remove_file(audio_path)
 
@@ -321,17 +319,15 @@ class AssemblyTranscriptProvider(TranscriptProvider):
         client: httpx.AsyncClient,
         headers: dict,
         path: str,
-        on_progress: Callable[[int], Awaitable[None]] | None = None,
     ) -> str:
         """Upload an audio file and return its public upload_url."""
-        await _report_progress(on_progress, 61, "uploading audio")
-        audio = Path(path).read_bytes()
-        response = await client.post(
-            f"{self.base_url}/upload",
-            headers={**headers, "content-type": "application/octet-stream"},
-            content=audio,
-            timeout=_UPLOAD_TIMEOUT_SECONDS,
-        )
+        with Path(path).open("rb") as audio:
+            response = await client.post(
+                f"{self.base_url}/upload",
+                headers={**headers, "content-type": "application/octet-stream"},
+                content=audio,
+                timeout=_UPLOAD_TIMEOUT_SECONDS,
+            )
         if response.status_code != 200:
             logger.error("Assembly upload failed", status_code=response.status_code)
             raise ExternalServiceError("Audio upload failed", service="assemblyai")
@@ -346,10 +342,8 @@ class AssemblyTranscriptProvider(TranscriptProvider):
         client: httpx.AsyncClient,
         headers: dict,
         audio_url: str,
-        on_progress: Callable[[int], Awaitable[None]] | None = None,
     ) -> str:
         """Create a transcription job and return its id."""
-        await _report_progress(on_progress, 64, "starting transcription")
         response = await client.post(
             f"{self.base_url}/transcript",
             headers=headers,
@@ -369,13 +363,10 @@ class AssemblyTranscriptProvider(TranscriptProvider):
         client: httpx.AsyncClient,
         headers: dict,
         transcript_id: str,
-        on_progress: Callable[[int], Awaitable[None]] | None = None,
     ) -> TranscriptData:
         """Poll until the transcript is ready and parse word timestamps."""
-        for attempt in range(_MAX_POLL_ATTEMPTS):
+        for _ in range(_MAX_POLL_ATTEMPTS):
             await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-            # Climb from 65 toward 69 as polling proceeds.
-            await _report_progress(on_progress, min(69, 65 + attempt), "transcribing audio")
             response = await client.get(
                 f"{self.base_url}/transcript/{transcript_id}", headers=headers
             )
@@ -426,20 +417,6 @@ def _remove_file(path: str) -> None:
     """Best-effort removal of a temp audio file."""
     with contextlib.suppress(OSError):
         Path(path).unlink()
-
-
-async def _report_progress(
-    on_progress: Callable[[int], Awaitable[None]] | None,
-    progress: int,
-    stage: str,
-) -> None:
-    """Report a transcript stage to the progress callback, if provided."""
-    if on_progress is None:
-        return
-    try:
-        await on_progress(progress)
-    except Exception:
-        logger.exception("Progress callback failed", stage=stage, progress=progress)
 
 
 def _parse_assembly_transcript(data: dict) -> TranscriptData:
