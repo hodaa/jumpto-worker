@@ -1,5 +1,7 @@
 """Unit tests for external service providers (fake/live switch)."""
 
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -262,16 +264,25 @@ class TestYouTubeCaptionFetcher:
 class TestYdlpOptions:
     """Tests for the shared yt-dlp options builder."""
 
-    def test_sets_cookiefile_and_proxy_when_configured(self, monkeypatch) -> None:
-        settings = SimpleNamespace(
-            resolved_ytdlp_cookie_file="/etc/jumpto/cookies.txt",
+    def _settings(self, cookie_file):
+        return SimpleNamespace(
+            resolved_ytdlp_cookie_file=cookie_file,
             ytdlp_proxy="http://user:pass@residential:8080",
         )
-        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: settings)
+
+    def test_sets_writable_cookie_copy_and_proxy_when_configured(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        source = tmp_path / "cookies.txt"
+        source.write_text("# Netscape HTTP Cookie File\n")
+        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: self._settings(str(source)))
 
         options = build_ydlp_options()
 
-        assert options["cookiefile"] == "/etc/jumpto/cookies.txt"
+        cookie_path = options["cookiefile"]
+        assert cookie_path != str(source)
+        assert Path(cookie_path).read_text() == source.read_text()
+        assert os.access(cookie_path, os.W_OK)
         assert options["proxy"] == "http://user:pass@residential:8080"
 
     def test_omits_cookiefile_and_proxy_when_unset(self, monkeypatch) -> None:
@@ -286,15 +297,13 @@ class TestYdlpOptions:
         assert "cookiefile" not in options
         assert "proxy" not in options
 
-    def test_overrides_win_over_base_options(self, monkeypatch) -> None:
-        settings = SimpleNamespace(
-            resolved_ytdlp_cookie_file="/etc/jumpto/cookies.txt",
-            ytdlp_proxy="http://user:pass@residential:8080",
-        )
-        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: settings)
+    def test_overrides_win_over_base_options(self, monkeypatch, tmp_path) -> None:
+        source = tmp_path / "cookies.txt"
+        source.write_text("# Netscape HTTP Cookie File\n")
+        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: self._settings(str(source)))
 
         options = build_ydlp_options(proxy="http://override:3128", noplaylist=False)
 
         assert options["proxy"] == "http://override:3128"
         assert options["noplaylist"] is False
-        assert options["cookiefile"] == "/etc/jumpto/cookies.txt"
+        assert options["cookiefile"] != str(source)
