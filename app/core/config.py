@@ -100,9 +100,10 @@ class Settings(BaseSettings):
         description="Proxy URL for yt-dlp (e.g. http://user:pass@gateway:port)",
     )
 
-    # Optional bgutil PO-token provider base URL. When set, yt-dlp is wired to
-    # fetch proof-of-origin tokens from this server (YTDLP_BGUTIL_URL env var).
-    # Defaults to the plugin's 127.0.0.1:4416 lookup if left empty.
+    # Optional bgutil PO-token provider base URL (YTDLP_BGUTIL_URL env var).
+    # When set, build_ydlp_options wires yt-dlp's "youtubepot-bgutilhttp"
+    # extractor_args to this server. When left empty, no extractor_args are set
+    # and the bgutil plugin falls back to its own built-in 127.0.0.1:4416.
     ytdlp_bgutil_url: str = Field(
         default="",
         description="Base URL of the bgutil-ytdlp-pot-provider server (e.g. http://bgutil-pot:4416)",

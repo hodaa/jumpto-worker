@@ -347,7 +347,7 @@ class TestYdlpOptions:
         options = build_ydlp_options()
 
         assert options["extractor_args"] == {
-            "youtubepot-bgutilhttp": ["base_url=http://bgutil-pot:4416"],
+            "youtubepot-bgutilhttp": {"base_url": ["http://bgutil-pot:4416"]},
         }
 
     def test_overrides_win_over_base_options(self, monkeypatch, tmp_path) -> None:

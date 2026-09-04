@@ -19,7 +19,7 @@
 set -u
 
 # ---- CONFIG: adjust these -------------------------------------------------
-SSH_TARGET="opc@1.2.3.4"                 # VPS ssh target (e.g. opc@x.y.z.w)
+SSH_TARGET="jumpto"                      # VPS ssh target (e.g. opc@x.y.z.w or ssh alias)
 REMOTE_TMP="/tmp/jumpto-cookies.new.txt"  # staging path on the VPS
 REMOTE_FINAL="/etc/jumpto/cookies.txt"    # host-side bind-mount source
 REMOTE_DIR="jumpto-worker"                # compose directory on the VPS ($HOME/jumpto-worker)

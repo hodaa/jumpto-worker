@@ -60,7 +60,11 @@ def build_ydlp_options(**overrides: object) -> dict:
         options["proxy"] = settings.ytdlp_proxy
     if settings.ytdlp_bgutil_url:
         options["extractor_args"] = {
-            "youtubepot-bgutilhttp": [f"base_url={settings.ytdlp_bgutil_url}"],
+            # yt-dlp stores extractor_args in nested {ie: {key: [value]}} form.
+            "youtubepot-bgutilhttp": {"base_url": [settings.ytdlp_bgutil_url]},
         }
+    # Allow yt-dlp to fetch the EJS challenge-solver scripts (required to pass
+    # YouTube's JS challenges; runs them with the bundled Deno runtime).
+    options["remote_components"] = ["ejs:github"]
     options.update(overrides)
     return options
