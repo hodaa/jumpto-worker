@@ -35,3 +35,4 @@ class TranscriptSubmission:
     language: str
     transcript_text: str
     words: list[TranscriptWordData] = field(default_factory=list)
+    provider: str = ""

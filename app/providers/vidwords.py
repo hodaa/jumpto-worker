@@ -61,6 +61,8 @@ class VidWordsResult:
 class VidWordsTranscriptProvider:
     """Fetches transcripts and basic metadata from the VidWords API."""
 
+    name = "vidwords"
+
     def __init__(
         self,
         api_key: str,
@@ -75,7 +77,7 @@ class VidWordsTranscriptProvider:
         self.timeout = timeout
         self.transport = transport
 
-    async def fetch(self, youtube_url: str) -> VidWordsResult | None:
+    async def fetch(self, youtube_url: str, youtube_video_id: str = "") -> VidWordsResult | None:
         """Fetch a transcript for ``youtube_url``.
 
         Returns ``None`` when the video has no caption track (caller should

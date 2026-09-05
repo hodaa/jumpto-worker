@@ -8,7 +8,6 @@ import pytest
 from app.core.exceptions import ExternalServiceError
 from app.models import JobData, TranscriptSubmission
 from app.providers import TranscriptData, TranscriptWordData, VidWordsResult
-from app.providers.vidwords import VidWordsPermanentError
 from app.tasks import transcription as transcription_module
 from app.tasks.transcription import (
     _build_submission,
@@ -233,25 +232,14 @@ class TestLivePipelineEnabled:
         assert _live_pipeline_enabled() is True
 
 
-class TestVidWordsPrimary:
-    """Tests for the VidWords-first transcription branch."""
+class TestCloudProviderChain:
+    """Tests for the cloud-provider chain (Supadata -> VidWords -> yt-dlp)."""
 
     @pytest.mark.asyncio
-    async def test_vidwords_used_first_when_configured(self, monkeypatch) -> None:
-        provider = AsyncMock()
-        result = VidWordsResult(
-            title="Me at the zoo",
-            author="jawed",
-            duration_seconds=19,
-            is_generated=False,
-            transcript=TranscriptData(
-                language="en",
-                text="All right, so here we are.",
-                words=[TranscriptWordData(word="All", start_time=0.0, end_time=0.5)],
-            ),
-        )
-        provider.fetch.return_value = result
-        monkeypatch.setattr(transcription_module, "_vidwords_provider", lambda: provider)
+    async def test_first_provider_used_when_it_returns_result(self, monkeypatch) -> None:
+        first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=_cloud_result()))
+        second = SimpleNamespace(name="supadata", fetch=AsyncMock())
+        monkeypatch.setattr(transcription_module, "_cloud_providers", lambda: [first, second])
         media_fetch = AsyncMock()
         monkeypatch.setattr(transcription_module, "get_media_info_with_raw", media_fetch)
 
@@ -260,15 +248,42 @@ class TestVidWordsPrimary:
         assert submission.title == "Me at the zoo"
         assert submission.duration_seconds == 19
         assert submission.language == "en"
-        assert submission.transcript_text == "All right, so here we are."
-        provider.fetch.assert_awaited_once()
+        assert submission.provider == "vidwords"
+        first.fetch.assert_awaited_once()
+        second.fetch.assert_not_awaited()
         media_fetch.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_no_transcript_falls_back_to_ytdlp_path(self, monkeypatch) -> None:
-        provider = AsyncMock()
-        provider.fetch.return_value = None
-        monkeypatch.setattr(transcription_module, "_vidwords_provider", lambda: provider)
+    async def test_falls_through_to_second_provider_on_miss(self, monkeypatch) -> None:
+        first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=None))
+        second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
+        monkeypatch.setattr(transcription_module, "_cloud_providers", lambda: [first, second])
+
+        submission = await _perform_transcription(_job())
+
+        assert submission.title == "Me at the zoo"
+        assert submission.provider == "supadata"
+        second.fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_error_in_first_provider_tries_second(self, monkeypatch) -> None:
+        first = SimpleNamespace(
+            name="vidwords",
+            fetch=AsyncMock(side_effect=ExternalServiceError("oops", service="vidwords")),
+        )
+        second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
+        monkeypatch.setattr(transcription_module, "_cloud_providers", lambda: [first, second])
+
+        submission = await _perform_transcription(_job())
+
+        assert submission.provider == "supadata"
+        second.fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_all_miss_falls_back_to_ytdlp_path(self, monkeypatch) -> None:
+        first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=None))
+        second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=None))
+        monkeypatch.setattr(transcription_module, "_cloud_providers", lambda: [first, second])
         media_info = SimpleNamespace(title="Fallback Video", duration_seconds=240)
         monkeypatch.setattr(
             transcription_module,
@@ -281,26 +296,12 @@ class TestVidWordsPrimary:
         submission = await _perform_transcription(_job())
 
         assert submission.title == "Fallback Video"
+        assert submission.provider == "yt-dlp"
         assert submission.transcript_text == "Hello, world!"
 
     @pytest.mark.asyncio
-    async def test_permanent_error_propagates_without_fallback(self, monkeypatch) -> None:
-        provider = AsyncMock()
-        provider.fetch.side_effect = VidWordsPermanentError("nope", service="vidwords")
-        monkeypatch.setattr(transcription_module, "_vidwords_provider", lambda: provider)
-        media_fetch = AsyncMock()
-        monkeypatch.setattr(transcription_module, "get_media_info_with_raw", media_fetch)
-
-        with pytest.raises(VidWordsPermanentError):
-            await _perform_transcription(_job())
-
-        media_fetch.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_transient_error_falls_back_to_ytdlp_path(self, monkeypatch) -> None:
-        provider = AsyncMock()
-        provider.fetch.side_effect = ExternalServiceError("rate limited", service="vidwords")
-        monkeypatch.setattr(transcription_module, "_vidwords_provider", lambda: provider)
+    async def test_no_cloud_providers_uses_ytdlp_directly(self, monkeypatch) -> None:
+        monkeypatch.setattr(transcription_module, "_cloud_providers", lambda: [])
         media_info = SimpleNamespace(title="Fallback Video", duration_seconds=240)
         monkeypatch.setattr(
             transcription_module,
@@ -312,7 +313,7 @@ class TestVidWordsPrimary:
 
         submission = await _perform_transcription(_job())
 
-        assert submission.title == "Fallback Video"
+        assert submission.provider == "yt-dlp"
 
 
 class TestFailureMarking:
@@ -388,6 +389,21 @@ def _transcript():
             SimpleNamespace(word="Hello,", start_time=0.0, end_time=0.5),
             SimpleNamespace(word="world!", start_time=0.5, end_time=1.0),
         ],
+    )
+
+
+def _cloud_result(title: str = "Me at the zoo") -> VidWordsResult:
+    """Build a fake cloud-provider result."""
+    return VidWordsResult(
+        title=title,
+        author="jawed",
+        duration_seconds=19,
+        is_generated=False,
+        transcript=TranscriptData(
+            language="en",
+            text="All right, so here we are.",
+            words=[TranscriptWordData(word="All", start_time=0.0, end_time=0.5)],
+        ),
     )
 
 

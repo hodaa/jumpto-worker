@@ -9,13 +9,13 @@ from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.models import TranscriptSubmission, TranscriptWordData
 from app.providers import (
+    SupadataTranscriptProvider,
     TranscriptData,
     VidWordsTranscriptProvider,
     YouTubeCaptionTranscriptProvider,
     get_media_info_with_raw,
     get_transcript_provider,
 )
-from app.providers.vidwords import VidWordsPermanentError, VidWordsResult
 from app.tasks.celery_app import celery_app
 from app.utils.text import normalize_word
 
@@ -64,62 +64,79 @@ async def run_pipeline(job_id: str) -> dict:
 
 
 async def _perform_transcription(job) -> TranscriptSubmission:
-    """Fetch media metadata and transcript, then build a submission payload.
+    """Fetch a transcript, trying configured cloud providers first.
 
-    VidWords runs first when configured (nice, undetectable transcripts), and
-    the yt-dlp-based path remains the fallback for captionless videos.
+    Order: Supadata -> VidWords -> yt-dlp captions -> Assembly. Each cloud
+    provider is skipped (next one tried) when it has no transcript or hits a
+    transient/permanent error.
     """
-    vidwords = _vidwords_provider()
-    if vidwords is not None:
-        result = await _try_vidwords(vidwords, job)
+    for provider in _cloud_providers():
+        result = await _try_cloud(provider, job)
         if result is not None:
-            return _build_vidwords_submission(result)
+            logger.info(
+                "Transcript provider used",
+                provider=provider.name,
+                youtube_url=job.youtube_url,
+            )
+            return _build_cloud_submission(result, provider.name)
     media, info = await asyncio.to_thread(
         get_media_info_with_raw, job.youtube_video_id, job.youtube_url
     )
     transcript = await _fetch_transcript_with_retry(job.youtube_url, info)
-    return _build_submission(media, transcript)
+    return _build_submission(media, transcript, provider="yt-dlp")
 
 
-def _vidwords_provider() -> VidWordsTranscriptProvider | None:
-    """Return a VidWords provider when configured and live pipeline is on."""
+def _cloud_providers() -> list:
+    """Build the configured cloud transcript providers in priority order."""
     if not _live_pipeline_enabled():
-        return None
+        return []
     settings = get_settings()
-    api_key = getattr(settings, "vidwords_api_key", "")
-    if not api_key:
-        return None
-    return VidWordsTranscriptProvider(
-        api_key=api_key,
-        base_url=getattr(settings, "vidwords_api_url", "https://vidwords.com"),
-        lang=getattr(settings, "vidwords_lang", "en") or "en",
-    )
+    providers: list = []
+    supadata_key = getattr(settings, "supadata_api_key", "")
+    if supadata_key:
+        providers.append(
+            SupadataTranscriptProvider(
+                api_key=supadata_key,
+                lang=getattr(settings, "supadata_lang", "en") or "en",
+            )
+        )
+    vidwords_key = getattr(settings, "vidwords_api_key", "")
+    if vidwords_key:
+        providers.append(
+            VidWordsTranscriptProvider(
+                api_key=vidwords_key,
+                base_url=getattr(settings, "vidwords_api_url", "https://vidwords.com"),
+                lang=getattr(settings, "vidwords_lang", "en") or "en",
+            )
+        )
+    return providers
 
 
-async def _try_vidwords(provider: VidWordsTranscriptProvider, job) -> VidWordsResult | None:
-    """Fetch via VidWords; permanent errors propagate, transient ones fall back."""
+async def _try_cloud(provider, job):
+    """Fetch via a cloud provider; any miss/error moves to the next provider."""
     try:
-        return await provider.fetch(job.youtube_url)
-    except VidWordsPermanentError:
-        raise
+        return await provider.fetch(job.youtube_url, job.youtube_video_id)
     except Exception:
         logger.exception(
-            "VidWords transcript fetch failed; falling back to yt-dlp path",
+            "Cloud transcript provider failed; trying next provider",
+            provider=provider.name,
             youtube_url=job.youtube_url,
         )
         return None
 
 
-def _build_vidwords_submission(result: VidWordsResult) -> TranscriptSubmission:
-    """Build a submission payload directly from a VidWords result."""
+def _build_cloud_submission(result, provider: str) -> TranscriptSubmission:
+    """Build a submission payload directly from a cloud provider result."""
     media = SimpleNamespace(
         title=result.title or "Untitled video",
         duration_seconds=result.duration_seconds,
     )
-    return _build_submission(media, result.transcript)
+    return _build_submission(media, result.transcript, provider=provider)
 
 
-def _build_submission(media, transcript: TranscriptData) -> TranscriptSubmission:
+def _build_submission(
+    media, transcript: TranscriptData, provider: str = ""
+) -> TranscriptSubmission:
     """Build a transcript submission payload from media and transcript data."""
     _words = [
         (normalize_word(word.word), word.start_time, word.end_time) for word in transcript.words
@@ -139,6 +156,7 @@ def _build_submission(media, transcript: TranscriptData) -> TranscriptSubmission
         language=transcript.language,
         transcript_text=transcript.text,
         words=words,
+        provider=provider,
     )
 
 

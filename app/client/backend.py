@@ -45,6 +45,7 @@ class BackendClient:
             "duration_seconds": submission.duration_seconds,
             "language": submission.language,
             "transcript_text": submission.transcript_text,
+            "provider": submission.provider,
             "words": [
                 {
                     "word_index": word.word_index,

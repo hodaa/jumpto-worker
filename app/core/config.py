@@ -80,6 +80,16 @@ class Settings(BaseSettings):
         description="VidWords API base URL (VIDWORDS_API_URL env var)",
     )
 
+    # Supadata (YouTube transcripts/metadata API)
+    supadata_api_key: str = Field(
+        default="",
+        description="Supadata API key (SUPADATA_API_KEY env var)",
+    )
+    supadata_lang: str = Field(
+        default="en",
+        description="Preferred transcript language for Supadata (SUPADATA_LANG env var)",
+    )
+
     # Environment
     environment: str = Field(
         default="development",
