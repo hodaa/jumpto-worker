@@ -98,6 +98,7 @@ def _cloud_providers() -> list:
             SupadataTranscriptProvider(
                 api_key=supadata_key,
                 lang=getattr(settings, "supadata_lang", "en") or "en",
+                mode=getattr(settings, "supadata_mode", "auto") or "auto",
             )
         )
     vidwords_key = getattr(settings, "vidwords_api_key", "")

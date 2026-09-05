@@ -89,6 +89,10 @@ class Settings(BaseSettings):
         default="en",
         description="Preferred transcript language for Supadata (SUPADATA_LANG env var)",
     )
+    supadata_mode: str = Field(
+        default="auto",
+        description="Supadata transcript mode: native, generate or auto (SUPADATA_MODE env var)",
+    )
 
     # Environment
     environment: str = Field(

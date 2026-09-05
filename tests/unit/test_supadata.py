@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from app.core.exceptions import ExternalServiceError
+from app.providers import supadata as supadata_module
 from app.providers.supadata import SupadataPermanentError, SupadataTranscriptProvider
 
 WATCH_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
@@ -89,7 +90,7 @@ class TestFetchSuccess:
         captured: dict = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path.endswith("/youtube/transcript"):
+            if request.url.path.endswith("/transcript"):
                 captured["auth"] = request.headers.get("x-api-key")
                 captured["path"] = request.url.path
                 captured["params"] = dict(request.url.params)
@@ -102,8 +103,8 @@ class TestFetchSuccess:
         await _provider(handler).fetch(WATCH_URL, VIDEO_ID)
 
         assert captured["auth"] == "test-token"
-        assert captured["path"] == "/youtube/transcript"
-        assert captured["params"] == {"url": WATCH_URL, "lang": "en"}
+        assert captured["path"] == "/transcript"
+        assert captured["params"] == {"url": WATCH_URL, "lang": "en", "mode": "auto"}
 
 
 class TestFetchErrorBranches:
@@ -162,3 +163,72 @@ class TestFetchErrorBranches:
 
         with pytest.raises(ExternalServiceError):
             await provider.fetch(WATCH_URL, VIDEO_ID)
+
+
+class TestFetchAsyncJob:
+    """Tests for the async job flow (HTTP 202 + polling)."""
+
+    def _provider(self, monkeypatch, handler) -> SupadataTranscriptProvider:
+        monkeypatch.setattr(supadata_module, "_POLL_INTERVAL_SECONDS", 0)
+        return _provider(handler)
+
+    @pytest.mark.asyncio
+    async def test_polls_job_until_completed(self, monkeypatch) -> None:
+        polled: dict = {"times": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/youtube/video"):
+                return _resp(_video_body())
+            if request.url.path.startswith("/transcript/job"):
+                polled["times"] += 1
+                if polled["times"] <= 2:
+                    return _resp({"status": "active"})
+                return _resp(
+                    {
+                        "status": "completed",
+                        "content": _transcript_body()["content"],
+                        "lang": "en",
+                        "availableLangs": ["en"],
+                    }
+                )
+            return _resp({"jobId": "job-123"}, status=202)
+
+        result = await self._provider(monkeypatch, handler).fetch(WATCH_URL, VIDEO_ID)
+
+        assert polled["times"] == 3
+        assert result is not None
+        assert result.transcript.text == "All right, so here we are in front of the elephants."
+        assert result.is_generated is True
+
+    @pytest.mark.asyncio
+    async def test_job_failed_is_permanent(self, monkeypatch) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.startswith("/transcript/job"):
+                return _resp({"status": "failed", "error": "boom"})
+            return _resp({"jobId": "job-123"}, status=202)
+
+        with pytest.raises(SupadataPermanentError):
+            await self._provider(monkeypatch, handler).fetch(WATCH_URL, VIDEO_ID)
+
+    @pytest.mark.asyncio
+    async def test_missing_job_id_is_permanent(self, monkeypatch) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _resp({"status": "active"}, status=202)
+
+        with pytest.raises(SupadataPermanentError):
+            await self._provider(monkeypatch, handler).fetch(WATCH_URL, VIDEO_ID)
+
+
+class TestEmptyContent:
+    """Tests for responses that carry no usable transcript."""
+
+    @pytest.mark.asyncio
+    async def test_empty_content_is_a_miss(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/youtube/video"):
+                return _resp(_video_body())
+            return _resp({"content": [], "lang": "en", "availableLangs": []})
+
+        result = await _provider(handler).fetch(WATCH_URL, VIDEO_ID)
+
+        assert result is None

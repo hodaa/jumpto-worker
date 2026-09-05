@@ -6,11 +6,17 @@ cookies, or PO-token providers. This pairs with VidWords as a second
 cloud provider: if one has no transcript or is failing, the other — and
 finally the yt-dlp fallback — can still serve the job.
 
+The generic ``/transcript`` endpoint fetches an existing caption track
+(``mode=native``) or falls back to AI transcription (``mode=generate``/
+``mode=auto``), so captionless videos get a transcript too. Longer
+generations return HTTP 202 with a ``jobId`` that must be polled.
+
 The API returns transcript ``chunks`` with millisecond ``offset``/``duration``;
 word records are derived from each chunk so word-level search keeps working at
 caption-line granularity.
 """
 
+import asyncio
 import math
 from dataclasses import dataclass
 
@@ -29,6 +35,8 @@ logger = get_logger(__name__)
 
 _BASE_URL = "https://api.supadata.ai/v1"
 _TIMEOUT_SECONDS = 45.0
+_POLL_INTERVAL_SECONDS = 1
+_MAX_POLL_ATTEMPTS = 300
 
 _PERMANENT_ERRORS = {
     "invalid-request",
@@ -64,12 +72,14 @@ class SupadataTranscriptProvider:
         api_key: str,
         base_url: str = _BASE_URL,
         lang: str = "en",
+        mode: str = "auto",
         timeout: float = _TIMEOUT_SECONDS,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.lang = lang
+        self.mode = mode
         self.timeout = timeout
         self.transport = transport
         self.headers = {"x-api-key": api_key, "Content-Type": "application/json"}
@@ -77,25 +87,33 @@ class SupadataTranscriptProvider:
     async def fetch(self, youtube_url: str, youtube_video_id: str = "") -> SupadataResult | None:
         """Fetch a transcript for a YouTube video.
 
-        Returns ``None`` when no transcript is available (caller should move
-        to the next provider). Raises :class:`ExternalServiceError` on API,
-        account or permanent video errors.
+        Uses ``mode=auto``: native captions when available, otherwise Supadata
+        AI-generates the transcript (no yt-dlp on our side). Returns ``None``
+        when no transcript could be produced (caller should move to the next
+        provider). Raises :class:`ExternalServiceError` on API, account or
+        permanent video errors.
         """
         headers = self.headers
         try:
             async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
                 response = await client.get(
-                    f"{self.base_url}/youtube/transcript",
-                    params={"url": youtube_url, "lang": self.lang},
+                    f"{self.base_url}/transcript",
+                    params={"url": youtube_url, "lang": self.lang, "mode": self.mode},
                     headers=headers,
                 )
                 if response.status_code == 206:
-                    logger.info("Supadata found no captions", youtube_url=youtube_url)
+                    logger.info("Supadata found no transcript", youtube_url=youtube_url)
                     return None
-                if response.status_code != 200:
+                if response.status_code == 202:
+                    payload = await self._poll_job(client, response, youtube_url)
+                elif response.status_code != 200:
                     self._raise_http_error(response, youtube_url)
-                payload = response.json()
-                chunks = payload.get("content") if isinstance(payload.get("content"), list) else []
+                else:
+                    payload = response.json()
+                chunks = _normalize_chunks(payload.get("content"))
+                if not chunks:
+                    logger.info("Supadata returned no usable content", youtube_url=youtube_url)
+                    return None
                 metadata = await self._fetch_metadata(client, youtube_url, youtube_video_id)
         except httpx.HTTPError as exc:
             logger.error("Supadata request failed", youtube_url=youtube_url, error=str(exc))
@@ -119,9 +137,48 @@ class SupadataTranscriptProvider:
             title=str(metadata.get("title") or ""),
             author=str((metadata.get("channel") or {}).get("name") or ""),
             duration_seconds=int(metadata.get("duration") or _duration_from_chunks(chunks)),
-            is_generated=False,
+            is_generated=True,
             transcript=transcript,
         )
+
+    async def _poll_job(
+        self,
+        client: httpx.AsyncClient,
+        response: httpx.Response,
+        youtube_url: str,
+    ) -> dict:
+        """Poll an async transcript job (HTTP 202) until it completes."""
+        job_id = str(response.json().get("jobId") or "")
+        if not job_id:
+            raise SupadataPermanentError(
+                "No transcript could be produced",
+                service="supadata",
+                details={"status_code": response.status_code},
+            ) from None
+        logger.info("Supadata transcript job queued", job_id=job_id, youtube_url=youtube_url)
+        for _ in range(_MAX_POLL_ATTEMPTS):
+            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+            polled = await client.get(f"{self.base_url}/transcript/{job_id}", headers=self.headers)
+            if polled.status_code != 200:
+                self._raise_http_error(polled, youtube_url)
+            data = polled.json()
+            status = str(data.get("status") or "")
+            if status == "completed":
+                return {
+                    "content": data.get("content"),
+                    "lang": data.get("lang", "en"),
+                    "availableLangs": data.get("availableLangs", []),
+                }
+            if status == "failed":
+                raise SupadataPermanentError(
+                    "Could not fetch the transcript for this video",
+                    service="supadata",
+                    details={"message": str(data.get("error") or "")},
+                ) from None
+        raise ExternalServiceError(
+            "Transcription service timed out; try again later",
+            service="supadata",
+        ) from None
 
     async def _fetch_metadata(
         self,
@@ -173,6 +230,19 @@ class SupadataTranscriptProvider:
             service="supadata",
             details=detail,
         ) from None
+
+
+def _normalize_chunks(content) -> list[dict]:
+    """Normalize the transcript response into a list of chunks.
+
+    Handles both shapes the API returns: a list of chunk objects (``text`` +
+    ``offset`` + ``duration``) and a plain-text string (some async job results).
+    """
+    if isinstance(content, list):
+        return [chunk for chunk in content if isinstance(chunk, dict)]
+    if isinstance(content, str) and content.strip():
+        return [{"text": content, "offset": 0, "duration": 0}]
+    return []
 
 
 def _words_from_chunks(chunks: list[dict]) -> list[TranscriptWordData]:
