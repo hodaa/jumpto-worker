@@ -7,11 +7,14 @@ import pytest
 
 from app.core.exceptions import ExternalServiceError
 from app.models import JobData, TranscriptSubmission
+from app.providers import TranscriptData, TranscriptWordData, VidWordsResult
+from app.providers.vidwords import VidWordsPermanentError
 from app.tasks import transcription as transcription_module
 from app.tasks.transcription import (
     _build_submission,
     _fetch_transcript_with_retry,
     _live_pipeline_enabled,
+    _perform_transcription,
     _user_safe_message,
     run_pipeline,
 )
@@ -230,6 +233,88 @@ class TestLivePipelineEnabled:
         assert _live_pipeline_enabled() is True
 
 
+class TestVidWordsPrimary:
+    """Tests for the VidWords-first transcription branch."""
+
+    @pytest.mark.asyncio
+    async def test_vidwords_used_first_when_configured(self, monkeypatch) -> None:
+        provider = AsyncMock()
+        result = VidWordsResult(
+            title="Me at the zoo",
+            author="jawed",
+            duration_seconds=19,
+            is_generated=False,
+            transcript=TranscriptData(
+                language="en",
+                text="All right, so here we are.",
+                words=[TranscriptWordData(word="All", start_time=0.0, end_time=0.5)],
+            ),
+        )
+        provider.fetch.return_value = result
+        monkeypatch.setattr(transcription_module, "_vidwords_provider", lambda: provider)
+        media_fetch = AsyncMock()
+        monkeypatch.setattr(transcription_module, "get_media_info_with_raw", media_fetch)
+
+        submission = await _perform_transcription(_job())
+
+        assert submission.title == "Me at the zoo"
+        assert submission.duration_seconds == 19
+        assert submission.language == "en"
+        assert submission.transcript_text == "All right, so here we are."
+        provider.fetch.assert_awaited_once()
+        media_fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_transcript_falls_back_to_ytdlp_path(self, monkeypatch) -> None:
+        provider = AsyncMock()
+        provider.fetch.return_value = None
+        monkeypatch.setattr(transcription_module, "_vidwords_provider", lambda: provider)
+        media_info = SimpleNamespace(title="Fallback Video", duration_seconds=240)
+        monkeypatch.setattr(
+            transcription_module,
+            "get_media_info_with_raw",
+            lambda *args: (media_info, None),
+        )
+        transcript = AsyncMock(return_value=_transcript())
+        monkeypatch.setattr(transcription_module, "_fetch_transcript_with_retry", transcript)
+
+        submission = await _perform_transcription(_job())
+
+        assert submission.title == "Fallback Video"
+        assert submission.transcript_text == "Hello, world!"
+
+    @pytest.mark.asyncio
+    async def test_permanent_error_propagates_without_fallback(self, monkeypatch) -> None:
+        provider = AsyncMock()
+        provider.fetch.side_effect = VidWordsPermanentError("nope", service="vidwords")
+        monkeypatch.setattr(transcription_module, "_vidwords_provider", lambda: provider)
+        media_fetch = AsyncMock()
+        monkeypatch.setattr(transcription_module, "get_media_info_with_raw", media_fetch)
+
+        with pytest.raises(VidWordsPermanentError):
+            await _perform_transcription(_job())
+
+        media_fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_transient_error_falls_back_to_ytdlp_path(self, monkeypatch) -> None:
+        provider = AsyncMock()
+        provider.fetch.side_effect = ExternalServiceError("rate limited", service="vidwords")
+        monkeypatch.setattr(transcription_module, "_vidwords_provider", lambda: provider)
+        media_info = SimpleNamespace(title="Fallback Video", duration_seconds=240)
+        monkeypatch.setattr(
+            transcription_module,
+            "get_media_info_with_raw",
+            lambda *args: (media_info, None),
+        )
+        transcript = AsyncMock(return_value=_transcript())
+        monkeypatch.setattr(transcription_module, "_fetch_transcript_with_retry", transcript)
+
+        submission = await _perform_transcription(_job())
+
+        assert submission.title == "Fallback Video"
+
+
 class TestFailureMarking:
     """Tests for failure reporting to the backend."""
 
@@ -319,4 +404,5 @@ def _settings(*, live_calls: bool, mode: str = "fake") -> SimpleNamespace:
         job_timeout_seconds=600,
         jumpto_live_external_calls=live_calls,
         jumpto_transcript_mode=mode,
+        vidwords_api_key="",
     )

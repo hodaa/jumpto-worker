@@ -66,6 +66,20 @@ class Settings(BaseSettings):
         description="Assembly.ai API key for transcription",
     )
 
+    # VidWords (YouTube transcripts API)
+    vidwords_api_key: str = Field(
+        default="",
+        description="VidWords API token for fetch transcripts/title via their API",
+    )
+    vidwords_lang: str = Field(
+        default="en",
+        description="Preferred caption language for VidWords (VIDWORDS_LANG env var)",
+    )
+    vidwords_api_url: str = Field(
+        default="https://vidwords.com",
+        description="VidWords API base URL (VIDWORDS_API_URL env var)",
+    )
+
     # Environment
     environment: str = Field(
         default="development",

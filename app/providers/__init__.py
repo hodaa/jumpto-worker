@@ -10,6 +10,7 @@ from app.providers.transcript import (
     YouTubeCaptionTranscriptProvider,
     get_transcript_provider,
 )
+from app.providers.vidwords import VidWordsResult, VidWordsTranscriptProvider
 
 __all__ = [
     "AssemblyTranscriptProvider",
@@ -18,6 +19,8 @@ __all__ = [
     "TranscriptData",
     "TranscriptProvider",
     "TranscriptWordData",
+    "VidWordsResult",
+    "VidWordsTranscriptProvider",
     "YouTubeCaptionTranscriptProvider",
     "get_media_info",
     "get_media_info_with_raw",
