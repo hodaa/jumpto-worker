@@ -60,7 +60,12 @@ def _cdp_call(ws_url: str, method: str, params: dict | None = None) -> dict:
     """Send one CDP call over WebSocket and return its result."""
     import websocket  # Installed in the chromium-cdp image
 
-    connection = websocket.create_connection(ws_url, timeout=WS_TIMEOUT_SECONDS)
+    # suppress_origin=True: without it websocket-client 1.8 auto-sends a
+    # browser-style Origin header, which Chromium rejects unless the DevTools
+    # server was started with --remote-allow-origins.
+    connection = websocket.create_connection(
+        ws_url, timeout=WS_TIMEOUT_SECONDS, suppress_origin=True
+    )
     try:
         connection.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
         while True:
