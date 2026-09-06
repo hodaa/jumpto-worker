@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import BeforeValidator, Field
+from pydantic import AliasChoices, BeforeValidator, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -92,6 +92,27 @@ class Settings(BaseSettings):
     supadata_mode: str = Field(
         default="auto",
         description="Supadata transcript mode: native, generate or auto (SUPADATA_MODE env var)",
+    )
+
+    # TranscriptFetch (YouTube transcripts/metadata API)
+    transcriptfetch_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "transcriptfetch_api_key",
+            "TRANSCRIPTFETCH_API_KEY",
+            # The user's .env has an extra "s" ("transscriptfetch"); accept the
+            # typo so the key is picked up regardless of spelling.
+            "TRANSSCRIPTFETCH_API_KEY",
+        ),
+        description="TranscriptFetch API key (TRANSCRIPTFETCH_API_KEY env var)",
+    )
+    transcriptfetch_lang: str = Field(
+        default="en",
+        description="Preferred caption language for TranscriptFetch (TRANSCRIPTFETCH_LANG env var)",
+    )
+    transcriptfetch_mode: str = Field(
+        default="auto",
+        description="TranscriptFetch mode: captions, audio or auto (TRANSCRIPTFETCH_MODE env var)",
     )
 
     # Environment

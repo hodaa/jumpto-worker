@@ -11,6 +11,8 @@ from app.models import TranscriptSubmission, TranscriptWordData
 from app.providers import (
     SupadataTranscriptProvider,
     TranscriptData,
+    TranscriptFetchTranscriptProvider,
+    TranscriptJobPending,
     VidWordsTranscriptProvider,
     YouTubeCaptionTranscriptProvider,
     get_media_info_with_raw,
@@ -26,26 +28,49 @@ _RETRY_DELAY_SECONDS = 2
 _USER_SAFE_FAILURE = "Transcription failed. Please try again later."
 _EXTERNAL_FAILURE = "Could not fetch the transcript for this video. Please try again later."
 _TIMEOUT_SAFE_MESSAGE = "Transcription timed out. Please try again later."
+_CLOUD_JOB_TIMEOUT_SAFE_MESSAGE = "Transcription timed out. Please try again later."
+
+# Waiting budget for resumable async cloud jobs (e.g. Supadata AI generation).
+# Each Celery attempt makes one provider call; the task retries on an
+# exponential backoff until the job completes or the budget is exhausted.
+_CLOUD_JOB_ATTEMPTS = 9
+_CLOUD_JOB_RETRY_BASE_SECONDS = 2
+_CLOUD_JOB_RETRY_MAX_SECONDS = 60
 
 
-async def run_pipeline(job_id: str) -> dict:
-    """Run the transcription pipeline for a job against the backend API."""
+async def run_pipeline(job_id: str, resume_token: str = "", resume_provider: str = "") -> dict:
+    """Run the transcription pipeline for a job against the backend API.
+
+    ``resume_token``/``resume_provider`` carry a pending cloud async job across
+    Celery retries: when present the job is already ``processing`` and the
+    pipeline resumes by checking that job once (routed to the originating
+    provider) instead of requeueing a new transcription.
+    """
     settings = get_settings()
     client = BackendClient(settings.backend_url, settings.internal_api_key)
 
     try:
         job = await client.get_job(job_id)
-        if job.status != "pending":
+        if not resume_token and job.status != "pending":
             logger.info("Skipping non-pending job", job_id=job_id, status=job.status)
             return {"status": job.status}
+        if job.status == "pending":
+            await client.advance_job(job_id)
 
-        await client.advance_job(job_id)
         submission = await asyncio.wait_for(
-            _perform_transcription(job),
+            _perform_transcription(job, resume_token, resume_provider),
             timeout=settings.job_timeout_seconds,
         )
         await client.store_transcript(job_id, submission)
         await client.complete_job(job_id)
+    except TranscriptJobPending:
+        logger.info(
+            "Cloud provider job still processing; task will retry or fail",
+            job_id=job_id,
+            resume_token=resume_token,
+            resume_provider=resume_provider,
+        )
+        raise
     except Exception as exc:
         error = _user_safe_message(exc)
         logger.exception("Transcription pipeline failed", job_id=job_id, error=error)
@@ -63,15 +88,21 @@ async def run_pipeline(job_id: str) -> dict:
     return {"status": "completed", "video_id": job.video_id}
 
 
-async def _perform_transcription(job) -> TranscriptSubmission:
+async def _perform_transcription(
+    job, resume_token: str = "", resume_provider: str = ""
+) -> TranscriptSubmission:
     """Fetch a transcript, trying configured cloud providers first.
 
-    Order: Supadata -> VidWords -> yt-dlp captions -> Assembly. Each cloud
-    provider is skipped (next one tried) when it has no transcript or hits a
-    transient/permanent error.
+    Order: TranscriptFetch -> Supadata -> VidWords -> yt-dlp captions ->
+    Assembly. Each cloud provider is skipped (next one tried) when it has no
+    transcript or hits a transient/permanent error. A still-processing async
+    job raises ``TranscriptJobPending`` (bubbles to the retry-aware task),
+    carrying a resume token the originating provider follows on its next
+    attempt; a completed or failed job resolves within this attempt.
     """
     for provider in _cloud_providers():
-        result = await _try_cloud(provider, job)
+        resume = resume_token if (resume_token and provider.name == resume_provider) else ""
+        result = await _try_cloud(provider, job, resume)
         if result is not None:
             logger.info(
                 "Transcript provider used",
@@ -92,6 +123,15 @@ def _cloud_providers() -> list:
         return []
     settings = get_settings()
     providers: list = []
+    transcriptfetch_key = getattr(settings, "transcriptfetch_api_key", "")
+    if transcriptfetch_key:
+        providers.append(
+            TranscriptFetchTranscriptProvider(
+                api_key=transcriptfetch_key,
+                lang=getattr(settings, "transcriptfetch_lang", "en") or "en",
+                mode=getattr(settings, "transcriptfetch_mode", "auto") or "auto",
+            )
+        )
     supadata_key = getattr(settings, "supadata_api_key", "")
     if supadata_key:
         providers.append(
@@ -113,10 +153,19 @@ def _cloud_providers() -> list:
     return providers
 
 
-async def _try_cloud(provider, job):
-    """Fetch via a cloud provider; any miss/error moves to the next provider."""
+async def _try_cloud(provider, job, resume_token: str = ""):
+    """Fetch via a cloud provider; any miss/error moves to the next provider.
+
+    A still-processing async job (``TranscriptJobPending``) is re-raised so the
+    task can decide whether to retry it or fail the job; everything else is
+    treated as a regular miss (next provider tried).
+    """
     try:
-        return await provider.fetch(job.youtube_url, job.youtube_video_id)
+        return await provider.fetch(
+            job.youtube_url, job.youtube_video_id, resume_token=resume_token
+        )
+    except TranscriptJobPending:
+        raise
     except Exception:
         logger.exception(
             "Cloud transcript provider failed; trying next provider",
@@ -161,11 +210,54 @@ def _build_submission(
     )
 
 
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
-def download_and_transcribe(self, job_id: str) -> dict:
-    """Run the transcription pipeline from the Celery worker."""
-    asyncio.run(run_pipeline(job_id))
+@celery_app.task(bind=True, max_retries=_CLOUD_JOB_ATTEMPTS, default_retry_delay=60)
+def download_and_transcribe(
+    self, job_id: str, resume_token: str = "", resume_provider: str = ""
+) -> dict:
+    """Run the transcription pipeline from the Celery worker.
+
+    While a resumable cloud async job (e.g. Supadata) is processing, the task
+    returns early (instead of blocking in a poll loop) and re-enqueues itself
+    with an exponential backoff, carrying the job's resume token routed to its
+    originating provider. A non-resumable pending job (e.g. TranscriptFetch's
+    one-call rule) is failed immediately. When the waiting budget runs out the
+    job is marked failed and the task gives up.
+    """
+    try:
+        asyncio.run(run_pipeline(job_id, resume_token, resume_provider))
+    except TranscriptJobPending as exc:
+        if not exc.resumable:
+            asyncio.run(_fail_job(job_id, _EXTERNAL_FAILURE))
+            raise
+        if self.request.retries >= _CLOUD_JOB_ATTEMPTS - 1:
+            asyncio.run(_fail_job(job_id, _CLOUD_JOB_TIMEOUT_SAFE_MESSAGE))
+            raise
+        raise self.retry(
+            exc=exc,
+            max_retries=_CLOUD_JOB_ATTEMPTS,
+            countdown=_job_retry_countdown(self.request.retries),
+            args=[job_id, exc.resume_token, exc.provider],
+        ) from exc
     return {"status": "completed"}
+
+
+async def _fail_job(job_id: str, message: str) -> None:
+    """Best-effort mark a job as failed in the backend."""
+    settings = get_settings()
+    client = BackendClient(settings.backend_url, settings.internal_api_key)
+    try:
+        await client.fail_job(job_id, message)
+    except Exception:
+        logger.exception("Failed to mark job as failed", job_id=job_id)
+    finally:
+        close = getattr(client, "close", None)
+        if close is not None:
+            await close()
+
+
+def _job_retry_countdown(retries: int) -> int:
+    """Exponential backoff in seconds for the async-job retry schedule."""
+    return min(_CLOUD_JOB_RETRY_BASE_SECONDS * (2**retries), _CLOUD_JOB_RETRY_MAX_SECONDS)
 
 
 async def _fetch_transcript_with_retry(

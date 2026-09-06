@@ -4,8 +4,11 @@ import httpx
 import pytest
 
 from app.core.exceptions import ExternalServiceError
-from app.providers import supadata as supadata_module
-from app.providers.supadata import SupadataPermanentError, SupadataTranscriptProvider
+from app.providers.supadata import (
+    SupadataPermanentError,
+    SupadataTranscriptProvider,
+)
+from app.providers.transcript import TranscriptJobPending
 
 WATCH_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 VIDEO_ID = "jNQXAC9IVRw"
@@ -166,57 +169,79 @@ class TestFetchErrorBranches:
 
 
 class TestFetchAsyncJob:
-    """Tests for the async job flow (HTTP 202 + polling)."""
-
-    def _provider(self, monkeypatch, handler) -> SupadataTranscriptProvider:
-        monkeypatch.setattr(supadata_module, "_POLL_INTERVAL_SECONDS", 0)
-        return _provider(handler)
+    """Tests for the async job flow (202 -> task retries, single call/attempt)."""
 
     @pytest.mark.asyncio
-    async def test_polls_job_until_completed(self, monkeypatch) -> None:
+    async def test_202_queues_job_and_raises_pending(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/youtube/video"):
+                return _resp(_video_body())
+            return _resp({"jobId": "job-123"}, status=202)
+
+        provider = _provider(handler)
+
+        with pytest.raises(TranscriptJobPending) as excinfo:
+            await provider.fetch(WATCH_URL, VIDEO_ID)
+        assert excinfo.value.resume_token == "job-123"
+        assert excinfo.value.provider == "supadata"
+        assert excinfo.value.resumable is True
+
+    @pytest.mark.asyncio
+    async def test_resume_completed_job_returns_result_in_one_call(self) -> None:
         polled: dict = {"times": 0}
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/youtube/video"):
                 return _resp(_video_body())
-            if request.url.path.startswith("/transcript/job"):
-                polled["times"] += 1
-                if polled["times"] <= 2:
-                    return _resp({"status": "active"})
-                return _resp(
-                    {
-                        "status": "completed",
-                        "content": _transcript_body()["content"],
-                        "lang": "en",
-                        "availableLangs": ["en"],
-                    }
-                )
-            return _resp({"jobId": "job-123"}, status=202)
+            polled["times"] += 1
+            assert request.url.path == "/transcript/job-123"
+            return _resp(
+                {
+                    "status": "completed",
+                    "content": _transcript_body()["content"],
+                    "lang": "en",
+                    "availableLangs": ["en"],
+                }
+            )
 
-        result = await self._provider(monkeypatch, handler).fetch(WATCH_URL, VIDEO_ID)
+        result = await _provider(handler).fetch(WATCH_URL, VIDEO_ID, resume_token="job-123")
 
-        assert polled["times"] == 3
+        assert polled["times"] == 1
         assert result is not None
         assert result.transcript.text == "All right, so here we are in front of the elephants."
         assert result.is_generated is True
 
     @pytest.mark.asyncio
-    async def test_job_failed_is_permanent(self, monkeypatch) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path.startswith("/transcript/job"):
-                return _resp({"status": "failed", "error": "boom"})
-            return _resp({"jobId": "job-123"}, status=202)
+    async def test_resume_processing_job_raises_pending_after_one_call(self) -> None:
+        polled: dict = {"times": 0}
 
-        with pytest.raises(SupadataPermanentError):
-            await self._provider(monkeypatch, handler).fetch(WATCH_URL, VIDEO_ID)
+        def handler(request: httpx.Request) -> httpx.Response:
+            polled["times"] += 1
+            return _resp({"status": "active"})
+
+        provider = _provider(handler)
+
+        with pytest.raises(TranscriptJobPending) as excinfo:
+            await provider.fetch(WATCH_URL, VIDEO_ID, resume_token="job-123")
+        assert excinfo.value.resume_token == "job-123"
+        assert excinfo.value.provider == "supadata"
+        assert excinfo.value.resumable is True
+        assert polled["times"] == 1
 
     @pytest.mark.asyncio
-    async def test_missing_job_id_is_permanent(self, monkeypatch) -> None:
+    async def test_resume_failed_job_is_permanent(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
-            return _resp({"status": "active"}, status=202)
+            return _resp({"status": "failed", "error": "boom"})
 
         with pytest.raises(SupadataPermanentError):
-            await self._provider(monkeypatch, handler).fetch(WATCH_URL, VIDEO_ID)
+            await _provider(handler).fetch(WATCH_URL, VIDEO_ID, resume_token="job-123")
+
+    @pytest.mark.asyncio
+    async def test_missing_job_id_is_permanent(self) -> None:
+        provider = _provider(lambda request: _resp({"status": "active"}, status=202))
+
+        with pytest.raises(SupadataPermanentError):
+            await provider.fetch(WATCH_URL, VIDEO_ID)
 
 
 class TestEmptyContent:

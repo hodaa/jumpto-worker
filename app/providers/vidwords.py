@@ -77,9 +77,16 @@ class VidWordsTranscriptProvider:
         self.timeout = timeout
         self.transport = transport
 
-    async def fetch(self, youtube_url: str, youtube_video_id: str = "") -> VidWordsResult | None:
+    async def fetch(
+        self,
+        youtube_url: str,
+        youtube_video_id: str = "",
+        resume_token: str = "",
+    ) -> VidWordsResult | None:
         """Fetch a transcript for ``youtube_url``.
 
+        ``resume_token`` is accepted for interface uniformity across cloud
+        providers but never used: VidWords is synchronous (no async jobs).
         Returns ``None`` when the video has no caption track (caller should
         fall back). Raises :class:`ExternalServiceError` on API/account
         failures or permanent per-video errors.

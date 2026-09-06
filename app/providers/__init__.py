@@ -6,10 +6,16 @@ from app.providers.transcript import (
     AssemblyTranscriptProvider,
     FakeTranscriptProvider,
     TranscriptData,
+    TranscriptJobPending,
     TranscriptProvider,
     TranscriptWordData,
     YouTubeCaptionTranscriptProvider,
     get_transcript_provider,
+)
+from app.providers.transcriptfetch import (
+    TranscriptFetchPermanentError,
+    TranscriptFetchResult,
+    TranscriptFetchTranscriptProvider,
 )
 from app.providers.vidwords import VidWordsResult, VidWordsTranscriptProvider
 
@@ -20,6 +26,10 @@ __all__ = [
     "SupadataResult",
     "SupadataTranscriptProvider",
     "TranscriptData",
+    "TranscriptFetchPermanentError",
+    "TranscriptFetchResult",
+    "TranscriptFetchTranscriptProvider",
+    "TranscriptJobPending",
     "TranscriptProvider",
     "TranscriptWordData",
     "VidWordsResult",

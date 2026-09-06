@@ -23,6 +23,19 @@ class TestCeleryWorkerConcurrencySetting:
             Settings(_env_file=None, celery_worker_concurrency=0)
 
 
+class TestTranscriptFetchApiKey:
+    """Tests for TranscriptFetch key env-var name variants."""
+
+    def test_reads_correctly_spelled_env_var(self, monkeypatch) -> None:
+        monkeypatch.setenv("TRANSCRIPTFETCH_API_KEY", "secret-1")
+        assert Settings(_env_file=None).transcriptfetch_api_key == "secret-1"
+
+    def test_reads_misspelled_env_var_from_dotenv(self, monkeypatch) -> None:
+        # "transscriptfetch" mirrors the key name the user has in .env.
+        monkeypatch.setenv("TRANSSCRIPTFETCH_API_KEY", "secret-2")
+        assert Settings(_env_file=None).transcriptfetch_api_key == "secret-2"
+
+
 class TestResolvedYtDlpCookieFile:
     """Tests for the yt-dlp cookie file resolver."""
 

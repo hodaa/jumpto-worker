@@ -9,6 +9,7 @@ import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -23,6 +24,37 @@ _ASSEMBLY_BASE_URL = "https://api.assemblyai.com/v2"
 _POLL_INTERVAL_SECONDS = 1
 _MAX_POLL_ATTEMPTS = 600
 _UPLOAD_TIMEOUT_SECONDS = 300
+
+
+class TranscriptJobPending(ExternalServiceError):
+    """A cloud provider escalated transcription to an async job not yet done.
+
+    Raised by providers that queue work on their side (e.g. Supadata AI
+    generation). ``resume_token`` lets a later attempt resume the same job
+    instead of queuing a fresh transcription; the orchestrator routes it back
+    to the originating provider via ``provider``. ``resumable`` separates jobs
+    the caller may wait on (retry with backoff, carrying the resume token)
+    from providers running a strict one-call policy (e.g. TranscriptFetch),
+    where the job must be failed rather than polled or retried.
+    """
+
+    def __init__(
+        self,
+        message: str = "Transcription service is still processing",
+        *,
+        provider: str,
+        resume_token: str = "",
+        resumable: bool = True,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.provider = provider
+        self.resume_token = resume_token
+        self.resumable = resumable
+        super().__init__(
+            message,
+            service=provider,
+            details={**(details or {}), "resume_token": resume_token},
+        )
 
 
 @dataclass

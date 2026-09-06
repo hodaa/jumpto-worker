@@ -9,14 +9,17 @@ finally the yt-dlp fallback — can still serve the job.
 The generic ``/transcript`` endpoint fetches an existing caption track
 (``mode=native``) or falls back to AI transcription (``mode=generate``/
 ``mode=auto``), so captionless videos get a transcript too. Longer
-generations return HTTP 202 with a ``jobId`` that must be polled.
+generations return HTTP 202 with a ``jobId`` instead of a result; the worker
+does not block-poll that job. Each ``fetch`` makes one call — either to queue
+the job (202) or to check a previously queued ``jobId`` via a resume token —
+and raises :class:`TranscriptJobPending` while the job is still processing so
+the Celery task can retry later with backoff.
 
 The API returns transcript ``chunks`` with millisecond ``offset``/``duration``;
 word records are derived from each chunk so word-level search keeps working at
 caption-line granularity.
 """
 
-import asyncio
 import math
 from dataclasses import dataclass
 
@@ -26,6 +29,7 @@ from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.providers.transcript import (
     TranscriptData,
+    TranscriptJobPending,
     TranscriptWordData,
     _close_word_times,
     _language_base,
@@ -35,8 +39,6 @@ logger = get_logger(__name__)
 
 _BASE_URL = "https://api.supadata.ai/v1"
 _TIMEOUT_SECONDS = 45.0
-_POLL_INTERVAL_SECONDS = 1
-_MAX_POLL_ATTEMPTS = 300
 
 _PERMANENT_ERRORS = {
     "invalid-request",
@@ -84,31 +86,58 @@ class SupadataTranscriptProvider:
         self.transport = transport
         self.headers = {"x-api-key": api_key, "Content-Type": "application/json"}
 
-    async def fetch(self, youtube_url: str, youtube_video_id: str = "") -> SupadataResult | None:
+    async def fetch(
+        self,
+        youtube_url: str,
+        youtube_video_id: str = "",
+        resume_token: str = "",
+    ) -> SupadataResult | None:
         """Fetch a transcript for a YouTube video.
 
         Uses ``mode=auto``: native captions when available, otherwise Supadata
-        AI-generates the transcript (no yt-dlp on our side). Returns ``None``
-        when no transcript could be produced (caller should move to the next
-        provider). Raises :class:`ExternalServiceError` on API, account or
-        permanent video errors.
+        AI-generates the transcript (no yt-dlp on our side). Each call makes
+        exactly one Supadata request: without ``resume_token`` it queues a new
+        transcript job (raising :class:`TranscriptJobPending` on a 202), and
+        with one it checks that job's current state. Returns ``None`` when no
+        transcript could be produced (caller should move to the next provider).
+        Raises :class:`ExternalServiceError` on API, account or permanent
+        video errors.
         """
         headers = self.headers
         try:
             async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
-                response = await client.get(
-                    f"{self.base_url}/transcript",
-                    params={"url": youtube_url, "lang": self.lang, "mode": self.mode},
-                    headers=headers,
-                )
-                if response.status_code == 206:
-                    logger.info("Supadata found no transcript", youtube_url=youtube_url)
-                    return None
-                if response.status_code == 202:
-                    payload = await self._poll_job(client, response, youtube_url)
-                elif response.status_code != 200:
-                    self._raise_http_error(response, youtube_url)
+                if resume_token:
+                    payload = await self._job_result(client, resume_token, youtube_url)
                 else:
+                    response = await client.get(
+                        f"{self.base_url}/transcript",
+                        params={"url": youtube_url, "lang": self.lang, "mode": self.mode},
+                        headers=headers,
+                    )
+                    if response.status_code == 206:
+                        logger.info("Supadata found no transcript", youtube_url=youtube_url)
+                        return None
+                    if response.status_code == 202:
+                        job_id = str(response.json().get("jobId") or "")
+                        if not job_id:
+                            raise SupadataPermanentError(
+                                "No transcript could be produced",
+                                service="supadata",
+                                details={"status_code": response.status_code},
+                            ) from None
+                        logger.info(
+                            "Supadata transcript job queued",
+                            job_id=job_id,
+                            youtube_url=youtube_url,
+                        )
+                        raise TranscriptJobPending(
+                            message="Transcription service is still processing; will retry later",
+                            provider="supadata",
+                            resume_token=job_id,
+                            resumable=True,
+                        ) from None
+                    if response.status_code != 200:
+                        self._raise_http_error(response, youtube_url)
                     payload = response.json()
                 chunks = _normalize_chunks(payload.get("content"))
                 if not chunks:
@@ -141,43 +170,42 @@ class SupadataTranscriptProvider:
             transcript=transcript,
         )
 
-    async def _poll_job(
+    async def _job_result(
         self,
         client: httpx.AsyncClient,
-        response: httpx.Response,
+        resume_token: str,
         youtube_url: str,
     ) -> dict:
-        """Poll an async transcript job (HTTP 202) until it completes."""
-        job_id = str(response.json().get("jobId") or "")
-        if not job_id:
+        """Fetch an async transcript job's current state in a single request."""
+        polled = await client.get(
+            f"{self.base_url}/transcript/{resume_token}", headers=self.headers
+        )
+        if polled.status_code != 200:
+            self._raise_http_error(polled, youtube_url)
+        data = polled.json()
+        status = str(data.get("status") or "")
+        if status == "completed":
+            return {
+                "content": data.get("content"),
+                "lang": data.get("lang", "en"),
+                "availableLangs": data.get("availableLangs", []),
+            }
+        if status == "failed":
             raise SupadataPermanentError(
-                "No transcript could be produced",
+                "Could not fetch the transcript for this video",
                 service="supadata",
-                details={"status_code": response.status_code},
+                details={"message": str(data.get("error") or "")},
             ) from None
-        logger.info("Supadata transcript job queued", job_id=job_id, youtube_url=youtube_url)
-        for _ in range(_MAX_POLL_ATTEMPTS):
-            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-            polled = await client.get(f"{self.base_url}/transcript/{job_id}", headers=self.headers)
-            if polled.status_code != 200:
-                self._raise_http_error(polled, youtube_url)
-            data = polled.json()
-            status = str(data.get("status") or "")
-            if status == "completed":
-                return {
-                    "content": data.get("content"),
-                    "lang": data.get("lang", "en"),
-                    "availableLangs": data.get("availableLangs", []),
-                }
-            if status == "failed":
-                raise SupadataPermanentError(
-                    "Could not fetch the transcript for this video",
-                    service="supadata",
-                    details={"message": str(data.get("error") or "")},
-                ) from None
-        raise ExternalServiceError(
-            "Transcription service timed out; try again later",
-            service="supadata",
+        logger.info(
+            "Supadata transcript job still processing",
+            job_id=resume_token,
+            youtube_url=youtube_url,
+        )
+        raise TranscriptJobPending(
+            message="Transcription service is still processing; will retry later",
+            provider="supadata",
+            resume_token=resume_token,
+            resumable=True,
         ) from None
 
     async def _fetch_metadata(

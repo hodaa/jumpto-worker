@@ -7,14 +7,16 @@ import pytest
 
 from app.core.exceptions import ExternalServiceError
 from app.models import JobData, TranscriptSubmission
-from app.providers import TranscriptData, TranscriptWordData, VidWordsResult
+from app.providers import TranscriptData, TranscriptJobPending, TranscriptWordData, VidWordsResult
 from app.tasks import transcription as transcription_module
 from app.tasks.transcription import (
     _build_submission,
     _fetch_transcript_with_retry,
+    _job_retry_countdown,
     _live_pipeline_enabled,
     _perform_transcription,
     _user_safe_message,
+    download_and_transcribe,
     run_pipeline,
 )
 
@@ -102,7 +104,7 @@ class TestRunPipeline:
         settings = _settings(live_calls=False)
         monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
 
-        def boom(job):
+        def boom(job, resume_token="", resume_provider=""):
             raise RuntimeError("boom")
 
         monkeypatch.setattr(transcription_module, "_perform_transcription", boom)
@@ -112,6 +114,38 @@ class TestRunPipeline:
 
         assert client.failed is True
         assert client.calls[-1] == "fail"
+
+    @pytest.mark.asyncio
+    async def test_first_attempt_advances_then_raises_pending(self, monkeypatch) -> None:
+        client = _FakeClient()
+        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+
+        def pending(job, resume_token="", resume_provider=""):
+            raise TranscriptJobPending(provider="supadata", resume_token="job-x")
+
+        monkeypatch.setattr(transcription_module, "_perform_transcription", pending)
+
+        with pytest.raises(TranscriptJobPending):
+            await run_pipeline("job-1")
+
+        assert client.calls == ["get_job", "advance"]
+        assert client.failed is False
+
+    @pytest.mark.asyncio
+    async def test_resume_pending_is_not_advanced_or_failed(self, monkeypatch) -> None:
+        client = _FakeClient(status="processing")
+        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+
+        def pending(job, resume_token="", resume_provider=""):
+            raise TranscriptJobPending(provider="supadata", resume_token="job-x")
+
+        monkeypatch.setattr(transcription_module, "_perform_transcription", pending)
+
+        with pytest.raises(TranscriptJobPending):
+            await run_pipeline("job-1", resume_token="job-x", resume_provider="supadata")
+
+        assert client.calls == ["get_job"]
+        assert client.failed is False
 
     def test_user_safe_message_maps_errors(self) -> None:
         assert (
@@ -280,6 +314,30 @@ class TestCloudProviderChain:
         second.fetch.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_resume_token_routed_only_to_its_provider(self, monkeypatch) -> None:
+        first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=_cloud_result()))
+        second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
+        monkeypatch.setattr(transcription_module, "_cloud_providers", lambda: [first, second])
+
+        submission = await _perform_transcription(
+            _job(), resume_token="job-x", resume_provider="supadata"
+        )
+
+        assert submission.provider == "vidwords"
+        first.fetch.assert_awaited_once_with(
+            "https://www.youtube.com/watch?v=abcde12345", "abcde12345", resume_token=""
+        )
+        second.fetch.assert_not_awaited()
+
+        first.fetch.reset_mock()
+        first.fetch.return_value = None
+        await _perform_transcription(_job(), resume_token="job-x", resume_provider="supadata")
+
+        second.fetch.assert_awaited_once_with(
+            "https://www.youtube.com/watch?v=abcde12345", "abcde12345", resume_token="job-x"
+        )
+
+    @pytest.mark.asyncio
     async def test_all_miss_falls_back_to_ytdlp_path(self, monkeypatch) -> None:
         first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=None))
         second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=None))
@@ -331,7 +389,7 @@ class TestFailureMarking:
         settings = _settings(live_calls=False)
         monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
 
-        def boom(job):
+        def boom(job, resume_token="", resume_provider=""):
             raise RuntimeError("transcription boom")
 
         monkeypatch.setattr(transcription_module, "_perform_transcription", boom)
@@ -340,6 +398,118 @@ class TestFailureMarking:
             await run_pipeline("job-1")
 
         assert client.calls[-1] == "fail"
+
+
+class TestDownloadAndTranscribe:
+    """Tests for the Celery task's retry-based async-job wait."""
+
+    async def _pending_pipeline(
+        self, job_id: str, resume_token: str = "", resume_provider: str = ""
+    ) -> None:
+        raise TranscriptJobPending(provider="supadata", resume_token="job-x")
+
+    async def _non_resumable_pending_pipeline(
+        self, job_id: str, resume_token: str = "", resume_provider: str = ""
+    ) -> None:
+        raise TranscriptJobPending(
+            provider="transcriptfetch", resume_token="job-x", resumable=False
+        )
+
+    def test_retries_pending_job_with_backoff(self, monkeypatch) -> None:
+        monkeypatch.setattr(transcription_module, "run_pipeline", self._pending_pipeline)
+
+        stub = _StubTask(retries=0)
+        with pytest.raises(_RetryRaised):
+            download_and_transcribe.run.__func__(stub, "job-1")
+
+        max_retries, countdown, args = stub.retry_call
+        assert max_retries == transcription_module._CLOUD_JOB_ATTEMPTS
+        assert countdown == 2
+        assert args == ["job-1", "job-x", "supadata"]
+
+    def test_escapes_successfully_when_job_completes(self, monkeypatch) -> None:
+        async def completed(job_id: str, resume_token: str = "", resume_provider: str = "") -> dict:
+            return {"status": "completed"}
+
+        monkeypatch.setattr(transcription_module, "run_pipeline", completed)
+        stub = _StubTask(retries=3)
+
+        result = download_and_transcribe.run.__func__(stub, "job-1", "job-x", "supadata")
+
+        assert result == {"status": "completed"}
+        assert stub.retry_call is None
+
+    def test_marks_job_failed_once_wait_budget_exhausted(self, monkeypatch) -> None:
+        monkeypatch.setattr(transcription_module, "run_pipeline", self._pending_pipeline)
+
+        client = _FakeClient()
+        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+        settings = _settings(live_calls=False)
+        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
+
+        stub = _StubTask(retries=transcription_module._CLOUD_JOB_ATTEMPTS - 1)
+        with pytest.raises(TranscriptJobPending):
+            download_and_transcribe.run.__func__(stub, "job-1", "job-x", "supadata")
+
+        assert stub.retry_call is None
+        assert client.failed is True
+        assert client.calls == ["fail"]
+
+    def test_non_resumable_pending_fails_job_without_retry(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            transcription_module, "run_pipeline", self._non_resumable_pending_pipeline
+        )
+
+        client = _FakeClient()
+        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+        settings = _settings(live_calls=False)
+        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
+
+        stub = _StubTask(retries=0)
+        with pytest.raises(TranscriptJobPending):
+            download_and_transcribe.run.__func__(stub, "job-1")
+
+        assert stub.retry_call is None
+        assert client.failed is True
+        assert client.calls == ["fail"]
+
+    def test_retries_failed_job_routes_resume_token_to_its_provider(self, monkeypatch) -> None:
+        captured: dict = {}
+
+        async def routed_pipeline(
+            job_id: str, resume_token: str = "", resume_provider: str = ""
+        ) -> dict:
+            captured["resume_token"] = resume_token
+            captured["resume_provider"] = resume_provider
+            raise TranscriptJobPending(provider="supadata", resume_token="job-x")
+
+        monkeypatch.setattr(transcription_module, "run_pipeline", routed_pipeline)
+        stub = _StubTask(retries=1)
+        with pytest.raises(_RetryRaised):
+            download_and_transcribe.run.__func__(stub, "job-1", "job-x", "supadata")
+
+        assert captured == {"resume_token": "job-x", "resume_provider": "supadata"}
+
+    def test_job_retry_countdown_caps_at_max(self) -> None:
+        assert _job_retry_countdown(0) == 2
+        assert _job_retry_countdown(4) == 32
+        assert _job_retry_countdown(10) == 60
+
+
+class _RetryRaised(Exception):
+    """Sentinel raised by the fake Celery task ``retry``."""
+
+
+class _StubTask:
+    """Minimal stand-in for the bound Celery task ``self``."""
+
+    def __init__(self, retries: int = 0) -> None:
+        self.request = SimpleNamespace(retries=retries)
+        self.retry_call: tuple | None = None
+
+    def retry(self, exc=None, max_retries=None, countdown=None, args=None) -> None:
+        self.retry_call = (max_retries, countdown, args)
+        raise _RetryRaised()
 
 
 class _FakeClient:
@@ -407,7 +577,7 @@ def _cloud_result(title: str = "Me at the zoo") -> VidWordsResult:
     )
 
 
-async def _perform_mock(job):
+async def _perform_mock(job, resume_token="", resume_provider=""):
     """Mock the transcription step to return a submission."""
     return _build_submission(_media(), _transcript())
 
