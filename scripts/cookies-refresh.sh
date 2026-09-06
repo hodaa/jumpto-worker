@@ -46,7 +46,9 @@ fi
 echo "$(date '+%F %T') cookie refresh requested; exporting from Chromium ..."
 
 # --- Export from the chromium container -------------------------------------
-if ! docker exec "$CHROMIUM_CONTAINER" python3 "$CDP_SCRIPT"; then
+# --user root: the export writes /etc/jumpto/fresh-cookies.txt, and the
+# container's default user (abc) cannot write into /etc/jumpto.
+if ! docker exec --user root "$CHROMIUM_CONTAINER" python3 "$CDP_SCRIPT"; then
   notify "JumpTo: Chromium cookie export failed" \
     "The chromium container could not export cookies. Is it running and logged in?" warning
   exit 1
