@@ -1,0 +1,38 @@
+# Extends the linuxserver Chromium image with the Python tooling needed for
+# the JumpTo host-side cookie refresh. The refresh script must run INSIDE the
+# container (its DevTools endpoint only listens on the container loopback).
+#
+# Build (on the VPS, where the chromium container runs):
+#   docker build -f scripts/chromium-cdp-Dockerfile -t chromium-cdp scripts/
+#
+# Then swap the running container to this image while keeping its profile
+# (signed-in YouTube session):
+#   docker stop chromium
+#   docker rm chromium
+#   docker run -d --name chromium --restart=unless-stopped \
+#     -p 127.0.0.1:3001:3001 -p 127.0.0.1:9222:9222 \
+#     --tmpfs /dev/shm \
+#     -v /etc/jumpto/chromium/profile:/config \
+#     -v /etc/jumpto:/etc/jumpto \
+#     -v /etc/localtime:/etc/localtime:ro \
+#     chromium-cdp
+#   # Sign in once: docker exec chromium chromium-browser --no-sandbox
+#   # (change KASM/headless flags to match your existing container)
+#
+# The /etc/jumpto mount is REQUIRED: the exporter writes
+# /etc/jumpto/fresh-cookies.txt INSIDE the container, and cookies-refresh.sh
+# reads that exact path on the host. Keep whatever /etc/jumpto/chromium/
+# profile mount your current chromium container uses so the YouTube login
+# survives the swap.
+
+FROM lscr.io/linuxserver/chromium
+
+# Kept intentionally OUTSIDE the chromium runtime python env: a plain
+# Debian/Ubuntu python3 plus the websocket-client wheel is all the exporter
+# needs, and it avoids disturbing the chromium runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir websocket-client==1.8.0
+
+COPY refresh_cookies.py /opt/jumpto/refresh_cookies.py

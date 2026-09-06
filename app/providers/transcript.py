@@ -16,7 +16,7 @@ import httpx
 from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
-from app.providers.ytdlp import build_ydlp_options
+from app.providers.ytdlp import build_ydlp_options, is_youtube_bot_check, request_cookie_refresh
 
 logger = get_logger(__name__)
 
@@ -188,6 +188,8 @@ def _download_caption(
                 "yt-dlp failed to download captions",
                 error=str(exc),
             )
+            if is_youtube_bot_check(exc):
+                request_cookie_refresh()
             raise ExternalServiceError(
                 "Failed to download captions", service="youtube-captions"
             ) from exc
@@ -203,11 +205,16 @@ def _download_caption(
 
 def _extract_video_info(youtube_url: str) -> dict:
     """Extract full video metadata (including caption tracks) with yt-dlp."""
-    import yt_dlp  # Optional dependency, only needed for live calls
+    import yt_dlp
 
     options = build_ydlp_options(skip_download=True)
-    with yt_dlp.YoutubeDL(options) as ydl:
-        return ydl.extract_info(youtube_url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return ydl.extract_info(youtube_url, download=False)
+    except yt_dlp.utils.DownloadError as exc:
+        if is_youtube_bot_check(exc):
+            request_cookie_refresh()
+        raise
 
 
 def _select_caption_language(info: dict, supported: tuple[str, ...]) -> str:
@@ -441,8 +448,13 @@ def _run_download(options: dict, youtube_url: str) -> None:
     """Run a yt-dlp audio download for a URL."""
     import yt_dlp
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        ydl.download([youtube_url])
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([youtube_url])
+    except yt_dlp.utils.DownloadError as exc:
+        if is_youtube_bot_check(exc):
+            request_cookie_refresh()
+        raise
 
 
 def _remove_file(path: str) -> None:

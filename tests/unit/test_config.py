@@ -106,3 +106,24 @@ class TestResolvedYtDlpCookieFile:
         settings = Settings(_env_file=None, ytdlp_cookie_file="")
         monkeypatch.setattr(Path, "is_file", lambda self: False)
         assert settings.resolved_ytdlp_cookie_file is None
+
+
+class TestCookieRefreshMarkerPath:
+    """Tests for the cookie-refresh marker path setting."""
+
+    def test_defaults_to_worker_state_marker(self) -> None:
+        assert (
+            Settings(_env_file=None).cookie_refresh_marker_path
+            == "/var/lib/jumpto/state/refresh-requested"
+        )
+
+    def test_reads_configured_value_from_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("COOKIE_REFRESH_MARKER_PATH", "/etc/jumpto/state/refresh-requested")
+        assert (
+            Settings(_env_file=None).cookie_refresh_marker_path
+            == "/etc/jumpto/state/refresh-requested"
+        )
+
+    def test_empty_value_disables_marker(self, monkeypatch) -> None:
+        monkeypatch.setenv("COOKIE_REFRESH_MARKER_PATH", "")
+        assert Settings(_env_file=None).cookie_refresh_marker_path == ""

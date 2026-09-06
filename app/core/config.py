@@ -165,6 +165,15 @@ class Settings(BaseSettings):
     # host cookies are mounted at a well-known path (see docker-compose.yml).
     mounted_ytdlp_cookie_file: str = "/etc/jumpto/cookies.txt"
 
+    # When yt-dlp hits YouTube's "Sign in to confirm you're not a bot", the
+    # worker touches this marker file so a host-side cron can re-export cookies
+    # from the authenticated Chromium container and replace the cookie file.
+    # Leave empty to disable the auto-refresh trigger (marker never written).
+    cookie_refresh_marker_path: str = Field(
+        default="/var/lib/jumpto/state/refresh-requested",
+        description="Path worker touches to request a host-side cookie refresh (COOKIE_REFRESH_MARKER_PATH)",
+    )
+
     # Optional HTTP(S)/SOCKS proxy for yt-dlp, e.g. a residential gateway, to
     # avoid YouTube bot-blocks on datacenter IPs (YTDLP_PROXY env var).
     ytdlp_proxy: str = Field(

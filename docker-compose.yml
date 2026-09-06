@@ -14,6 +14,8 @@
         YTDLP_BGUTIL_URL: http://bgutil-pot:4416
       volumes:
         - /etc/jumpto/cookies.txt:/etc/jumpto/cookies.txt:ro
+        # Writable marker that requests a host-side cookie refresh.
+        - /etc/jumpto/state:/var/lib/jumpto/state
       depends_on:
         - bgutil-pot
       command:

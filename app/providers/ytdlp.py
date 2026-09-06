@@ -1,4 +1,4 @@
-"""Shared yt-dlp option building so every provider uses the same auth/cookies."""
+"""Shared yt-dlp option building and bot-check handling."""
 
 import atexit
 import contextlib
@@ -8,6 +8,13 @@ import tempfile
 from pathlib import Path
 
 from app.core.config import get_settings
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+# YouTube's bot-check message surfaced by yt-dlp when the requester looks
+# like an automated client rather than a signed-in browser.
+_BOT_CHECK_MARKERS = ("sign in to confirm you're not a bot",)
 
 # Temp copies of the cookie file created so yt-dlp can refresh them even when
 # the mounted source (e.g. /etc/jumpto/cookies.txt) is read-only.
@@ -68,3 +75,25 @@ def build_ydlp_options(**overrides: object) -> dict:
     options["remote_components"] = ["ejs:github"]
     options.update(overrides)
     return options
+
+
+def is_youtube_bot_check(error: BaseException | str) -> bool:
+    """Return True when a yt-dlp error is YouTube's "not a bot" bot-check."""
+    text = str(error).lower()
+    return any(marker in text for marker in _BOT_CHECK_MARKERS)
+
+
+def request_cookie_refresh() -> None:
+    """Touch the cookie-refresh marker so the host re-exports cookies.
+
+    No-op when ``cookie_refresh_marker_path`` is empty or the marker already
+    exists, so a bot-check storm only raises the flag once.
+    """
+    marker = Path(get_settings().cookie_refresh_marker_path or "").expanduser()
+    if not marker.parts or marker.exists():
+        return
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch(exist_ok=True)
+    except OSError as exc:
+        logger.warning("Could not write cookie-refresh marker", path=str(marker), error=str(exc))
