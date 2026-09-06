@@ -25,8 +25,11 @@ if broker_url.startswith("rediss://"):
         "ssl_cert_reqs": ssl.CERT_REQUIRED,
     }
 elif broker_url.startswith("amqps://"):
+    # The amqp/pyamqp transport expects amqp-style ssl options (cert_reqs,
+    # not redis's ssl_cert_reqs) and loads the system CA store when none is
+    # given, so a plain cert_reqs verifies against trusted CAs.
     celery_app.conf.broker_use_ssl = {
-        "ssl_cert_reqs": ssl.CERT_REQUIRED,
+        "cert_reqs": ssl.CERT_REQUIRED,
     }
 
 celery_app.conf.broker_connection_retry_on_startup = True
