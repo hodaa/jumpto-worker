@@ -16,7 +16,12 @@ import httpx
 from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
-from app.providers.ytdlp import build_ydlp_options, is_youtube_bot_check, request_cookie_refresh
+from app.providers.ytdlp import (
+    build_ydlp_options,
+    is_youtube_bot_check,
+    release_temp_cookie,
+    request_cookie_refresh,
+)
 
 logger = get_logger(__name__)
 
@@ -82,8 +87,13 @@ class TranscriptProvider(ABC):
     async def fetch(
         self,
         youtube_url: str,
+        info: dict | None = None,
     ) -> TranscriptData:
-        """Fetch transcript data for a YouTube URL."""
+        """Fetch transcript data for a YouTube URL.
+
+        ``info`` carries an already-extracted yt-dlp metadata dict so the
+        provider can skip a redundant ``extract_info`` call.
+        """
 
 
 class FakeTranscriptProvider(TranscriptProvider):
@@ -124,6 +134,7 @@ class FakeTranscriptProvider(TranscriptProvider):
     async def fetch(
         self,
         youtube_url: str,
+        info: dict | None = None,
     ) -> TranscriptData:
         """Build a deterministic transcript from a fixed corpus."""
         words = [
@@ -165,6 +176,10 @@ def _download_caption(
     yt-dlp handles YouTube client impersonation and retries so the caption
     endpoint is reached without the rate limiting that raw HTTP fetches hit.
     A single best-language track is downloaded to minimize caption requests.
+
+    When ``info`` is provided it is replayed through ``process_ie_result`` so
+    yt-dlp downloads captions without re-extracting the video metadata; the
+    ``requested_subtitles`` list is recomputed from the cached caption tracks.
     """
     if info is None:
         info = _extract_video_info(youtube_url)
@@ -182,7 +197,7 @@ def _download_caption(
 
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
-                ydl.extract_info(youtube_url, download=True)
+                ydl.process_ie_result(info, download=True)
         except yt_dlp.utils.DownloadError as exc:
             logger.warning(
                 "yt-dlp failed to download captions",
@@ -200,6 +215,7 @@ def _download_caption(
         text = chosen.read_text(encoding="utf-8", errors="replace")
         return text, _caption_language(chosen.name)
     finally:
+        release_temp_cookie(options)
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -215,6 +231,8 @@ def _extract_video_info(youtube_url: str) -> dict:
         if is_youtube_bot_check(exc):
             request_cookie_refresh()
         raise
+    finally:
+        release_temp_cookie(options)
 
 
 def _select_caption_language(info: dict, supported: tuple[str, ...]) -> str:
@@ -341,9 +359,10 @@ class AssemblyTranscriptProvider(TranscriptProvider):
     async def fetch(
         self,
         youtube_url: str,
+        info: dict | None = None,
     ) -> TranscriptData:
         """Download the audio and transcribe it via Assembly.ai."""
-        audio_path = await asyncio.to_thread(_download_audio, youtube_url)
+        audio_path = await asyncio.to_thread(_download_audio, youtube_url, info)
         try:
             headers = {"authorization": self.api_key}
             async with httpx.AsyncClient() as client:
@@ -419,7 +438,7 @@ class AssemblyTranscriptProvider(TranscriptProvider):
         raise ExternalServiceError("Transcription timed out", service="assemblyai")
 
 
-def _download_audio(youtube_url: str) -> str:
+def _download_audio(youtube_url: str, info: dict | None = None) -> str:
     """Download a YouTube audio stream to a temp file and return its path."""
     fd, path = tempfile.mkstemp(suffix=".webm")
     os.close(fd)
@@ -430,7 +449,7 @@ def _download_audio(youtube_url: str) -> str:
         outtmpl=path,
     )
     try:
-        _run_download(options, youtube_url)
+        _run_download(options, youtube_url, info)
         if not destination.exists() or destination.stat().st_size == 0:
             logger.error("Audio download produced no file", path=path)
             raise ExternalServiceError("Audio download produced no file", service="yt-dlp")
@@ -444,17 +463,28 @@ def _download_audio(youtube_url: str) -> str:
         raise ExternalServiceError("Could not download audio", service="yt-dlp") from exc
 
 
-def _run_download(options: dict, youtube_url: str) -> None:
-    """Run a yt-dlp audio download for a URL."""
+def _run_download(options: dict, youtube_url: str, info: dict | None = None) -> None:
+    """Run a yt-dlp audio download for a URL.
+
+    With ``info`` (a pre-extracted metadata dict) the download replays it
+    through ``process_ie_result`` instead of running a fresh ``extract_info``,
+    halving the YouTube requests per video. Without it, falls back to a
+    standard download.
+    """
     import yt_dlp
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.download([youtube_url])
+            if info is not None:
+                ydl.process_ie_result(info, download=True)
+            else:
+                ydl.download([youtube_url])
     except yt_dlp.utils.DownloadError as exc:
         if is_youtube_bot_check(exc):
             request_cookie_refresh()
         raise
+    finally:
+        release_temp_cookie(options)
 
 
 def _remove_file(path: str) -> None:

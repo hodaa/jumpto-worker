@@ -19,6 +19,7 @@ from app.providers.transcript import (
     _parse_assembly_transcript,
     _parse_vtt,
     _preferred_vtt_file,
+    _run_download,
     _select_caption_language,
     get_transcript_provider,
 )
@@ -139,7 +140,9 @@ class TestAssignmentFetcher:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"fake-audio")
 
-        monkeypatch.setattr("app.providers.transcript._download_audio", lambda url: str(audio_file))
+        monkeypatch.setattr(
+            "app.providers.transcript._download_audio", lambda url, info=None: str(audio_file)
+        )
 
         upload_response = Mock(status_code=200)
         upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/fake"}
@@ -265,14 +268,36 @@ class TestYouTubeCaptionFetcher:
         assert transcript.words[0].start_time == pytest.approx(0.5)
 
 
+class _ReplayYoutubeDL:
+    """Stands in for yt-dlp and records whether it replayed cached info."""
+
+    def __init__(self, options: dict) -> None:
+        self.options = options
+        self.replayed: tuple[dict, bool] | None = None
+        self.downloaded: list[str] | None = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_: object) -> bool:
+        return False
+
+    def process_ie_result(self, info: dict, download: bool = True) -> dict:
+        self.replayed = (info, download)
+        return info
+
+    def download(self, url_list: list[str]) -> None:
+        self.downloaded = url_list
+
+
 class TestDownloadCaptionMetadataReuse:
-    """Tests that a pre-fetched metadata dict avoids a redundant extract_info."""
+    """Tests that pre-fetched yt-dlp metadata is replayed, not re-extracted."""
 
     def test_reuses_provided_info_without_re_extracting(self, monkeypatch, tmp_path) -> None:
-        from unittest.mock import Mock
-
         extract = Mock()
+        fake = _ReplayYoutubeDL({})
         monkeypatch.setattr("app.providers.transcript._extract_video_info", extract)
+        monkeypatch.setattr("yt_dlp.YoutubeDL", lambda options: fake)
         info = {
             "automatic_captions": {"en-orig": [{"ext": "vtt"}]},
             "subtitles": {},
@@ -282,6 +307,25 @@ class TestDownloadCaptionMetadataReuse:
             _download_caption("https://youtu.be/abcde12345", ("en", "ar"), info)
 
         extract.assert_not_called()
+        assert fake.replayed == (info, True)
+
+    def test_run_download_replays_info_without_re_extracting(self, monkeypatch) -> None:
+        fake = _ReplayYoutubeDL({})
+        monkeypatch.setattr("yt_dlp.YoutubeDL", lambda options: fake)
+        info = {"id": "abc", "title": "t", "formats": []}
+
+        _run_download({}, "https://youtu.be/abc", info)
+
+        assert fake.replayed == (info, True)
+
+    def test_run_download_still_extracts_when_no_info(self, monkeypatch) -> None:
+        fake = _ReplayYoutubeDL({})
+        monkeypatch.setattr("yt_dlp.YoutubeDL", lambda options: fake)
+
+        _run_download({}, "https://youtu.be/abc")
+
+        assert fake.replayed is None
+        assert fake.downloaded == ["https://youtu.be/abc"]
 
     def test_extracts_when_info_not_provided(self, monkeypatch, tmp_path) -> None:
         from unittest.mock import Mock
@@ -303,6 +347,7 @@ class TestYdlpOptions:
             resolved_ytdlp_cookie_file=cookie_file,
             ytdlp_proxy="http://user:pass@residential:8080",
             ytdlp_bgutil_url="",
+            ytdlp_socket_timeout=30,
         )
 
     def test_sets_writable_cookie_copy_and_proxy_when_configured(
@@ -325,6 +370,7 @@ class TestYdlpOptions:
             resolved_ytdlp_cookie_file=None,
             ytdlp_proxy="",
             ytdlp_bgutil_url="",
+            ytdlp_socket_timeout=30,
         )
         monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: settings)
 
@@ -341,6 +387,7 @@ class TestYdlpOptions:
             resolved_ytdlp_cookie_file=str(source),
             ytdlp_proxy="",
             ytdlp_bgutil_url="http://bgutil-pot:4416",
+            ytdlp_socket_timeout=30,
         )
         monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: settings)
 

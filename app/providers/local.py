@@ -12,6 +12,7 @@ from app.core.config import _live_pipeline_enabled, get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.providers.base import TranscriptProviderStrategy, VideoTranscriptResult
+from app.providers.cache import extract_youtube_video_id, get_transcript_cache
 from app.providers.media import get_media_info_with_raw
 from app.providers.transcript import (
     TranscriptData,
@@ -43,18 +44,33 @@ class YtDlpTranscriptStrategy(TranscriptProviderStrategy):
         captionless or failing videos fall back to audio transcription via
         Assembly.ai. ``resume_token`` is accepted for interface uniformity but
         never used (this strategy is synchronous).
+
+        When the live pipeline is on, finished transcripts are cached in Redis
+        keyed by the video id, so a later job for the same video skips yt-dlp
+        entirely. The id comes from the job when present or is parsed from the
+        URL otherwise; unparseable ids simply disable caching.
         """
+        video_id = youtube_video_id or extract_youtube_video_id(youtube_url)
+        cache = get_transcript_cache() if _live_pipeline_enabled(get_settings()) else None
+        if cache is not None and video_id:
+            cached = await asyncio.to_thread(cache.get, video_id)
+            if cached is not None:
+                logger.info("Transcript cache hit", video_id=video_id)
+                return cached
         media, info = await asyncio.to_thread(
             get_media_info_with_raw, youtube_video_id, youtube_url
         )
         transcript = await _fetch_transcript_with_retry(youtube_url, info)
-        return VideoTranscriptResult(
+        result = VideoTranscriptResult(
             title=media.title,
             author="",
             duration_seconds=media.duration_seconds,
             is_generated=False,
             transcript=transcript,
         )
+        if cache is not None and video_id:
+            await asyncio.to_thread(cache.set, video_id, result)
+        return result
 
 
 async def _fetch_transcript_with_retry(
@@ -74,7 +90,7 @@ async def _fetch_transcript_with_retry(
     last_error: Exception | None = None
     for attempt in range(_RETRY_ATTEMPTS):
         try:
-            return await provider.fetch(youtube_url)
+            return await provider.fetch(youtube_url, info=info)
         except ExternalServiceError as exc:
             last_error = exc
             logger.warning("Transcript fetch attempt failed", attempt=attempt + 1)
@@ -82,4 +98,4 @@ async def _fetch_transcript_with_retry(
                 await asyncio.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
     if last_error:
         raise last_error
-    return await provider.fetch(youtube_url)  # pragma: no cover
+    return await provider.fetch(youtube_url, info=info)  # pragma: no cover

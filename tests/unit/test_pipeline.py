@@ -208,7 +208,7 @@ class TestFetchTranscriptWithRetry:
         settings = _settings(live_calls=True, mode="real")
         monkeypatch.setattr(local_module, "get_settings", lambda: settings)
 
-        def fail(url):
+        def fail(url, info=None):
             raise ExternalServiceError("No captions", service="youtube-captions")
 
         youtube_provider = AsyncMock()
@@ -233,7 +233,7 @@ class TestFetchTranscriptWithRetry:
         monkeypatch.setattr(local_module, "_RETRY_ATTEMPTS", 2)
         monkeypatch.setattr(local_module, "_RETRY_DELAY_SECONDS", 0)
 
-        def fail(url):
+        def fail(url, info=None):
             raise ExternalServiceError("boom", service="assemblyai")
 
         fallback = AsyncMock()

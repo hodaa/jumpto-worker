@@ -190,6 +190,28 @@ class Settings(BaseSettings):
         description="Base URL of the bgutil-ytdlp-pot-provider server (e.g. http://bgutil-pot:4416)",
     )
 
+    # Socket timeout (seconds) for yt-dlp network requests. Bounds how long a
+    # hung YouTube response can pin a worker thread before the retry backoff
+    # kicks in; without it a stalled connection could idle a to_thread slot
+    # for minutes.
+    ytdlp_socket_timeout: float = Field(
+        default=30,
+        ge=1,
+        description="Network socket timeout (seconds) for yt-dlp requests (YTDLP_SOCKET_TIMEOUT)",
+    )
+
+    # Worker-side transcript cache (Redis). Reprocessing the same YouTube video
+    # is served from cache keyed by video id instead of re-running yt-dlp.
+    transcript_cache_enabled: Annotated[bool, BeforeValidator(_coerce_bool)] = Field(
+        default=True,
+        description="Enable the Redis-backed worker transcript cache (TRANSCRIPT_CACHE_ENABLED)",
+    )
+    transcript_cache_ttl_seconds: int = Field(
+        default=86400,
+        ge=0,
+        description="How long a cached transcript stays valid (TRANSCRIPT_CACHE_TTL_SECONDS)",
+    )
+
     @property
     def resolved_ytdlp_cookie_file(self) -> str | None:
         """Return cookie file path if set and exists, else None."""

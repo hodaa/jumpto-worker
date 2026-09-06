@@ -44,6 +44,24 @@ def _writable_cookie_copy(cookie_file: str) -> str:
         _temp_cookie_copies.append(tmp)
 
 
+def release_temp_cookie(options: dict) -> None:
+    """Delete and forget the temp cookie copy wired into ``options``.
+
+    Call after the yt-dlp run that built ``options`` finishes (success or
+    failure) so temp copies don't accumulate for the process lifetime. Keeps
+    the ``_temp_cookie_copies`` registry in sync so ``atexit`` still cleans up
+    copies leaked by crashes or call sites that forget to release. No-op when
+    no cookie was wired or the file is already gone.
+    """
+    cookie = options.get("cookiefile")
+    if not cookie:
+        return
+    with contextlib.suppress(OSError):
+        Path(cookie).unlink(missing_ok=True)
+    with contextlib.suppress(ValueError):
+        _temp_cookie_copies.remove(cookie)
+
+
 def build_ydlp_options(**overrides: object) -> dict:
     """
     Build a base yt-dlp options dict wired with the shared cookie file and
@@ -59,6 +77,7 @@ def build_ydlp_options(**overrides: object) -> dict:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "socket_timeout": settings.ytdlp_socket_timeout,
     }
     cookie_file = settings.resolved_ytdlp_cookie_file
     if cookie_file:

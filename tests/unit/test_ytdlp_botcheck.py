@@ -36,6 +36,9 @@ class _BoomYoutubeDL:
     def download(self, url_list: list[str]) -> None:
         raise yt_dlp.utils.DownloadError(_BOT_CHECK_ERROR)
 
+    def process_ie_result(self, info: dict, download: bool = True) -> dict:
+        raise yt_dlp.utils.DownloadError(_BOT_CHECK_ERROR)
+
 
 def _media_settings(tmp_path) -> SimpleNamespace:
     """Settings that enable live media calls with a refresh marker."""

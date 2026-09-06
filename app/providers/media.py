@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
-from app.providers.ytdlp import build_ydlp_options, is_youtube_bot_check, request_cookie_refresh
+from app.providers.ytdlp import (
+    build_ydlp_options,
+    is_youtube_bot_check,
+    release_temp_cookie,
+    request_cookie_refresh,
+)
 
 logger = get_logger(__name__)
 
@@ -87,26 +92,29 @@ def _fetch_from_yt_dlp(youtube_url: str) -> dict:
 
     options = build_ydlp_options()
     last_error: yt_dlp.utils.DownloadError | None = None
-    for attempt in range(_METADATA_RETRY_ATTEMPTS):
-        try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                return ydl.extract_info(youtube_url, download=False)
-        except yt_dlp.utils.DownloadError as exc:
-            if is_youtube_bot_check(exc):
-                request_cookie_refresh()
-                raise ExternalServiceError(
-                    "Could not fetch video metadata",
-                    service="yt-dlp",
-                ) from exc
-            last_error = exc
-            logger.warning(
-                "yt-dlp metadata fetch attempt failed; retrying",
-                youtube_url=youtube_url,
-                attempt=attempt + 1,
-                error=str(exc),
-            )
-            if attempt + 1 < _METADATA_RETRY_ATTEMPTS:
-                time.sleep(_METADATA_RETRY_DELAY_SECONDS * (attempt + 1))
+    try:
+        for attempt in range(_METADATA_RETRY_ATTEMPTS):
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    return ydl.extract_info(youtube_url, download=False)
+            except yt_dlp.utils.DownloadError as exc:
+                if is_youtube_bot_check(exc):
+                    request_cookie_refresh()
+                    raise ExternalServiceError(
+                        "Could not fetch video metadata",
+                        service="yt-dlp",
+                    ) from exc
+                last_error = exc
+                logger.warning(
+                    "yt-dlp metadata fetch attempt failed; retrying",
+                    youtube_url=youtube_url,
+                    attempt=attempt + 1,
+                    error=str(exc),
+                )
+                if attempt + 1 < _METADATA_RETRY_ATTEMPTS:
+                    time.sleep(_METADATA_RETRY_DELAY_SECONDS * (attempt + 1))
+    finally:
+        release_temp_cookie(options)
     assert last_error is not None
     logger.exception(
         "yt-dlp failed to fetch video metadata after retries",
