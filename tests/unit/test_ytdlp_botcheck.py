@@ -189,8 +189,19 @@ class TestNetscapeExport:
             ]
         )
         by_name = {row["name"]: row for row in rows}
-        assert by_name["a"]["host_only"] == "FALSE"
-        assert by_name["b"]["host_only"] == "TRUE"
+        assert by_name["a"]["include_subdomains"] == "TRUE"
+        assert by_name["b"]["include_subdomains"] == "FALSE"
+
+    def test_maps_session_expires_to_zero(self) -> None:
+        rows = to_netscape_rows(
+            [
+                {"name": "YSC", "value": "1", "domain": ".youtube.com", "expires": -1},
+                {"name": "NID", "value": "2", "domain": ".google.com", "expires": None},
+            ]
+        )
+        by_name = {row["name"]: row for row in rows}
+        assert by_name["YSC"]["expires"] == 0
+        assert by_name["NID"]["expires"] == 0
 
     def test_defaults_path_and_secure(self) -> None:
         rows = to_netscape_rows(
@@ -220,4 +231,4 @@ class TestNetscapeExport:
         assert rc == EXIT_OK
         body = output.read_text().splitlines()
         assert body[0] == "# Netscape HTTP Cookie File"
-        assert ".youtube.com\tFALSE\t/\tFALSE\t0\tSID\tv" in body
+        assert ".youtube.com\tTRUE\t/\tFALSE\t0\tSID\tv" in body

@@ -107,10 +107,16 @@ def to_netscape_rows(cookies: list[dict]) -> list[dict]:
         rows.append(
             {
                 "domain": domain,
-                "host_only": "TRUE" if not domain.startswith(".") else "FALSE",
+                # Netscape format: a leading ".domain" MUST match TRUE here,
+                # or Python's cookiejar rejects the whole file with
+                # "assert domain_specified == initial_dot".
+                "include_subdomains": "TRUE" if domain.startswith(".") else "FALSE",
                 "path": cookie.get("path") or "/",
                 "secure": "TRUE" if cookie.get("secure") else "FALSE",
-                "expires": int(cookie.get("expires") or 0),
+                # CDP reports session cookies as expires=-1; Netscape format
+                # uses 0 for session cookies (anything else triggers a
+                # "skipping cookie ... invalid expires" warning).
+                "expires": max(int(cookie.get("expires") or 0), 0),
                 "name": cookie.get("name", ""),
                 "value": cookie.get("value", ""),
             }
@@ -121,7 +127,7 @@ def to_netscape_rows(cookies: list[dict]) -> list[dict]:
 def format_netscape(rows: list[dict]) -> str:
     """Render rows as a Netscape cookies.txt body (without the header)."""
     lines = [
-        f"{row['domain']}\t{row['host_only']}\t{row['path']}\t"
+        f"{row['domain']}\t{row['include_subdomains']}\t{row['path']}\t"
         f"{row['secure']}\t{row['expires']}\t{row['name']}\t{row['value']}"
         for row in rows
     ]
