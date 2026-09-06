@@ -25,6 +25,7 @@ import httpx
 
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
+from app.providers.base import TranscriptProviderStrategy, VideoTranscriptResult
 from app.providers.transcript import (
     TranscriptData,
     TranscriptJobPending,
@@ -74,17 +75,11 @@ class TranscriptFetchPermanentError(ExternalServiceError):
 
 
 @dataclass(frozen=True)
-class TranscriptFetchResult:
+class TranscriptFetchResult(VideoTranscriptResult):
     """Transcript plus the metadata TranscriptFetch returns for a video."""
 
-    title: str
-    author: str
-    duration_seconds: int
-    is_generated: bool
-    transcript: TranscriptData
 
-
-class TranscriptFetchTranscriptProvider:
+class TranscriptFetchTranscriptProvider(TranscriptProviderStrategy):
     """Fetches transcripts and video metadata from the TranscriptFetch API."""
 
     name = "transcriptfetch"

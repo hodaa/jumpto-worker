@@ -5,9 +5,9 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import AliasChoices, BeforeValidator, Field
+from pydantic import AliasChoices, BeforeValidator, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -32,6 +32,12 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @field_validator("queue_provider", mode="before")
+    @classmethod
+    def _normalize_queue_provider(cls, value: object) -> object:
+        """Lowercase/strip QUEUE_PROVIDER so "Redis"/"RABBITMQ" both work."""
+        return value.strip().lower() if isinstance(value, str) else value
+
     # Backend communication
     backend_url: str = Field(
         default="http://localhost:8000",
@@ -42,10 +48,18 @@ class Settings(BaseSettings):
         description="Shared API key for authenticating to the backend internal API",
     )
 
-    # Celery / Redis
+    # Celery / broker
+    queue_provider: Literal["redis", "rabbitmq"] = Field(
+        default="redis",
+        description="Celery broker transport: redis or rabbitmq (QUEUE_PROVIDER env var)",
+    )
     redis_url: str = Field(
         default="redis://localhost:6379/0",
-        description="Redis connection URL used as the Celery broker",
+        description="Redis connection URL used as the Celery broker (when QUEUE_PROVIDER=redis)",
+    )
+    rabbitmq_url: str = Field(
+        default="amqp://guest:guest@localhost:5672//",
+        description="RabbitMQ connection URL used as the Celery broker (when QUEUE_PROVIDER=rabbitmq)",
     )
     celery_worker_concurrency: int = Field(
         default=8,
@@ -121,6 +135,15 @@ class Settings(BaseSettings):
         description="Application environment (development/production)",
     )
 
+    # Default transcript provider strategy (used first in the chain)
+    default_video_provider: str = Field(
+        default="",
+        description=(
+            "Default video transcript provider used first; empty uses the standard order "
+            "(transcriptfetch, supadata, vidwords, yt-dlp). e.g. DEFAULT_VIDEO_PROVIDER=yt-dlp"
+        ),
+    )
+
     # External calls
     jumpto_live_external_calls: Annotated[bool, BeforeValidator(_coerce_bool)] = Field(
         default=False,
@@ -174,6 +197,13 @@ class Settings(BaseSettings):
         return None
 
     @property
+    def broker_url(self) -> str:
+        """Return the Celery broker URL for the configured queue provider."""
+        if self.queue_provider == "rabbitmq":
+            return self.rabbitmq_url
+        return self.redis_url
+
+    @property
     def is_development(self) -> bool:
         """Check if running in development mode."""
         return self.environment.lower() == "development"
@@ -183,3 +213,11 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()
+
+
+def _live_pipeline_enabled(settings: Settings | None = None) -> bool:
+    """Return whether live external transcription calls are active."""
+    settings = settings or get_settings()
+    live = bool(getattr(settings, "jumpto_live_external_calls", False))
+    mode = str(getattr(settings, "jumpto_transcript_mode", "")).lower()
+    return live and mode != "fake"

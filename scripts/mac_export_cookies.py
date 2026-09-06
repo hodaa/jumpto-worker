@@ -51,7 +51,9 @@ def netscape_rows(jar) -> list:
         host_only = "TRUE" if not domain.startswith(".") else "FALSE"
         secure = "TRUE" if c.secure else "FALSE"
         expires = int(c.expires) if c.expires and c.expires > 0 else 0
-        rows.append(f"{domain}\t{host_only}\t{c.path or '/'}\t{secure}\t{expires}\t{c.name}\t{c.value}")
+        rows.append(
+            f"{domain}\t{host_only}\t{c.path or '/'}\t{secure}\t{expires}\t{c.name}\t{c.value}"
+        )
     return rows
 
 

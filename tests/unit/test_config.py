@@ -36,6 +36,50 @@ class TestTranscriptFetchApiKey:
         assert Settings(_env_file=None).transcriptfetch_api_key == "secret-2"
 
 
+class TestDefaultVideoProvider:
+    """Tests for the default transcript provider selection setting."""
+
+    def test_defaults_to_empty(self) -> None:
+        assert Settings(_env_file=None).default_video_provider == ""
+
+    def test_reads_configured_value_from_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("DEFAULT_VIDEO_PROVIDER", "yt-dlp")
+        assert Settings(_env_file=None).default_video_provider == "yt-dlp"
+
+
+class TestQueueProvider:
+    """Tests for the Celery broker transport selection."""
+
+    def test_defaults_to_redis(self) -> None:
+        assert Settings(_env_file=None).queue_provider == "redis"
+
+    def test_default_redis_broker_url(self) -> None:
+        assert Settings(_env_file=None).broker_url == "redis://localhost:6379/0"
+
+    def test_broker_url_uses_redis_url_for_redis_provider(self) -> None:
+        settings = Settings(_env_file=None, redis_url="redis://redis:6379/0")
+        assert settings.broker_url == "redis://redis:6379/0"
+
+    def test_rabbitmq_broker_url_from_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("QUEUE_PROVIDER", "rabbitmq")
+        monkeypatch.setenv("RABBITMQ_URL", "amqp://user:pass@rabbit:5672//")
+        settings = Settings(_env_file=None)
+        assert settings.queue_provider == "rabbitmq"
+        assert settings.broker_url == "amqp://user:pass@rabbit:5672//"
+
+    def test_default_rabbitmq_broker_url(self, monkeypatch) -> None:
+        monkeypatch.setenv("QUEUE_PROVIDER", "rabbitmq")
+        assert Settings(_env_file=None).broker_url == "amqp://guest:guest@localhost:5672//"
+
+    def test_accepts_mixed_case_provider(self, monkeypatch) -> None:
+        monkeypatch.setenv("QUEUE_PROVIDER", "RabbitMQ")
+        assert Settings(_env_file=None).queue_provider == "rabbitmq"
+
+    def test_rejects_unknown_provider(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, queue_provider="kafka")
+
+
 class TestResolvedYtDlpCookieFile:
     """Tests for the yt-dlp cookie file resolver."""
 

@@ -8,33 +8,26 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-celery_app = Celery(
-    "jumpto-worker",
-    broker=settings.redis_url,
-    include=["app.tasks.transcription"],
-)
+broker_url = settings.broker_url
 
-_redis_url = settings.redis_url
+# Redis over TLS: kombu reads the query param and needs broker_use_ssl too.
+if broker_url.startswith("rediss://"):
+    separator = "&" if "?" in broker_url else "?"
+    broker_url = f"{broker_url}{separator}ssl_cert_reqs=CERT_REQUIRED"
 
-if _redis_url.startswith("rediss://"):
-    separator = "&" if "?" in _redis_url else "?"
-    _redis_url = f"{_redis_url}{separator}ssl_cert_reqs=CERT_REQUIRED"
+celery_app = Celery("jumpto", broker=broker_url)
 
-celery_app = Celery(
-    "jumpto",
-    broker=_redis_url,
-    backend=_redis_url,
-)
-
-if _redis_url.startswith("rediss://"):
+if broker_url.startswith("rediss://"):
     celery_app.conf.broker_use_ssl = {
         "ssl_cert_reqs": ssl.CERT_REQUIRED,
     }
-
     celery_app.conf.result_backend_transport_options = {
         "ssl_cert_reqs": ssl.CERT_REQUIRED,
     }
-
+elif broker_url.startswith("amqps://"):
+    celery_app.conf.broker_use_ssl = {
+        "ssl_cert_reqs": ssl.CERT_REQUIRED,
+    }
 
 celery_app.conf.broker_connection_retry_on_startup = True
 

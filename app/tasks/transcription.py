@@ -4,27 +4,17 @@ import asyncio
 from types import SimpleNamespace
 
 from app.client import BackendClient
-from app.core.config import get_settings
+from app.core.config import _live_pipeline_enabled, get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.models import TranscriptSubmission, TranscriptWordData
-from app.providers import (
-    SupadataTranscriptProvider,
-    TranscriptData,
-    TranscriptFetchTranscriptProvider,
-    TranscriptJobPending,
-    VidWordsTranscriptProvider,
-    YouTubeCaptionTranscriptProvider,
-    get_media_info_with_raw,
-    get_transcript_provider,
-)
+from app.providers import TranscriptData, TranscriptJobPending
+from app.providers.registry import build_provider_chain
 from app.tasks.celery_app import celery_app
 from app.utils.text import normalize_word
 
 logger = get_logger(__name__)
 
-_RETRY_ATTEMPTS = 3
-_RETRY_DELAY_SECONDS = 2
 _USER_SAFE_FAILURE = "Transcription failed. Please try again later."
 _EXTERNAL_FAILURE = "Could not fetch the transcript for this video. Please try again later."
 _TIMEOUT_SAFE_MESSAGE = "Transcription timed out. Please try again later."
@@ -91,16 +81,17 @@ async def run_pipeline(job_id: str, resume_token: str = "", resume_provider: str
 async def _perform_transcription(
     job, resume_token: str = "", resume_provider: str = ""
 ) -> TranscriptSubmission:
-    """Fetch a transcript, trying configured cloud providers first.
+    """Fetch a transcript through the configured strategy chain.
 
-    Order: TranscriptFetch -> Supadata -> VidWords -> yt-dlp captions ->
-    Assembly. Each cloud provider is skipped (next one tried) when it has no
-    transcript or hits a transient/permanent error. A still-processing async
-    job raises ``TranscriptJobPending`` (bubbles to the retry-aware task),
-    carrying a resume token the originating provider follows on its next
-    attempt; a completed or failed job resolves within this attempt.
+    Each strategy is tried in order — the provider named by
+    ``DEFAULT_VIDEO_PROVIDER`` first (when configured), then the standard
+    priority order (TranscriptFetch -> Supadata -> VidWords -> yt-dlp). One
+    with no transcript or a transient/permanent error is skipped. A
+    still-processing async job raises ``TranscriptJobPending`` (bubbles to the
+    retry-aware task). If every strategy misses, the pipeline raises so the
+    job is failed rather than completed empty.
     """
-    for provider in _cloud_providers():
+    for provider in _provider_chain():
         resume = resume_token if (resume_token and provider.name == resume_provider) else ""
         result = await _try_cloud(provider, job, resume)
         if result is not None:
@@ -109,52 +100,29 @@ async def _perform_transcription(
                 provider=provider.name,
                 youtube_url=job.youtube_url,
             )
-            return _build_cloud_submission(result, provider.name)
-    media, info = await asyncio.to_thread(
-        get_media_info_with_raw, job.youtube_video_id, job.youtube_url
+            return _build_result_submission(result, provider.name)
+    raise ExternalServiceError(
+        "Could not fetch the transcript for this video",
+        service="transcription",
     )
-    transcript = await _fetch_transcript_with_retry(job.youtube_url, info)
-    return _build_submission(media, transcript, provider="yt-dlp")
 
 
-def _cloud_providers() -> list:
-    """Build the configured cloud transcript providers in priority order."""
-    if not _live_pipeline_enabled():
-        return []
-    settings = get_settings()
-    providers: list = []
-    transcriptfetch_key = getattr(settings, "transcriptfetch_api_key", "")
-    if transcriptfetch_key:
-        providers.append(
-            TranscriptFetchTranscriptProvider(
-                api_key=transcriptfetch_key,
-                lang=getattr(settings, "transcriptfetch_lang", "en") or "en",
-                mode=getattr(settings, "transcriptfetch_mode", "auto") or "auto",
-            )
-        )
-    supadata_key = getattr(settings, "supadata_api_key", "")
-    if supadata_key:
-        providers.append(
-            SupadataTranscriptProvider(
-                api_key=supadata_key,
-                lang=getattr(settings, "supadata_lang", "en") or "en",
-                mode=getattr(settings, "supadata_mode", "auto") or "auto",
-            )
-        )
-    vidwords_key = getattr(settings, "vidwords_api_key", "")
-    if vidwords_key:
-        providers.append(
-            VidWordsTranscriptProvider(
-                api_key=vidwords_key,
-                base_url=getattr(settings, "vidwords_api_url", "https://vidwords.com"),
-                lang=getattr(settings, "vidwords_lang", "en") or "en",
-            )
-        )
-    return providers
+def _provider_chain() -> list:
+    """Build the configured transcript strategy chain in execution order.
+
+    The provider named by ``DEFAULT_VIDEO_PROVIDER`` leads the chain; every
+    other registered strategy follows in standard priority order. Cloud
+    strategies are skipped while live external calls are disabled; the local
+    ``yt-dlp`` strategy is always the terminal fallback.
+    """
+    strategies = build_provider_chain(get_settings())
+    if not _live_pipeline_enabled(get_settings()):
+        return [strategy for strategy in strategies if not strategy.uses_cloud]
+    return strategies
 
 
 async def _try_cloud(provider, job, resume_token: str = ""):
-    """Fetch via a cloud provider; any miss/error moves to the next provider.
+    """Fetch via a provider strategy; any miss/error moves to the next one.
 
     A still-processing async job (``TranscriptJobPending``) is re-raised so the
     task can decide whether to retry it or fail the job; everything else is
@@ -175,8 +143,8 @@ async def _try_cloud(provider, job, resume_token: str = ""):
         return None
 
 
-def _build_cloud_submission(result, provider: str) -> TranscriptSubmission:
-    """Build a submission payload directly from a cloud provider result."""
+def _build_result_submission(result, provider: str) -> TranscriptSubmission:
+    """Build a submission payload directly from a provider strategy result."""
     media = SimpleNamespace(
         title=result.title or "Untitled video",
         duration_seconds=result.duration_seconds,
@@ -258,40 +226,6 @@ async def _fail_job(job_id: str, message: str) -> None:
 def _job_retry_countdown(retries: int) -> int:
     """Exponential backoff in seconds for the async-job retry schedule."""
     return min(_CLOUD_JOB_RETRY_BASE_SECONDS * (2**retries), _CLOUD_JOB_RETRY_MAX_SECONDS)
-
-
-async def _fetch_transcript_with_retry(
-    youtube_url: str,
-    info: dict | None = None,
-) -> TranscriptData:
-    """Fetch a transcript, retrying transient external failures."""
-    if _live_pipeline_enabled():
-        try:
-            return await YouTubeCaptionTranscriptProvider().fetch(youtube_url, info=info)
-        except Exception:
-            logger.exception(
-                "Captions fast-path failed; falling back to audio transcription",
-                youtube_url=youtube_url,
-            )
-    provider = get_transcript_provider()
-    last_error: Exception | None = None
-    for attempt in range(_RETRY_ATTEMPTS):
-        try:
-            return await provider.fetch(youtube_url)
-        except ExternalServiceError as exc:
-            last_error = exc
-            logger.warning("Transcript fetch attempt failed", attempt=attempt + 1)
-            if attempt + 1 < _RETRY_ATTEMPTS:
-                await asyncio.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
-    if last_error:
-        raise last_error
-    return await provider.fetch(youtube_url)  # pragma: no cover
-
-
-def _live_pipeline_enabled() -> bool:
-    """Return whether the live external transcription pipeline is active."""
-    settings = get_settings()
-    return settings.jumpto_live_external_calls and settings.jumpto_transcript_mode.lower() != "fake"
 
 
 def _user_safe_message(exc: Exception) -> str:

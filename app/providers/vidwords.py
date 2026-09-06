@@ -17,6 +17,7 @@ import httpx
 
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
+from app.providers.base import TranscriptProviderStrategy, VideoTranscriptResult
 from app.providers.transcript import (
     TranscriptData,
     TranscriptWordData,
@@ -48,17 +49,11 @@ class VidWordsPermanentError(ExternalServiceError):
 
 
 @dataclass(frozen=True)
-class VidWordsResult:
+class VidWordsResult(VideoTranscriptResult):
     """Transcript plus the metadata VidWords returns for a video."""
 
-    title: str
-    author: str
-    duration_seconds: int
-    is_generated: bool
-    transcript: TranscriptData
 
-
-class VidWordsTranscriptProvider:
+class VidWordsTranscriptProvider(TranscriptProviderStrategy):
     """Fetches transcripts and basic metadata from the VidWords API."""
 
     name = "vidwords"
