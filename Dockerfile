@@ -25,4 +25,4 @@ RUN pip install --no-cache-dir .
 # Install yt-dlp PO Token provider plugin
 RUN pip install --no-cache-dir bgutil-ytdlp-pot-provider
 
-CMD ["celery", "-A", "app.tasks.celery_app.celery_app", "worker", "--loglevel=info", "--concurrency=8"]
+CMD ["celery", "-A", "app.tasks.celery_app.celery_app", "worker", "--loglevel=info"]

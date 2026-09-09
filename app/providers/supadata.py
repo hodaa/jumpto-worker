@@ -25,7 +25,8 @@ from dataclasses import dataclass
 
 import httpx
 
-from app.core.exceptions import ExternalServiceError
+from app.client.http import get_shared_http_client
+from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.core.logging import get_logger
 from app.providers.base import TranscriptProviderStrategy, VideoTranscriptResult
 from app.providers.transcript import (
@@ -50,7 +51,7 @@ _PERMANENT_ERRORS = {
 }
 
 
-class SupadataPermanentError(ExternalServiceError):
+class SupadataPermanentError(PermanentExternalServiceError):
     """Supadata failure that no fallback can recover (account/video-level)."""
 
 
@@ -100,45 +101,45 @@ class SupadataTranscriptProvider(TranscriptProviderStrategy):
         """
         headers = self.headers
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
-                if resume_token:
-                    payload = await self._job_result(client, resume_token, youtube_url)
-                else:
-                    response = await client.get(
-                        f"{self.base_url}/transcript",
-                        params={"url": youtube_url, "lang": self.lang, "mode": self.mode},
-                        headers=headers,
-                    )
-                    if response.status_code == 206:
-                        logger.info("Supadata found no transcript", youtube_url=youtube_url)
-                        return None
-                    if response.status_code == 202:
-                        job_id = str(response.json().get("jobId") or "")
-                        if not job_id:
-                            raise SupadataPermanentError(
-                                "No transcript could be produced",
-                                service="supadata",
-                                details={"status_code": response.status_code},
-                            ) from None
-                        logger.info(
-                            "Supadata transcript job queued",
-                            job_id=job_id,
-                            youtube_url=youtube_url,
-                        )
-                        raise TranscriptJobPending(
-                            message="Transcription service is still processing; will retry later",
-                            provider="supadata",
-                            resume_token=job_id,
-                            resumable=True,
-                        ) from None
-                    if response.status_code != 200:
-                        self._raise_http_error(response, youtube_url)
-                    payload = response.json()
-                chunks = _normalize_chunks(payload.get("content"))
-                if not chunks:
-                    logger.info("Supadata returned no usable content", youtube_url=youtube_url)
+            client = get_shared_http_client(timeout=self.timeout, transport=self.transport)
+            if resume_token:
+                payload = await self._job_result(client, resume_token, youtube_url)
+            else:
+                response = await client.get(
+                    f"{self.base_url}/transcript",
+                    params={"url": youtube_url, "lang": self.lang, "mode": self.mode},
+                    headers=headers,
+                )
+                if response.status_code == 206:
+                    logger.info("Supadata found no transcript", youtube_url=youtube_url)
                     return None
-                metadata = await self._fetch_metadata(client, youtube_url, youtube_video_id)
+                if response.status_code == 202:
+                    job_id = str(response.json().get("jobId") or "")
+                    if not job_id:
+                        raise SupadataPermanentError(
+                            "No transcript could be produced",
+                            service="supadata",
+                            details={"status_code": response.status_code},
+                        ) from None
+                    logger.info(
+                        "Supadata transcript job queued",
+                        job_id=job_id,
+                        youtube_url=youtube_url,
+                    )
+                    raise TranscriptJobPending(
+                        message="Transcription service is still processing; will retry later",
+                        provider="supadata",
+                        resume_token=job_id,
+                        resumable=True,
+                    ) from None
+                if response.status_code != 200:
+                    self._raise_http_error(response, youtube_url)
+                payload = response.json()
+            chunks = _normalize_chunks(payload.get("content"))
+            if not chunks:
+                logger.info("Supadata returned no usable content", youtube_url=youtube_url)
+                return None
+            metadata = await self._fetch_metadata(client, youtube_url, youtube_video_id)
         except httpx.HTTPError as exc:
             logger.error("Supadata request failed", youtube_url=youtube_url, error=str(exc))
             raise ExternalServiceError(

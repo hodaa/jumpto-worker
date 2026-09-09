@@ -3,6 +3,7 @@
 **Date:** 2026-09-09  
 **Reviewed revision:** `2b020312f721182641c708a385564fe9cc703a0d`  
 **Scope:** worker execution path, provider orchestration, HTTP/Redis usage, Celery configuration, and transcript construction.
+**Implementation status:** the recommendations in this report were implemented in the follow-up changes on this branch; the validation section below reflects the updated test suite.
 
 ## Executive summary
 
@@ -14,6 +15,16 @@ The worker is small and its local Python transforms are not currently the main r
 4. Assembly.ai polling occupies a Celery slot and can issue up to 600 one-second-spaced status requests for one job.
 
 These are **high-confidence code-review findings**. No live backend, broker, Redis, or provider endpoints were available, so this is not a production latency/SLO measurement.
+
+## Implemented in this change set
+
+- Resume tokens now start at their originating strategy instead of replaying earlier providers.
+- Permanent provider/account failures now stop the chain instead of triggering fallback traffic.
+- Successful results are cached at the orchestration boundary with versioned settings-aware keys and a Redis single-flight lock.
+- Assembly.ai submission/status checks now use Celery’s resumable retry path rather than a 600-request polling loop.
+- HTTP clients are pooled per persistent worker event loop, and the Celery task loop is reused across tasks.
+- Backend retries use bounded jittered backoff and honor numeric `Retry-After` values.
+- Transcript submission construction is single-pass, deployment concurrency uses `CELERY_WORKER_CONCURRENCY`, and the hard time limit includes a configurable cleanup margin.
 
 ## Current execution path
 
@@ -116,8 +127,8 @@ A resume token is passed only to the provider whose name matches `resume_provide
 
 ## Validation performed
 
-- `171` unit tests passed in `1.67 s` in the audit environment.
-- Coverage run passed the configured 80% gate at **89.72%**.
+- `175` unit tests passed in `0.62 s` in the audit environment.
+- Coverage run passed the configured 80% gate at **86.75%**.
 - Synthetic transcript benchmarks were run with generated in-memory data; they do not represent network latency or production video distributions.
 - No live backend, Redis, Celery broker, YouTube, TranscriptFetch, Supadata, VidWords, or Assembly.ai load test was run. Real provider latency, rate limits, cache hit rate, queue wait, memory per worker, and duplicate-job frequency remain unknown.
 

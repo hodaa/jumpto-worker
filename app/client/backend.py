@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import random
 from typing import Any
 
 import httpx
 
+from app.client.http import get_shared_http_client
 from app.core.exceptions import BackendCommunicationError
 from app.core.logging import get_logger
 from app.models import JobData, TranscriptSubmission
@@ -14,7 +17,22 @@ logger = get_logger(__name__)
 
 _REQUEST_TIMEOUT_SECONDS = 30
 _MAX_RETRIES = 3
+_RETRY_BACKOFF_BASE_SECONDS = 0.25
+_RETRY_BACKOFF_MAX_SECONDS = 4.0
 _INTERNAL_API_KEY_HEADER = "X-Internal-API-Key"
+
+
+def _retry_delay(attempt: int, response: httpx.Response | None = None) -> float:
+    """Return bounded exponential backoff with optional Retry-After support."""
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if isinstance(retry_after, str):
+            try:
+                return min(float(retry_after), _RETRY_BACKOFF_MAX_SECONDS)
+            except ValueError:
+                pass
+    cap = min(_RETRY_BACKOFF_BASE_SECONDS * (2**attempt), _RETRY_BACKOFF_MAX_SECONDS)
+    return random.uniform(cap / 2, cap)
 
 
 class BackendClient:
@@ -23,11 +41,13 @@ class BackendClient:
     def __init__(self, base_url: str, api_key: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self._client = httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS)
+        self._client = get_shared_http_client(timeout=_REQUEST_TIMEOUT_SECONDS)
 
     async def close(self) -> None:
-        """Close the underlying connection pool."""
-        await self._client.aclose()
+        """Keep the process-level connection pool alive for later tasks."""
+        # The client belongs to the worker-process pool, not this task. It is
+        # closed when the persistent worker event loop shuts down.
+        return None
 
     async def get_job(self, job_id: str) -> JobData:
         """Fetch job and video data for a job id."""
@@ -90,6 +110,7 @@ class BackendClient:
                     error=str(exc),
                 )
                 if attempt + 1 < _MAX_RETRIES:
+                    await asyncio.sleep(_retry_delay(attempt))
                     continue
                 raise BackendCommunicationError(
                     f"Failed to reach backend at {path}"
@@ -106,6 +127,7 @@ class BackendClient:
                     attempt=attempt + 1,
                 )
                 if attempt + 1 < _MAX_RETRIES:
+                    await asyncio.sleep(_retry_delay(attempt, response))
                     continue
                 raise last_error
             if response.status_code >= 400:

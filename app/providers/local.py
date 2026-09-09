@@ -16,6 +16,7 @@ from app.providers.cache import extract_youtube_video_id, get_transcript_cache
 from app.providers.media import get_media_info_with_raw
 from app.providers.transcript import (
     TranscriptData,
+    TranscriptJobPending,
     YouTubeCaptionTranscriptProvider,
     get_transcript_provider,
 )
@@ -60,7 +61,12 @@ class YtDlpTranscriptStrategy(TranscriptProviderStrategy):
         media, info = await asyncio.to_thread(
             get_media_info_with_raw, youtube_video_id, youtube_url
         )
-        transcript = await _fetch_transcript_with_retry(youtube_url, info)
+        if resume_token:
+            transcript = await _fetch_transcript_with_retry(
+                youtube_url, info, resume_token=resume_token
+            )
+        else:
+            transcript = await _fetch_transcript_with_retry(youtube_url, info)
         result = VideoTranscriptResult(
             title=media.title,
             author="",
@@ -76,8 +82,25 @@ class YtDlpTranscriptStrategy(TranscriptProviderStrategy):
 async def _fetch_transcript_with_retry(
     youtube_url: str,
     info: dict | None = None,
+    resume_token: str = "",
 ) -> TranscriptData:
     """Fetch a transcript, retrying transient external failures."""
+    provider = get_transcript_provider()
+    if resume_token:
+        try:
+            return await provider.fetch(youtube_url, info=info, resume_token=resume_token)
+        except TranscriptJobPending as exc:
+            # The pipeline routes by strategy name. Assembly is nested inside
+            # the yt-dlp strategy, so preserve the strategy-level route while
+            # carrying Assembly's remote job id.
+            raise TranscriptJobPending(
+                message=str(exc),
+                provider="yt-dlp",
+                resume_token=exc.resume_token,
+                resumable=exc.resumable,
+                details=exc.details,
+            ) from exc
+
     if _live_pipeline_enabled(get_settings()):
         try:
             return await YouTubeCaptionTranscriptProvider().fetch(youtube_url, info=info)
@@ -86,11 +109,12 @@ async def _fetch_transcript_with_retry(
                 "Captions fast-path failed; falling back to audio transcription",
                 youtube_url=youtube_url,
             )
-    provider = get_transcript_provider()
     last_error: Exception | None = None
     for attempt in range(_RETRY_ATTEMPTS):
         try:
             return await provider.fetch(youtube_url, info=info)
+        except TranscriptJobPending:
+            raise
         except ExternalServiceError as exc:
             last_error = exc
             logger.warning("Transcript fetch attempt failed", attempt=attempt + 1)

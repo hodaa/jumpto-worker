@@ -27,9 +27,18 @@ class _FakeRedis:
     def get(self, key: str):
         return self.store.get(key)
 
-    def set(self, key: str, value: str, ex=None) -> None:
+    def set(self, key: str, value: str, ex=None, nx: bool = False) -> bool | None:
+        if nx and key in self.store:
+            return None
         self.store[key] = value
         self.set_calls.append((key, value, ex))
+        return True
+
+    def eval(self, _script: str, _numkeys: int, key: str, owner: str) -> int:
+        if self.store.get(key) == owner:
+            del self.store[key]
+            return 1
+        return 0
 
 
 def _result() -> VideoTranscriptResult:
@@ -136,6 +145,20 @@ class TestTranscriptCache:
         monkeypatch.setattr(cache, "_client", type("Cl", (), {"set": boom})())
 
         cache.set(VIDEO_ID, _result())  # must not raise
+
+    def test_lock_is_single_flight_and_owner_safe(self, monkeypatch) -> None:
+        cache, fake = _make_cache(monkeypatch)
+
+        acquired, owner = cache.acquire_lock(VIDEO_ID, "owner-a")
+        assert acquired is True
+        acquired_again, other_owner = cache.acquire_lock(VIDEO_ID, "owner-b")
+        assert acquired_again is False
+        assert other_owner == "owner-b"
+
+        cache.release_lock(VIDEO_ID, "owner-b")
+        assert f"jumpto:transcript:lock:{VIDEO_ID}" in fake.store
+        cache.release_lock(VIDEO_ID, owner)
+        assert f"jumpto:transcript:lock:{VIDEO_ID}" not in fake.store
 
 
 class TestStrategyCaching:

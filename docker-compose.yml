@@ -24,5 +24,4 @@
         - app.tasks.celery_app.celery_app
         - worker
         - --loglevel=info
-        - --concurrency=8
         - --hostname=jumpto-worker  

@@ -1,14 +1,19 @@
 """Transcription pipeline task for the JumpTo worker."""
 
 import asyncio
+import atexit
+import os
+import uuid
 from types import SimpleNamespace
 
 from app.client import BackendClient
+from app.client.http import close_shared_http_clients
 from app.core.config import _live_pipeline_enabled, get_settings
-from app.core.exceptions import ExternalServiceError
+from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.core.logging import get_logger
 from app.models import TranscriptSubmission, TranscriptWordData
 from app.providers import TranscriptData, TranscriptJobPending
+from app.providers.cache import extract_youtube_video_id, get_transcript_cache
 from app.providers.registry import build_provider_chain
 from app.tasks.celery_app import celery_app
 from app.utils.text import normalize_word
@@ -26,6 +31,37 @@ _CLOUD_JOB_TIMEOUT_SAFE_MESSAGE = "Transcription timed out. Please try again lat
 _CLOUD_JOB_ATTEMPTS = 9
 _CLOUD_JOB_RETRY_BASE_SECONDS = 2
 _CLOUD_JOB_RETRY_MAX_SECONDS = 60
+_CACHE_LOCK_WAIT_INTERVAL_SECONDS = 0.5
+_CACHE_LOCK_MAX_WAIT_SECONDS = 15
+
+# A Celery prefork process executes tasks serially, so one persistent loop per
+# process lets async clients and their connection pools survive task boundaries.
+_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
+_EVENT_LOOP_PID: int | None = None
+
+
+def _run_async(coro):
+    """Run a coroutine on the worker-process event loop."""
+    global _EVENT_LOOP, _EVENT_LOOP_PID
+    pid = os.getpid()
+    if _EVENT_LOOP is None or _EVENT_LOOP.is_closed() or pid != _EVENT_LOOP_PID:
+        _EVENT_LOOP = asyncio.new_event_loop()
+        asyncio.set_event_loop(_EVENT_LOOP)
+        _EVENT_LOOP_PID = pid
+    return _EVENT_LOOP.run_until_complete(coro)
+
+
+def _close_worker_event_loop() -> None:
+    """Close pooled async clients and the persistent worker loop at exit."""
+    global _EVENT_LOOP
+    if _EVENT_LOOP is None or _EVENT_LOOP.is_closed():
+        return
+    _EVENT_LOOP.run_until_complete(close_shared_http_clients(_EVENT_LOOP))
+    _EVENT_LOOP.close()
+    _EVENT_LOOP = None
+
+
+atexit.register(_close_worker_event_loop)
 
 
 async def run_pipeline(job_id: str, resume_token: str = "", resume_provider: str = "") -> dict:
@@ -83,28 +119,99 @@ async def _perform_transcription(
 ) -> TranscriptSubmission:
     """Fetch a transcript through the configured strategy chain.
 
-    Each strategy is tried in order — the provider named by
-    ``DEFAULT_VIDEO_PROVIDER`` first (when configured), then the standard
-    priority order (TranscriptFetch -> Supadata -> VidWords -> yt-dlp). One
-    with no transcript or a transient/permanent error is skipped. A
-    still-processing async job raises ``TranscriptJobPending`` (bubbles to the
-    retry-aware task). If every strategy misses, the pipeline raises so the
-    job is failed rather than completed empty.
+    A resume token starts at its owning provider and never replays providers
+    that already ran. Successful results are cached across all strategies and
+    a Redis lock prevents concurrent jobs for one video from doing duplicate
+    provider work.
     """
-    for provider in _provider_chain():
-        resume = resume_token if (resume_token and provider.name == resume_provider) else ""
-        result = await _try_cloud(provider, job, resume)
-        if result is not None:
-            logger.info(
-                "Transcript provider used",
-                provider=provider.name,
-                youtube_url=job.youtube_url,
+    strategies = _provider_chain()
+    start_index = 0
+    if resume_token:
+        if not resume_provider:
+            raise ExternalServiceError(
+                "Cannot resume transcription without an originating provider",
+                service="transcription",
             )
-            return _build_result_submission(result, provider.name)
-    raise ExternalServiceError(
-        "Could not fetch the transcript for this video",
-        service="transcription",
-    )
+        try:
+            start_index = next(
+                index for index, provider in enumerate(strategies) if provider.name == resume_provider
+            )
+        except StopIteration:
+            raise ExternalServiceError(
+                "The originating transcription provider is no longer configured",
+                service="transcription",
+            ) from None
+
+    cache = None
+    cache_video_id = ""
+    cache_lock_owner = ""
+    settings = get_settings()
+    if not resume_token and _live_pipeline_enabled(settings):
+        cache_video_id = job.youtube_video_id or extract_youtube_video_id(job.youtube_url)
+        if cache_video_id:
+            cache = get_transcript_cache()
+            cached = await asyncio.to_thread(cache.get_with_provider, cache_video_id)
+            if cached is not None:
+                result, cached_provider = cached
+                logger.info("Transcript cache hit", video_id=cache_video_id)
+                return _build_result_submission(result, cached_provider or "cache")
+            cache_lock_owner = await _acquire_cache_lock(cache, cache_video_id)
+            # Re-check after waiting/acquiring in case another worker
+            # populated the cache between the initial read and SET NX.
+            cached = await asyncio.to_thread(cache.get_with_provider, cache_video_id)
+            if cached is not None:
+                if cache_lock_owner:
+                    await asyncio.to_thread(
+                        cache.release_lock, cache_video_id, cache_lock_owner
+                    )
+                result, cached_provider = cached
+                logger.info("Transcript cache hit after lock", video_id=cache_video_id)
+                return _build_result_submission(result, cached_provider or "cache")
+
+    try:
+        for provider in strategies[start_index:]:
+            resume = resume_token if provider.name == resume_provider else ""
+            result = await _try_cloud(provider, job, resume)
+            if result is not None:
+                logger.info(
+                    "Transcript provider used",
+                    provider=provider.name,
+                    youtube_url=job.youtube_url,
+                )
+                if cache is not None and cache_video_id:
+                    await asyncio.to_thread(
+                        cache.set, cache_video_id, result, provider.name
+                    )
+                return _build_result_submission(result, provider.name)
+        raise ExternalServiceError(
+            "Could not fetch the transcript for this video",
+            service="transcription",
+        )
+    finally:
+        if cache is not None and cache_video_id and cache_lock_owner:
+            await asyncio.to_thread(cache.release_lock, cache_video_id, cache_lock_owner)
+
+
+async def _acquire_cache_lock(cache, video_id: str) -> str:
+    """Wait briefly for another worker to populate a cache miss."""
+    owner = uuid.uuid4().hex
+    deadline = asyncio.get_running_loop().time() + _CACHE_LOCK_MAX_WAIT_SECONDS
+    while True:
+        acquired, owner = await asyncio.to_thread(cache.acquire_lock, video_id, owner)
+        if acquired:
+            return owner
+        if asyncio.get_running_loop().time() >= deadline:
+            logger.warning("Transcript cache lock wait timed out; proceeding", video_id=video_id)
+            return ""
+        await asyncio.sleep(_CACHE_LOCK_WAIT_INTERVAL_SECONDS)
+        cached = await asyncio.to_thread(cache.get_with_provider, video_id)
+        if cached is not None:
+            # The caller will perform the final cache read after acquiring a
+            # lock. Returning an empty owner allows it to continue without
+            # holding a lock that it does not own.
+            return ""
+
+
 
 
 def _provider_chain() -> list:
@@ -134,6 +241,13 @@ async def _try_cloud(provider, job, resume_token: str = ""):
         )
     except TranscriptJobPending:
         raise
+    except PermanentExternalServiceError:
+        logger.exception(
+            "Permanent cloud transcript provider failure",
+            provider=provider.name,
+            youtube_url=job.youtube_url,
+        )
+        raise
     except Exception:
         logger.exception(
             "Cloud transcript provider failed; trying next provider",
@@ -156,18 +270,18 @@ def _build_submission(
     media, transcript: TranscriptData, provider: str = ""
 ) -> TranscriptSubmission:
     """Build a transcript submission payload from media and transcript data."""
-    _words = [
-        (normalize_word(word.word), word.start_time, word.end_time) for word in transcript.words
-    ]
-    words = [
-        TranscriptWordData(
-            word_index=index,
-            word=normalized,
-            start_time=start_time,
-            end_time=end_time,
-        )
-        for index, (normalized, start_time, end_time) in enumerate(w for w in _words if w[0])
-    ]
+    words: list[TranscriptWordData] = []
+    for word in transcript.words:
+        normalized = normalize_word(word.word)
+        if normalized:
+            words.append(
+                TranscriptWordData(
+                    word_index=len(words),
+                    word=normalized,
+                    start_time=word.start_time,
+                    end_time=word.end_time,
+                )
+            )
     return TranscriptSubmission(
         title=media.title,
         duration_seconds=media.duration_seconds,
@@ -192,13 +306,13 @@ def download_and_transcribe(
     job is marked failed and the task gives up.
     """
     try:
-        asyncio.run(run_pipeline(job_id, resume_token, resume_provider))
+        _run_async(run_pipeline(job_id, resume_token, resume_provider))
     except TranscriptJobPending as exc:
         if not exc.resumable:
-            asyncio.run(_fail_job(job_id, _EXTERNAL_FAILURE))
+            _run_async(_fail_job(job_id, _EXTERNAL_FAILURE))
             raise
         if self.request.retries >= _CLOUD_JOB_ATTEMPTS - 1:
-            asyncio.run(_fail_job(job_id, _CLOUD_JOB_TIMEOUT_SAFE_MESSAGE))
+            _run_async(_fail_job(job_id, _CLOUD_JOB_TIMEOUT_SAFE_MESSAGE))
             raise
         raise self.retry(
             exc=exc,

@@ -15,7 +15,8 @@ from dataclasses import dataclass
 
 import httpx
 
-from app.core.exceptions import ExternalServiceError
+from app.client.http import get_shared_http_client
+from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.core.logging import get_logger
 from app.providers.base import TranscriptProviderStrategy, VideoTranscriptResult
 from app.providers.transcript import (
@@ -44,7 +45,7 @@ _PERMANENT_ERRORS = {
 _NO_TRANSCRIPT_ERRORS = {"no_transcript", "transcripts_disabled"}
 
 
-class VidWordsPermanentError(ExternalServiceError):
+class VidWordsPermanentError(PermanentExternalServiceError):
     """VidWords failure that no fallback can recover (fast-fail)."""
 
 
@@ -92,10 +93,10 @@ class VidWordsTranscriptProvider(TranscriptProviderStrategy):
             "Content-Type": "application/json",
         }
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
-                response = await client.post(
-                    f"{self.base_url}/api/transcripts", json=payload, headers=headers
-                )
+            client = get_shared_http_client(timeout=self.timeout, transport=self.transport)
+            response = await client.post(
+                f"{self.base_url}/api/transcripts", json=payload, headers=headers
+            )
         except httpx.HTTPError as exc:
             logger.error("VidWords request failed", youtube_url=youtube_url, error=str(exc))
             raise ExternalServiceError(

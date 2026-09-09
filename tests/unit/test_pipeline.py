@@ -1,7 +1,7 @@
 """Unit tests for the worker transcription pipeline."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -16,6 +16,7 @@ from app.providers import (
     VidWordsResult,
 )
 from app.providers import local as local_module
+from app.providers.vidwords import VidWordsPermanentError
 from app.tasks import transcription as transcription_module
 from app.tasks.transcription import (
     _build_submission,
@@ -263,6 +264,25 @@ class TestPerformTranscription:
     """Tests for the strategy-chain transcription loop."""
 
     @pytest.mark.asyncio
+    async def test_cache_hit_skips_all_providers(self, monkeypatch) -> None:
+        from app.providers.cache import TranscriptCache, _serialize_result
+
+        cache = TranscriptCache("redis://unused:6379/0", 3600, enabled=True)
+        fake = Mock()
+        fake.get.return_value = _serialize_result(_cloud_result(), "vidwords")
+        cache._client = fake
+        provider = SimpleNamespace(name="vidwords", fetch=AsyncMock())
+        settings = SimpleNamespace(jumpto_live_external_calls=True, jumpto_transcript_mode="real")
+        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
+        monkeypatch.setattr(transcription_module, "get_transcript_cache", lambda: cache)
+        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [provider])
+
+        submission = await _perform_transcription(_job())
+
+        assert submission.provider == "vidwords"
+        provider.fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_first_provider_used_when_it_returns_result(self, monkeypatch) -> None:
         first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=_cloud_result()))
         second = SimpleNamespace(name="supadata", fetch=AsyncMock())
@@ -304,7 +324,25 @@ class TestPerformTranscription:
         second.fetch.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_resume_token_routed_only_to_its_provider(self, monkeypatch) -> None:
+    async def test_permanent_provider_error_does_not_fall_through(self, monkeypatch) -> None:
+        first = SimpleNamespace(
+            name="vidwords",
+            fetch=AsyncMock(
+                side_effect=VidWordsPermanentError(
+                    "invalid credentials", service="vidwords"
+                )
+            ),
+        )
+        second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
+        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, second])
+
+        with pytest.raises(VidWordsPermanentError):
+            await _perform_transcription(_job())
+
+        second.fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resume_token_routes_directly_to_its_provider(self, monkeypatch) -> None:
         first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=_cloud_result()))
         second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
         monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, second])
@@ -313,16 +351,8 @@ class TestPerformTranscription:
             _job(), resume_token="job-x", resume_provider="supadata"
         )
 
-        assert submission.provider == "vidwords"
-        first.fetch.assert_awaited_once_with(
-            "https://www.youtube.com/watch?v=abcde12345", "abcde12345", resume_token=""
-        )
-        second.fetch.assert_not_awaited()
-
-        first.fetch.reset_mock()
-        first.fetch.return_value = None
-        await _perform_transcription(_job(), resume_token="job-x", resume_provider="supadata")
-
+        assert submission.provider == "supadata"
+        first.fetch.assert_not_awaited()
         second.fetch.assert_awaited_once_with(
             "https://www.youtube.com/watch?v=abcde12345", "abcde12345", resume_token="job-x"
         )
