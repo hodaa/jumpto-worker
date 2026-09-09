@@ -48,11 +48,14 @@ def netscape_rows(jar) -> list:
         domain = c.domain
         if not any(domain.endswith(d) for d in RELEVANT_DOMAINS):
             continue
-        host_only = "TRUE" if not domain.startswith(".") else "FALSE"
+        # Netscape format: a dotted domain (e.g. ".youtube.com") must have the
+        # includeSubdomains flag TRUE, or Python's cookiejar rejects the file
+        # with "assert domain_specified == initial_dot".
+        include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
         secure = "TRUE" if c.secure else "FALSE"
         expires = int(c.expires) if c.expires and c.expires > 0 else 0
         rows.append(
-            f"{domain}\t{host_only}\t{c.path or '/'}\t{secure}\t{expires}\t{c.name}\t{c.value}"
+            f"{domain}\t{include_subdomains}\t{c.path or '/'}\t{secure}\t{expires}\t{c.name}\t{c.value}"
         )
     return rows
 

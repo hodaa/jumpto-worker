@@ -31,6 +31,9 @@
         - --hostname=jumpto-worker  
     
     chromium:
+      build:
+        context: ./scripts
+        dockerfile: chromium-cdp-Dockerfile
       image: chromium-cdp
       container_name: chromium
       restart: unless-stopped
@@ -39,6 +42,6 @@
         - /etc/jumpto:/etc/jumpto
         - /etc/localtime:/etc/localtime:ro
       ports:
-        - "3001:3001"
+        - "127.0.0.1:3001:3001"
       expose:
         - "9222"

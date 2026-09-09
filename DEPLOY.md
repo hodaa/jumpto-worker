@@ -53,3 +53,6 @@ docker compose up -d
 docker ps                          # Both chromium and jumpto-worker should be running
 docker logs jumpto-worker --tail 20 # Check worker is consuming tasks
 ```
+
+## 5. access the chromumuim from you machine
+ssh -L 3001:127.0.0.1:3001 user@public_ip
