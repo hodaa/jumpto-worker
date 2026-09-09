@@ -144,7 +144,7 @@ class TestAssignmentFetcher:
         audio_file.write_bytes(b"fake-audio")
 
         monkeypatch.setattr(
-            "app.providers.assembly._download_audio", lambda url, info=None: str(audio_file)
+            "app.providers.assembly._download_audio", lambda url: str(audio_file)
         )
 
         upload_response = Mock(status_code=200)
@@ -358,24 +358,6 @@ class TestDownloadCaptionMetadataReuse:
         extract.assert_not_called()
         assert fake.replayed == (info, True)
 
-    def test_run_download_replays_info_without_re_extracting(self, monkeypatch) -> None:
-        fake = _ReplayYoutubeDL({})
-        monkeypatch.setattr("yt_dlp.YoutubeDL", lambda options: fake)
-        info = {"id": "abc", "title": "t", "formats": []}
-
-        _run_download({}, "https://youtu.be/abc", info)
-
-        assert fake.replayed == (info, True)
-
-    def test_run_download_still_extracts_when_no_info(self, monkeypatch) -> None:
-        fake = _ReplayYoutubeDL({})
-        monkeypatch.setattr("yt_dlp.YoutubeDL", lambda options: fake)
-
-        _run_download({}, "https://youtu.be/abc")
-
-        assert fake.replayed is None
-        assert fake.downloaded == ["https://youtu.be/abc"]
-
     def test_extracts_when_info_not_provided(self, monkeypatch, tmp_path) -> None:
         from unittest.mock import Mock
 
@@ -386,6 +368,23 @@ class TestDownloadCaptionMetadataReuse:
             _download_caption("https://youtu.be/abcde12345")
 
         extract.assert_called_once_with("https://youtu.be/abcde12345")
+
+
+class TestRunDownload:
+    """_run_download always re-extracts and downloads fresh URLs."""
+
+    def test_never_replays_stale_info_dict(self, monkeypatch) -> None:
+        """Regression: replaying a pre-extracted info dict reuses YouTube
+        video-serving URLs that expire within seconds and 403s when the audio
+        fallback runs. Even when stale ``info`` is available it must not be
+        replayed."""
+        fake = _ReplayYoutubeDL({})
+        monkeypatch.setattr("yt_dlp.YoutubeDL", lambda options: fake)
+
+        _run_download({}, "https://youtu.be/abc")
+
+        assert fake.replayed is None
+        assert fake.downloaded == ["https://youtu.be/abc"]
 
 
 class TestYdlpOptions:

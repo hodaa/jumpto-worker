@@ -50,7 +50,7 @@ class AssemblyTranscriptProvider(TranscriptProvider):
         if resume_token:
             return await self._poll(client, headers, resume_token)
 
-        audio_path = await asyncio.to_thread(_download_audio, youtube_url, info)
+        audio_path = await asyncio.to_thread(_download_audio, youtube_url)
         try:
             upload_url = await self._upload(client, headers, audio_path)
             transcript_id = await self._submit(client, headers, upload_url)
@@ -130,7 +130,7 @@ class AssemblyTranscriptProvider(TranscriptProvider):
         ) from None
 
 
-def _download_audio(youtube_url: str, info: dict | None = None) -> str:
+def _download_audio(youtube_url: str) -> str:
     """Download a YouTube audio stream to a temp file and return its path."""
     fd, path = tempfile.mkstemp(suffix=".webm")
     os.close(fd)
@@ -141,7 +141,7 @@ def _download_audio(youtube_url: str, info: dict | None = None) -> str:
         outtmpl=path,
     )
     try:
-        _run_download(options, youtube_url, info)
+        _run_download(options, youtube_url)
         if not destination.exists() or destination.stat().st_size == 0:
             logger.error("Audio download produced no file", path=path)
             raise ExternalServiceError("Audio download produced no file", service="yt-dlp")
@@ -155,20 +155,17 @@ def _download_audio(youtube_url: str, info: dict | None = None) -> str:
         raise ExternalServiceError("Could not download audio", service="yt-dlp") from exc
 
 
-def _run_download(options: dict, youtube_url: str, info: dict | None = None) -> None:
-    """Run a yt-dlp audio download for a URL.
+def _run_download(options: dict, youtube_url: str) -> None:
+    """Run a fresh yt-dlp audio download for a URL.
 
-    With ``info`` (a pre-extracted metadata dict) the download replays it
-    through ``process_ie_result`` instead of running a fresh ``extract_info``,
-    halving the YouTube requests per video. Without it, falls back to a
-    standard download.
+    Always extract and download the URL rather than replaying a previously
+    extracted ``info`` dict through ``process_ie_result``: YouTube expires the
+    video-serving URLs inside a stored ``info`` within seconds, so replays fail
+    with HTTP 403 when the caption fast path missed and we fall back to audio.
     """
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
-            if info is not None:
-                ydl.process_ie_result(info, download=True)
-            else:
-                ydl.download([youtube_url])
+            ydl.download([youtube_url])
     except yt_dlp.utils.DownloadError as exc:
         if is_youtube_bot_check(exc):
             request_cookie_refresh()
