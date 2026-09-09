@@ -3,6 +3,8 @@
       image: brainicism/bgutil-ytdlp-pot-provider
       container_name: bgutil-pot
       restart: unless-stopped
+
+
     worker:
       build: .
       container_name: jumpto-worker
@@ -27,3 +29,12 @@
         - worker
         - --loglevel=info
         - --hostname=jumpto-worker  
+    
+    chromium:
+      image: chromium-cdp
+      container_name: chromium
+      restart: unless-stopped
+      ports:
+        - "3001:3001"
+      expose:
+        - "9222"
