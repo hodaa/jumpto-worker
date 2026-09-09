@@ -34,6 +34,10 @@
       image: chromium-cdp
       container_name: chromium
       restart: unless-stopped
+      volumes:
+        - /etc/jumpto/chromium/profile:/config
+        - /etc/jumpto:/etc/jumpto
+        - /etc/localtime:/etc/localtime:ro
       ports:
         - "3001:3001"
       expose:
