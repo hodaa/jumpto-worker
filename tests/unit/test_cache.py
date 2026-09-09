@@ -5,13 +5,13 @@ from redis.exceptions import RedisError
 
 import app.providers.local as local_module
 from app.providers.base import VideoTranscriptResult
-from app.providers.cache import (
+from app.providers.transcript import TranscriptData, TranscriptWordData
+from app.storage.cache import (
     TranscriptCache,
     _deserialize_result,
     _serialize_result,
     extract_youtube_video_id,
 )
-from app.providers.transcript import TranscriptData, TranscriptWordData
 
 VIDEO_ID = "abc123xyz99"
 WATCH_URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
@@ -60,7 +60,7 @@ def _result() -> VideoTranscriptResult:
 
 def _make_cache(monkeypatch, *, enabled: bool = True, ttl: int = 3600, store=None):
     fake = _FakeRedis(store)
-    monkeypatch.setattr("app.providers.cache._redis.from_url", lambda *args, **kwargs: fake)
+    monkeypatch.setattr("app.storage.cache._redis.from_url", lambda *args, **kwargs: fake)
     cache = TranscriptCache("redis://unused:6379/0", ttl, enabled=enabled)
     return cache, fake
 

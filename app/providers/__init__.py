@@ -1,5 +1,6 @@
 """External service providers for the transcription pipeline."""
 
+from app.providers.assembly import AssemblyTranscriptProvider
 from app.providers.base import TranscriptProviderStrategy, VideoTranscriptResult
 from app.providers.local import YtDlpTranscriptStrategy
 from app.providers.media import MediaInfo, get_media_info, get_media_info_with_raw
@@ -12,7 +13,6 @@ from app.providers.registry import (
 )
 from app.providers.supadata import SupadataResult, SupadataTranscriptProvider
 from app.providers.transcript import (
-    AssemblyTranscriptProvider,
     FakeTranscriptProvider,
     TranscriptData,
     TranscriptJobPending,

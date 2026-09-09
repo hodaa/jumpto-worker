@@ -12,7 +12,6 @@ from app.core.config import _live_pipeline_enabled, get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.providers.base import TranscriptProviderStrategy, VideoTranscriptResult
-from app.providers.cache import extract_youtube_video_id, get_transcript_cache
 from app.providers.media import get_media_info_with_raw
 from app.providers.transcript import (
     TranscriptData,
@@ -20,6 +19,7 @@ from app.providers.transcript import (
     YouTubeCaptionTranscriptProvider,
     get_transcript_provider,
 )
+from app.storage.cache import extract_youtube_video_id, get_transcript_cache
 
 logger = get_logger(__name__)
 

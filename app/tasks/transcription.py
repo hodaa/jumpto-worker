@@ -14,7 +14,6 @@ from app.core.logging import get_logger
 from app.models import TranscriptSubmission, TranscriptWordData
 from app.providers import TranscriptData, TranscriptJobPending, YtDlpTranscriptStrategy
 from app.providers.registry import provider_spec
-from app.providers import TranscriptData, TranscriptJobPending
 from app.tasks.celery_app import celery_app
 from app.utils.text import normalize_word
 

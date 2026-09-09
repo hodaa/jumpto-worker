@@ -8,9 +8,14 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from app.core.exceptions import ExternalServiceError
+from app.integrations.ytdlp import build_ydlp_options
+from app.providers.assembly import (
+    AssemblyTranscriptProvider,
+    _parse_assembly_transcript,
+    _run_download,
+)
 from app.providers.media import get_media_info
 from app.providers.transcript import (
-    AssemblyTranscriptProvider,
     FakeTranscriptProvider,
     TranscriptData,
     TranscriptJobPending,
@@ -18,13 +23,10 @@ from app.providers.transcript import (
     _caption_language,
     _caption_targets,
     _download_caption,
-    _parse_assembly_transcript,
     _parse_vtt,
     _preferred_vtt_file,
-    _run_download,
     get_transcript_provider,
 )
-from app.providers.ytdlp import build_ydlp_options
 
 _FAKE_SETTINGS_FAKE_MODE = SimpleNamespace(
     jumpto_transcript_mode="fake",
@@ -142,7 +144,7 @@ class TestAssignmentFetcher:
         audio_file.write_bytes(b"fake-audio")
 
         monkeypatch.setattr(
-            "app.providers.transcript._download_audio", lambda url, info=None: str(audio_file)
+            "app.providers.assembly._download_audio", lambda url, info=None: str(audio_file)
         )
 
         upload_response = Mock(status_code=200)
@@ -166,7 +168,7 @@ class TestAssignmentFetcher:
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
 
-        monkeypatch.setattr("app.providers.transcript.httpx.AsyncClient", lambda: client)
+        monkeypatch.setattr("app.providers.assembly.httpx.AsyncClient", lambda: client)
 
         provider = AssemblyTranscriptProvider("key")
         transcript = await provider.fetch("https://youtu.be/abcde12345")
@@ -182,7 +184,7 @@ class TestAssignmentFetcher:
         poll_response.json.return_value = {"status": "processing"}
         client = AsyncMock()
         client.get.return_value = poll_response
-        monkeypatch.setattr("app.providers.transcript.httpx.AsyncClient", lambda: client)
+        monkeypatch.setattr("app.providers.assembly.httpx.AsyncClient", lambda: client)
 
         provider = AssemblyTranscriptProvider("key")
         with pytest.raises(TranscriptJobPending) as excinfo:
@@ -402,7 +404,7 @@ class TestYdlpOptions:
     ) -> None:
         source = tmp_path / "cookies.txt"
         source.write_text("# Netscape HTTP Cookie File\n")
-        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: self._settings(str(source)))
+        monkeypatch.setattr("app.integrations.ytdlp.get_settings", lambda: self._settings(str(source)))
 
         options = build_ydlp_options()
 
@@ -421,7 +423,7 @@ class TestYdlpOptions:
             "youtube.com\tTRUE\t/\tFALSE\t-1\tCONSENT\tYES\n"
             "accounts.google.com\tTRUE\t/\tTRUE\t1791297119\tOTZ\t8773352\n"
         )
-        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: self._settings(str(source)))
+        monkeypatch.setattr("app.integrations.ytdlp.get_settings", lambda: self._settings(str(source)))
 
         options = build_ydlp_options()
 
@@ -436,7 +438,7 @@ class TestYdlpOptions:
     ) -> None:
         source = tmp_path / "cookies.txt"
         source.write_text("# Netscape HTTP Cookie File\n#HttpOnly_.youtube.com\tFALSE\t/\tTRUE\t0\tSID\tv\n")
-        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: self._settings(str(source)))
+        monkeypatch.setattr("app.integrations.ytdlp.get_settings", lambda: self._settings(str(source)))
 
         options = build_ydlp_options()
 
@@ -450,7 +452,7 @@ class TestYdlpOptions:
             ytdlp_bgutil_url="",
             ytdlp_socket_timeout=30,
         )
-        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: settings)
+        monkeypatch.setattr("app.integrations.ytdlp.get_settings", lambda: settings)
 
         options = build_ydlp_options()
 
@@ -467,7 +469,7 @@ class TestYdlpOptions:
             ytdlp_bgutil_url="http://bgutil-pot:4416",
             ytdlp_socket_timeout=30,
         )
-        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: settings)
+        monkeypatch.setattr("app.integrations.ytdlp.get_settings", lambda: settings)
 
         options = build_ydlp_options()
 
@@ -478,7 +480,7 @@ class TestYdlpOptions:
     def test_overrides_win_over_base_options(self, monkeypatch, tmp_path) -> None:
         source = tmp_path / "cookies.txt"
         source.write_text("# Netscape HTTP Cookie File\n")
-        monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: self._settings(str(source)))
+        monkeypatch.setattr("app.integrations.ytdlp.get_settings", lambda: self._settings(str(source)))
 
         options = build_ydlp_options(proxy="http://override:3128", noplaylist=False)
 

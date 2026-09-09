@@ -1,7 +1,7 @@
 """Unit tests for the worker transcription pipeline."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -227,6 +227,27 @@ class TestFetchTranscriptWithRetry:
         fallback.fetch.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_captionless_video_falls_back_to_audio(self, monkeypatch) -> None:
+        """A fully caption-less video raises in the real caption provider,
+        then falls back to the audio (Assembly) transcript path."""
+        settings = _settings(live_calls=True, mode="real")
+        monkeypatch.setattr(local_module, "get_settings", lambda: settings)
+
+        info = {"id": "abcde12345", "automatic_captions": {}, "subtitles": {}}
+
+        fallback = AsyncMock()
+        fallback.fetch.return_value = _transcript()
+        monkeypatch.setattr(local_module, "get_transcript_provider", lambda: fallback)
+
+        result = await local_module._fetch_transcript_with_retry(
+            "https://youtu.be/abcde12345", info
+        )
+
+        assert result.text == "Hello, world!"
+        fallback.fetch.assert_awaited_once()
+        fallback.fetch.assert_awaited_with("https://youtu.be/abcde12345", info=info)
+
+    @pytest.mark.asyncio
     async def test_raises_after_retries_exhausted(self, monkeypatch) -> None:
         settings = _settings(live_calls=False)
         monkeypatch.setattr(local_module, "get_settings", lambda: settings)
@@ -276,30 +297,6 @@ class TestPerformTranscription:
         provider = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=_cloud_result()))
         monkeypatch.setattr(transcription_module, "_configured_provider", lambda: provider)
 
-    async def test_cache_hit_skips_all_providers(self, monkeypatch) -> None:
-        from app.providers.cache import TranscriptCache, _serialize_result
-
-        cache = TranscriptCache("redis://unused:6379/0", 3600, enabled=True)
-        fake = Mock()
-        fake.get.return_value = _serialize_result(_cloud_result(), "vidwords")
-        cache._client = fake
-        provider = SimpleNamespace(name="vidwords", fetch=AsyncMock())
-        settings = SimpleNamespace(jumpto_live_external_calls=True, jumpto_transcript_mode="real")
-        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
-        monkeypatch.setattr(transcription_module, "get_transcript_cache", lambda: cache)
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [provider])
-
-        submission = await _perform_transcription(_job())
-
-        assert submission.provider == "vidwords"
-        provider.fetch.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_first_provider_used_when_it_returns_result(self, monkeypatch) -> None:
-        first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=_cloud_result()))
-        second = SimpleNamespace(name="supadata", fetch=AsyncMock())
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, second])
-
         submission = await _perform_transcription(_job())
 
         assert submission.title == "Me at the zoo"
@@ -309,41 +306,24 @@ class TestPerformTranscription:
         provider.fetch.assert_awaited_once()
 
     @pytest.mark.asyncio
-
-    async def test_ytdlp_fallback_on_miss(self, monkeypatch) -> None:
+    async def test_falls_back_to_ytdlp_when_configured_provider_misses(self, monkeypatch) -> None:
         provider = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=None))
         ytdlp = self._fallback()
         monkeypatch.setattr(transcription_module, "_configured_provider", lambda: provider)
         monkeypatch.setattr(transcription_module, "YtDlpTranscriptStrategy", lambda: ytdlp)
 
-    async def test_falls_through_to_second_provider_on_miss(self, monkeypatch) -> None:
-        first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=None))
-        second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, second])
-
         submission = await _perform_transcription(_job())
 
-        assert submission.title == "Me at the zoo"
-        assert submission.provider == "supadata"
-        second.fetch.assert_awaited_once()
+        assert submission.provider == "yt-dlp"
+        assert submission.title == "Fallback Video"
+        assert submission.transcript_text == "Hello, world!"
+        provider.fetch.assert_awaited_once()
+        ytdlp.fetch.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_error_in_first_provider_tries_second(self, monkeypatch) -> None:
-        first = SimpleNamespace(
-            name="vidwords",
-            fetch=AsyncMock(side_effect=ExternalServiceError("oops", service="vidwords")),
-        )
-        second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, second])
 
-        submission = await _perform_transcription(_job())
-
-        assert submission.provider == "supadata"
-        second.fetch.assert_awaited_once()
-
-    @pytest.mark.asyncio
     async def test_permanent_provider_error_does_not_fall_through(self, monkeypatch) -> None:
-        first = SimpleNamespace(
+        provider = SimpleNamespace(
             name="vidwords",
             fetch=AsyncMock(
                 side_effect=VidWordsPermanentError(
@@ -351,44 +331,31 @@ class TestPerformTranscription:
                 )
             ),
         )
-        second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, second])
+        ytdlp = self._fallback()
+        monkeypatch.setattr(transcription_module, "_configured_provider", lambda: provider)
+        monkeypatch.setattr(transcription_module, "YtDlpTranscriptStrategy", lambda: ytdlp)
 
         with pytest.raises(VidWordsPermanentError):
             await _perform_transcription(_job())
 
-        second.fetch.assert_not_awaited()
+        ytdlp.fetch.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_resume_token_routes_directly_to_its_provider(self, monkeypatch) -> None:
-        first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=_cloud_result()))
-        second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, second])
+    async def test_resume_token_routes_to_its_provider(self, monkeypatch) -> None:
+        provider = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
+        ytdlp = self._fallback()
+        monkeypatch.setattr(transcription_module, "_configured_provider", lambda: provider)
+        monkeypatch.setattr(transcription_module, "YtDlpTranscriptStrategy", lambda: ytdlp)
 
         submission = await _perform_transcription(
             _job(), resume_token="job-x", resume_provider="supadata"
         )
 
         assert submission.provider == "supadata"
-        first.fetch.assert_not_awaited()
-        second.fetch.assert_awaited_once_with(
+        provider.fetch.assert_awaited_once_with(
             "https://www.youtube.com/watch?v=abcde12345", "abcde12345", resume_token="job-x"
         )
-
-    @pytest.mark.asyncio
-    async def test_ytdlp_strategy_used_when_all_cloud_miss(self, monkeypatch) -> None:
-        first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=None))
-        ytdlp = SimpleNamespace(name="yt-dlp", fetch=AsyncMock(return_value=_ytdlp_result()))
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, ytdlp])
-
-
-        submission = await _perform_transcription(_job())
-
-        assert submission.title == "Fallback Video"
-        assert submission.provider == "yt-dlp"
-        assert submission.transcript_text == "Hello, world!"
-        provider.fetch.assert_awaited_once()
-        ytdlp.fetch.assert_awaited_once()
+        ytdlp.fetch.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_ytdlp_fallback_on_error(self, monkeypatch) -> None:

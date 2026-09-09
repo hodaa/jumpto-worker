@@ -8,7 +8,7 @@ import yt_dlp
 from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
-from app.providers.ytdlp import (
+from app.integrations.ytdlp import (
     build_ydlp_options,
     is_youtube_bot_check,
     release_temp_cookie,
