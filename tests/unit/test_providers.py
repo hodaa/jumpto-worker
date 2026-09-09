@@ -16,12 +16,12 @@ from app.providers.transcript import (
     TranscriptJobPending,
     YouTubeCaptionTranscriptProvider,
     _caption_language,
+    _caption_targets,
     _download_caption,
     _parse_assembly_transcript,
     _parse_vtt,
     _preferred_vtt_file,
     _run_download,
-    _select_caption_language,
     get_transcript_provider,
 )
 from app.providers.ytdlp import build_ydlp_options
@@ -205,32 +205,59 @@ class TestCaptionSelection:
 
         return [Path(name) for name in names]
 
-    def test_prefers_supported_language_file(self) -> None:
-        files = self._paths(["video.de.vtt", "video.en.vtt", "video.fr.vtt"])
+    def test_prefers_original_audio_track_file(self) -> None:
+        files = self._paths(["video.en.vtt", "video.en-orig.vtt", "video.fr.vtt"])
 
         chosen = _preferred_vtt_file(files)
 
-        assert chosen.name == "video.en.vtt"
+        assert chosen.name == "video.en-orig.vtt"
+
+    def test_picks_any_language(self) -> None:
+        files = self._paths(["video.it.vtt"])
+
+        chosen = _preferred_vtt_file(files)
+
+        assert chosen.name == "video.it.vtt"
 
     def test_reduces_original_language_files(self) -> None:
         assert _caption_language("video.ar-orig.vtt") == "ar"
 
 
 class TestCaptionLanguageSelection:
-    """Tests for the single caption-language selection."""
+    """Tests for the caption-track selection (language-agnostic)."""
 
-    def test_prefers_original_supported_language(self) -> None:
+    def test_prefers_manual_subtitles_over_auto(self) -> None:
         info = {
-            "automatic_captions": {"en": [], "ar": [], "ar-orig": []},
-            "subtitles": {},
+            "automatic_captions": {"en-orig": []},
+            "subtitles": {"it": []},
+            "original_language": "it",
         }
 
-        assert _select_caption_language(info, ("en", "ar")) == "ar"
+        assert _caption_targets(info) == ["it"]
 
-    def test_prefers_en_plain_when_no_original(self) -> None:
+    def test_prefers_original_language_and_orig_track(self) -> None:
+        info = {
+            "automatic_captions": {"en-orig": [], "it-1-orig": [], "fr": []},
+            "subtitles": {},
+            "original_language": "it",
+        }
+
+        targets = _caption_targets(info)
+
+        assert targets[0] == "it-1-orig"
+
+    def test_falls_back_to_any_auto_caption(self) -> None:
         info = {"automatic_captions": {"ar": [], "en": []}, "subtitles": {}}
 
-        assert _select_caption_language(info, ("en", "ar")) == "en"
+        assert _caption_targets(info) == ["ar"] or _caption_targets(info) == ["en"]
+
+    def test_no_captions_raises(self) -> None:
+        from app.core.exceptions import ExternalServiceError
+
+        info = {"automatic_captions": {}, "subtitles": {}}
+
+        with pytest.raises(ExternalServiceError):
+            _caption_targets(info)
 
 
 class TestCaptionParser:
@@ -324,7 +351,7 @@ class TestDownloadCaptionMetadataReuse:
         }
 
         with pytest.raises(ExternalServiceError):  # no temp captions written
-            _download_caption("https://youtu.be/abcde12345", ("en", "ar"), info)
+            _download_caption("https://youtu.be/abcde12345", info)
 
         extract.assert_not_called()
         assert fake.replayed == (info, True)
@@ -354,7 +381,7 @@ class TestDownloadCaptionMetadataReuse:
         monkeypatch.setattr("app.providers.transcript._extract_video_info", extract)
 
         with pytest.raises(ExternalServiceError):
-            _download_caption("https://youtu.be/abcde12345", ("en", "ar"))
+            _download_caption("https://youtu.be/abcde12345")
 
         extract.assert_called_once_with("https://youtu.be/abcde12345")
 

@@ -3,6 +3,8 @@
 import time
 from dataclasses import dataclass
 
+import yt_dlp
+
 from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
@@ -88,8 +90,6 @@ def _fetch_from_yt_dlp(youtube_url: str) -> dict:
     Transient ``DownloadError``s (rate limits, network blips, YouTube hiccups)
     are retried with a short backoff so a single failure doesn't kill the job.
     """
-    import yt_dlp  # Optional dependency, only needed for live calls
-
     options = build_ydlp_options()
     last_error: yt_dlp.utils.DownloadError | None = None
     try:

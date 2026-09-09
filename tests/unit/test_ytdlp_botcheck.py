@@ -142,7 +142,7 @@ class TestBotCheckWiredIntoTranscript:
 
         info = {"subtitles": {"en": [{"ext": "vtt"}]}}
         with pytest.raises(ExternalServiceError):
-            transcript._download_caption("https://youtu.be/abc", ("en",), info=info)
+            transcript._download_caption("https://youtu.be/abc", info=info)
 
         refresh.assert_called_once()
 

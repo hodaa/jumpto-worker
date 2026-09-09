@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import yt_dlp
 
 from app.client.http import get_shared_http_client
 from app.core.config import get_settings
@@ -150,11 +151,8 @@ class FakeTranscriptProvider(TranscriptProvider):
         return TranscriptData(language="en", text=text, words=words)
 
 
-_SUPPORTED_CAPTION_LANGUAGES = ("en", "ar")
-
-
 class YouTubeCaptionTranscriptProvider(TranscriptProvider):
-    """Transcript provider that downloads YouTube's own caption track (fast path)."""
+    """YouTube caption downloader (works for any subtitle language)."""
 
     async def fetch(
         self,
@@ -163,21 +161,19 @@ class YouTubeCaptionTranscriptProvider(TranscriptProvider):
         resume_token: str = "",
     ) -> TranscriptData:
         """Download and parse the best available caption track for a video."""
-        vtt_text, language_code = await asyncio.to_thread(
-            _download_caption, youtube_url, _SUPPORTED_CAPTION_LANGUAGES, info
-        )
+        vtt_text, language_code = await asyncio.to_thread(_download_caption, youtube_url, info)
         return _parse_vtt(vtt_text, language_code)
 
 
 def _download_caption(
-    youtube_url: str, languages: tuple[str, ...], info: dict | None = None
+    youtube_url: str, info: dict | None = None
 ) -> tuple[str, str]:
     """
-    Download a caption track with yt-dlp and return its (text, language).
+    Download the best available caption track and return its (text, language).
 
     yt-dlp handles YouTube client impersonation and retries so the caption
     endpoint is reached without the rate limiting that raw HTTP fetches hit.
-    A single best-language track is downloaded to minimize caption requests.
+    A single best track is downloaded to minimize caption requests.
 
     When ``info`` is provided it is replayed through ``process_ie_result`` so
     yt-dlp downloads captions without re-extracting the video metadata; the
@@ -185,46 +181,44 @@ def _download_caption(
     """
     if info is None:
         info = _extract_video_info(youtube_url)
-    target = _select_caption_language(info, languages)
-    temp_dir = tempfile.mkdtemp(prefix="jumpto-captions-")
-    options = build_ydlp_options(
-        skip_download=True,
-        writesubtitles=True,
-        writeautomaticsub=True,
-        subtitleslangs=[target],
-        outtmpl=str(Path(temp_dir) / "%(id)s.%(ext)s"),
-    )
-    try:
-        import yt_dlp  # Optional dependency, only needed for live calls
-
+    targets = _caption_targets(info)
+    vtt_files: list[Path] = []
+    for target in targets:
+        temp_dir = tempfile.mkdtemp(prefix="jumpto-captions-")
+        options = build_ydlp_options(
+            skip_download=True,
+            writesubtitles=True,
+            writeautomaticsub=True,
+            subtitleslangs=[target],
+            outtmpl=str(Path(temp_dir) / "%(id)s.%(ext)s"),
+        )
         try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                ydl.process_ie_result(info, download=True)
-        except yt_dlp.utils.DownloadError as exc:
-            logger.warning(
-                "yt-dlp failed to download captions",
-                error=str(exc),
-            )
-            if is_youtube_bot_check(exc):
-                request_cookie_refresh()
-            raise ExternalServiceError(
-                "Failed to download captions", service="youtube-captions"
-            ) from exc
-        vtt_files = sorted(Path(temp_dir).glob("*.vtt"))
-        if not vtt_files:
-            raise ExternalServiceError("No captions available", service="youtube-captions")
-        chosen = _preferred_vtt_file(vtt_files)
-        text = chosen.read_text(encoding="utf-8", errors="replace")
-        return text, _caption_language(chosen.name)
-    finally:
-        release_temp_cookie(options)
-        shutil.rmtree(temp_dir, ignore_errors=True)
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    ydl.process_ie_result(info, download=True)
+            except yt_dlp.utils.DownloadError as exc:
+                logger.warning(
+                    "yt-dlp failed to download captions",
+                    error=str(exc),
+                )
+                if is_youtube_bot_check(exc):
+                    request_cookie_refresh()
+                raise ExternalServiceError(
+                    "Failed to download captions", service="youtube-captions"
+                ) from exc
+            vtt_files = sorted(Path(temp_dir).glob("*.vtt"))
+            if vtt_files:
+                chosen = _preferred_vtt_file(vtt_files)
+                text = chosen.read_text(encoding="utf-8", errors="replace")
+                return text, _caption_language(chosen.name)
+        finally:
+            release_temp_cookie(options)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    raise ExternalServiceError("No captions available", service="youtube-captions")
 
 
 def _extract_video_info(youtube_url: str) -> dict:
     """Extract full video metadata (including caption tracks) with yt-dlp."""
-    import yt_dlp
-
     options = build_ydlp_options(skip_download=True)
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -237,43 +231,59 @@ def _extract_video_info(youtube_url: str) -> dict:
         release_temp_cookie(options)
 
 
-def _select_caption_language(info: dict, supported: tuple[str, ...]) -> str:
+def _caption_targets(info: dict) -> list[str]:
     """
-    Pick a single caption language to download for a video.
+    Pick caption tracks to download, in preference order, regardless of language.
 
-    Prefers the video's original-language caption (``xx-orig``) when it is a
-    supported language, then a plain supported code, then a supported
-    regional variant.
+    Manual subtitles beat auto-captions (human-curated words), original-audio
+    tracks (``xx-orig``) beat translated ones, and tracks in the video's
+    ``original_language`` are preferred over other languages. Search only needs
+    the words, so no language is ever excluded.
     """
-    lowered = [
-        key.lower()
-        for key in list((info.get("automatic_captions") or {}).keys())
-        + list((info.get("subtitles") or {}).keys())
-    ]
-    if not lowered:
+    manual = list((info.get("subtitles") or {}).keys())
+    auto = list((info.get("automatic_captions") or {}).keys())
+    if not manual and not auto:
         raise ExternalServiceError("No captions available", service="youtube-captions")
-    for language in supported:
-        if f"{language}-orig" in lowered:
-            return language
-    for language in supported:
-        if language in lowered:
-            return language
-    for language in supported:
-        if any(key.startswith(f"{language}-") or key.startswith(f"{language}_") for key in lowered):
-            return language
-    raise ExternalServiceError("No captions available", service="youtube-captions")
+
+    original = str(info.get("original_language") or "").lower().strip()
+
+    def rank(track: str) -> tuple[int, int, int, str]:
+        base_matches = 0 if (original and _language_base(track) == original) else 1
+        orig = 0 if track.endswith("-orig") else (1 if "-" not in track else 2)
+        group = 0 if track in manual else 1
+        return (group, orig, base_matches, track)
+
+    def reduce(tracks: list[str]) -> str:
+        return min(tracks, key=rank)
+
+    best = reduce(manual) if manual else reduce(auto)
+    # Prefer the best of each group, then the best of the merge.
+    if manual and auto:
+        best = min([reduce(manual), reduce(auto)], key=rank)
+    candidates = [best]
+    base = _language_base(best)
+    if base != best and base in (manual + auto):
+        candidates.append(base)
+    return candidates
 
 
 def _preferred_vtt_file(files: list[Path]) -> Path:
-    """Pick the caption file in the most preferred supported language."""
-    return min(files, key=lambda path: _caption_rank(_caption_language(path.name)))
+    """Pick the best caption file: original-audio, then plain, then regional."""
+    return min(files, key=lambda path: _caption_rank(_caption_locale(path.name)))
 
 
-def _caption_rank(language: str) -> tuple[int, int]:
-    """Rank a caption language, supported codes first."""
-    if language in _SUPPORTED_CAPTION_LANGUAGES:
-        return (0, _SUPPORTED_CAPTION_LANGUAGES.index(language))
-    return (1, 0)
+def _caption_locale(filename: str) -> str:
+    """Return the raw locale portion of a caption filename (keeps ``-orig``)."""
+    return Path(filename).stem.rsplit(".", 1)[-1]
+
+
+def _caption_rank(locale: str) -> tuple[int, int, str]:
+    """Rank a caption locale, ``-orig`` tracks (original audio) first."""
+    if locale.endswith("-orig"):
+        return (0, 0, locale)
+    if "-" not in locale:
+        return (0, 1, locale)
+    return (1, 0, locale)
 
 
 def _caption_language(filename: str) -> str:
@@ -483,8 +493,6 @@ def _run_download(options: dict, youtube_url: str, info: dict | None = None) -> 
     halving the YouTube requests per video. Without it, falls back to a
     standard download.
     """
-    import yt_dlp
-
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             if info is not None:
