@@ -3,7 +3,6 @@
 import atexit
 import contextlib
 import os
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -30,11 +29,45 @@ def _cleanup_temp_cookie_copies() -> None:
 atexit.register(_cleanup_temp_cookie_copies)
 
 
+def _sanitize_cookie_lines(source: str, dest: str) -> None:
+    """Copy ``source`` to ``dest``, normalizing rows yt-dlp's cookiejar rejects.
+
+    Python's ``http.cookiejar`` is strict about Netscape format: a dotted
+    domain (e.g. ``.youtube.com``) must have the includeSubdomains flag set to
+    TRUE, and expiry -1 (session cookies) must be 0. Files exported by older
+    cookie exporters (or the mac_export path) get this wrong, and yt-dlp then
+    aborts the whole download with "assert domain_specified == initial_dot".
+    Sanitizing here makes the worker resilient to any source file, stale or
+    freshly exported.
+    """
+    with Path(source).open(encoding="utf-8") as src, Path(dest).open("w", encoding="utf-8") as out:
+        for line in src:
+            content = line.rstrip("\n")
+            if (not content.strip()) or (content.startswith("#") and not content.startswith("#HttpOnly_")):
+                out.write(line)
+                continue
+            fields = content.split("\t")
+            if len(fields) >= 7:
+                domain = fields[0]
+                if domain.startswith("#HttpOnly_"):
+                    domain = domain[len("#HttpOnly_"):]
+                if domain.startswith("."):
+                    fields[1] = "TRUE"
+                try:
+                    expires = int(fields[4])
+                except ValueError:
+                    expires = 0
+                fields[4] = str(max(expires, 0))
+                out.write("\t".join(fields) + "\n")
+            else:
+                out.write(line)
+
+
 def _writable_cookie_copy(cookie_file: str) -> str:
-    """Return a writable copy of ``cookie_file`` for use by a single yt-dlp run."""
+    """Return a writable, sanitized copy of ``cookie_file`` for one yt-dlp run."""
     fd, tmp = tempfile.mkstemp(prefix="jumpto-cookies-", suffix=".txt")
     try:
-        shutil.copyfile(cookie_file, tmp)
+        _sanitize_cookie_lines(cookie_file, tmp)
         return tmp
     except OSError:
         Path(tmp).unlink(missing_ok=True)
