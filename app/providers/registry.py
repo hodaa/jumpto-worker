@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from app.core.config import Settings, get_settings
+from app.core.config import Settings
 from app.core.logging import get_logger
 from app.providers.base import TranscriptProviderStrategy
 from app.providers.local import YtDlpTranscriptStrategy

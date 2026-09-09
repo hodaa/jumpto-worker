@@ -15,8 +15,6 @@ from app.models import TranscriptSubmission, TranscriptWordData
 from app.providers import TranscriptData, TranscriptJobPending, YtDlpTranscriptStrategy
 from app.providers.registry import provider_spec
 from app.providers import TranscriptData, TranscriptJobPending
-from app.providers.cache import extract_youtube_video_id, get_transcript_cache
-from app.providers.registry import build_provider_chain
 from app.tasks.celery_app import celery_app
 from app.utils.text import normalize_word
 
