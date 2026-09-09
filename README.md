@@ -16,7 +16,8 @@ cp .env.example .env
 ## Run
 
 ```sh
-celery -A app.tasks.celery_app.celery_app worker --loglevel=info --concurrency=8
+celery -A app.tasks.celery_app.celery_app worker --loglevel=info
+# Set CELERY_WORKER_CONCURRENCY in .env to tune the prefork worker count.
 ```
 
 ## Test

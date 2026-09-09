@@ -23,7 +23,8 @@ from dataclasses import dataclass
 
 import httpx
 
-from app.core.exceptions import ExternalServiceError
+from app.client.http import get_shared_http_client
+from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.core.logging import get_logger
 from app.providers.base import TranscriptProviderStrategy, VideoTranscriptResult
 from app.providers.transcript import (
@@ -70,7 +71,7 @@ _PERMANENT_ERRORS = {
 }
 
 
-class TranscriptFetchPermanentError(ExternalServiceError):
+class TranscriptFetchPermanentError(PermanentExternalServiceError):
     """TranscriptFetch failure no fallback can recover (fast-fail)."""
 
 
@@ -133,12 +134,12 @@ class TranscriptFetchTranscriptProvider(TranscriptProviderStrategy):
             "Content-Type": "application/json",
         }
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
-                response = await client.post(
-                    f"{self.base_url}/api/v2/transcripts/video",
-                    json=payload,
-                    headers=headers,
-                )
+            client = get_shared_http_client(timeout=self.timeout, transport=self.transport)
+            response = await client.post(
+                f"{self.base_url}/api/v2/transcripts/video",
+                json=payload,
+                headers=headers,
+            )
         except httpx.HTTPError as exc:
             logger.error("TranscriptFetch request failed", youtube_url=youtube_url, error=str(exc))
             raise ExternalServiceError(

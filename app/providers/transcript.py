@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from app.client.http import get_shared_http_client
 from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
@@ -26,8 +27,6 @@ from app.providers.ytdlp import (
 logger = get_logger(__name__)
 
 _ASSEMBLY_BASE_URL = "https://api.assemblyai.com/v2"
-_POLL_INTERVAL_SECONDS = 1
-_MAX_POLL_ATTEMPTS = 600
 _UPLOAD_TIMEOUT_SECONDS = 300
 
 
@@ -88,6 +87,7 @@ class TranscriptProvider(ABC):
         self,
         youtube_url: str,
         info: dict | None = None,
+        resume_token: str = "",
     ) -> TranscriptData:
         """Fetch transcript data for a YouTube URL.
 
@@ -135,6 +135,7 @@ class FakeTranscriptProvider(TranscriptProvider):
         self,
         youtube_url: str,
         info: dict | None = None,
+        resume_token: str = "",
     ) -> TranscriptData:
         """Build a deterministic transcript from a fixed corpus."""
         words = [
@@ -159,6 +160,7 @@ class YouTubeCaptionTranscriptProvider(TranscriptProvider):
         self,
         youtube_url: str,
         info: dict | None = None,
+        resume_token: str = "",
     ) -> TranscriptData:
         """Download and parse the best available caption track for a video."""
         vtt_text, language_code = await asyncio.to_thread(
@@ -360,15 +362,19 @@ class AssemblyTranscriptProvider(TranscriptProvider):
         self,
         youtube_url: str,
         info: dict | None = None,
+        resume_token: str = "",
     ) -> TranscriptData:
-        """Download the audio and transcribe it via Assembly.ai."""
+        """Submit or resume an Assembly.ai transcription without blocking a slot."""
+        headers = {"authorization": self.api_key}
+        client = get_shared_http_client()
+        if resume_token:
+            return await self._poll(client, headers, resume_token)
+
         audio_path = await asyncio.to_thread(_download_audio, youtube_url, info)
         try:
-            headers = {"authorization": self.api_key}
-            async with httpx.AsyncClient() as client:
-                upload_url = await self._upload(client, headers, audio_path)
-                transcript_id = await self._submit(client, headers, upload_url)
-                return await self._poll(client, headers, transcript_id)
+            upload_url = await self._upload(client, headers, audio_path)
+            transcript_id = await self._submit(client, headers, upload_url)
+            return await self._poll(client, headers, transcript_id)
         finally:
             _remove_file(audio_path)
 
@@ -422,20 +428,26 @@ class AssemblyTranscriptProvider(TranscriptProvider):
         headers: dict,
         transcript_id: str,
     ) -> TranscriptData:
-        """Poll until the transcript is ready and parse word timestamps."""
-        for _ in range(_MAX_POLL_ATTEMPTS):
-            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-            response = await client.get(
-                f"{self.base_url}/transcript/{transcript_id}", headers=headers
+        """Check once and let Celery backoff while Assembly processes the job."""
+        response = await client.get(
+            f"{self.base_url}/transcript/{transcript_id}", headers=headers
+        )
+        if response.status_code != 200:
+            raise ExternalServiceError(
+                "Transcription service status check failed", service="assemblyai"
             )
-            if response.status_code != 200:
-                continue
-            data = response.json()
-            if data["status"] == "completed":
-                return _parse_assembly_transcript(data)
-            if data["status"] == "error":
-                raise ExternalServiceError("Transcription service failed", service="assemblyai")
-        raise ExternalServiceError("Transcription timed out", service="assemblyai")
+        data = response.json()
+        status = str(data.get("status") or "")
+        if status == "completed":
+            return _parse_assembly_transcript(data)
+        if status == "error":
+            raise ExternalServiceError("Transcription service failed", service="assemblyai")
+        raise TranscriptJobPending(
+            message="Transcription service is still processing; will retry later",
+            provider="assemblyai",
+            resume_token=transcript_id,
+            resumable=True,
+        ) from None
 
 
 def _download_audio(youtube_url: str, info: dict | None = None) -> str:

@@ -36,6 +36,10 @@ class ExternalServiceError(DomainError):
         )
 
 
+class PermanentExternalServiceError(ExternalServiceError):
+    """External-service failure that fallback providers cannot recover from."""
+
+
 class BackendCommunicationError(DomainError):
     """Exception for failures while communicating with the backend API."""
 

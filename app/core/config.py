@@ -73,6 +73,11 @@ class Settings(BaseSettings):
         ge=1,
         description="Max seconds a transcription job may run before it is failed",
     )
+    task_timeout_grace_seconds: int = Field(
+        default=30,
+        ge=1,
+        description="Extra hard-time-limit margin for cleanup after a job timeout",
+    )
 
     # Assembly AI
     assembly_api_key: str = Field(
@@ -211,6 +216,11 @@ class Settings(BaseSettings):
         default=86400,
         ge=0,
         description="How long a cached transcript stays valid (TRANSCRIPT_CACHE_TTL_SECONDS)",
+    )
+    transcript_cache_lock_ttl_seconds: int = Field(
+        default=900,
+        ge=1,
+        description="How long a transcript cache single-flight lock is held",
     )
 
     @property

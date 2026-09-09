@@ -13,6 +13,7 @@ from app.providers.transcript import (
     AssemblyTranscriptProvider,
     FakeTranscriptProvider,
     TranscriptData,
+    TranscriptJobPending,
     YouTubeCaptionTranscriptProvider,
     _caption_language,
     _download_caption,
@@ -174,6 +175,25 @@ class TestAssignmentFetcher:
         assert transcript.words[0].word == "hello"
         assert client.post.call_count == 2
         assert not audio_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_resume_checks_once_and_raises_pending(self, monkeypatch) -> None:
+        poll_response = Mock(status_code=200)
+        poll_response.json.return_value = {"status": "processing"}
+        client = AsyncMock()
+        client.get.return_value = poll_response
+        monkeypatch.setattr("app.providers.transcript.httpx.AsyncClient", lambda: client)
+
+        provider = AssemblyTranscriptProvider("key")
+        with pytest.raises(TranscriptJobPending) as excinfo:
+            await provider.fetch(
+                "https://youtu.be/abcde12345", resume_token="transcript-1"
+            )
+
+        assert excinfo.value.resume_token == "transcript-1"
+        assert excinfo.value.resumable is True
+        client.get.assert_awaited_once()
+        client.post.assert_not_awaited()
 
 
 class TestCaptionSelection:
