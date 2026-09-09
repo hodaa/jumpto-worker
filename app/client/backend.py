@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 import random
 from typing import Any
 
@@ -20,6 +22,14 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF_BASE_SECONDS = 0.25
 _RETRY_BACKOFF_MAX_SECONDS = 4.0
 _INTERNAL_API_KEY_HEADER = "X-Internal-API-Key"
+
+# Payloads at or above this size are gzipped before sending. Transcript bodies
+# (full text + per-word timings) compress ~5-10x, which keeps them under Vercel's
+# wire-size request-body cap (413 Request Entity Too Large) and cuts transfer
+# time to the backend.
+_GZIP_COMPRESS_MIN_BYTES = 1_000_000
+
+_GZIP_CONTENT_TYPE = "application/json"
 
 
 def _retry_delay(attempt: int, response: httpx.Response | None = None) -> float:
@@ -76,7 +86,17 @@ class BackendClient:
                 for word in submission.words
             ],
         }
-        await self._request("POST", f"/internal/jobs/{job_id}/transcript", json=payload)
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        extra_headers: dict[str, str] = {}
+        if len(body) >= _GZIP_COMPRESS_MIN_BYTES:
+            body = gzip.compress(body)
+            extra_headers["Content-Encoding"] = "gzip"
+        await self._request(
+            "POST",
+            f"/internal/jobs/{job_id}/transcript",
+            data=body,
+            extra_headers=extra_headers,
+        )
 
     async def complete_job(self, job_id: str) -> None:
         """Mark a job as completed."""
@@ -92,14 +112,21 @@ class BackendClient:
         path: str,
         *,
         json: dict[str, Any] | None = None,
+        data: bytes | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Send an authenticated request to the internal API, with retries."""
         url = f"{self.base_url}{path}"
-        headers = {_INTERNAL_API_KEY_HEADER: self.api_key}
+        headers = {_INTERNAL_API_KEY_HEADER: self.api_key, **(extra_headers or {})}
         last_error: Exception | None = None
         for attempt in range(_MAX_RETRIES):
             try:
-                response = await self._client.request(method, url, headers=headers, json=json)
+                if data is not None:
+                    if "Content-Type" not in headers:
+                        headers["Content-Type"] = _GZIP_CONTENT_TYPE
+                    response = await self._client.request(method, url, headers=headers, content=data)
+                else:
+                    response = await self._client.request(method, url, headers=headers, json=json)
             except httpx.HTTPError as exc:
                 last_error = exc
                 logger.warning(

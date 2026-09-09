@@ -1,5 +1,7 @@
 """Unit tests for the BackendClient."""
 
+import gzip
+import json
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -83,9 +85,46 @@ async def test_store_transcript_sends_words(monkeypatch) -> None:
     client = BackendClient(_BASE, _API_KEY)
     await client.store_transcript("job-1", submission)
 
-    payload = client_context.request.await_args.kwargs["json"]
+    args, kwargs = client_context.request.await_args.args, client_context.request.await_args.kwargs
+    assert args[0] == "POST"
+    assert kwargs["headers"]["Content-Type"] == "application/json"
+    assert "Content-Encoding" not in kwargs["headers"]
+    payload = json.loads(kwargs["content"])
     assert payload["transcript_text"] == "hello world"
     assert payload["words"][0]["word_index"] == 0
+
+
+@pytest.mark.asyncio
+async def test_store_transcript_gzips_large_payload(monkeypatch) -> None:
+    response = _json_response(200, {"status": "pending"})
+    client_context = _client_context(response)
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+
+    words = [
+        TranscriptWordData(word_index=i, word="keyword", start_time=i * 0.4, end_time=i * 0.4 + 0.35)
+        for i in range(60_000)
+    ]
+    submission = TranscriptSubmission(
+        title="Long Video",
+        duration_seconds=24_000,
+        language="en",
+        transcript_text=" ".join(w.word for w in words),
+        words=words,
+    )
+
+    client = BackendClient(_BASE, _API_KEY)
+    await client.store_transcript("job-1", submission)
+
+    kwargs = client_context.request.await_args.kwargs
+    compressed = kwargs["content"]
+    assert kwargs["headers"]["Content-Encoding"] == "gzip"
+    assert kwargs["headers"]["Content-Type"] == "application/json"
+    payload = json.loads(gzip.decompress(compressed))
+    assert payload["provider"] == submission.provider
+    assert payload["transcript_text"] == submission.transcript_text
+    assert payload["words"][-1]["word_index"] == 59_999
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    assert len(compressed) < len(raw)
 
 
 @pytest.mark.asyncio
