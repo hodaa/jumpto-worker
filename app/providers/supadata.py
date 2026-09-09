@@ -1,10 +1,10 @@
-"""Supadata transcript provider (cloud fast path, no YouTube access needed).
+"""Supadata transcript provider (cloud fallback, no YouTube access needed).
 
 Supadata runs YouTube extraction on their own infrastructure behind
 ``x-api-key`` auth, so transcripts and video metadata arrive without yt-dlp,
-cookies, or PO-token providers. This pairs with VidWords as a second
-cloud provider: if one has no transcript or is failing, the other — and
-finally the yt-dlp fallback — can still serve the job.
+cookies, or PO-token providers. It serves as a cloud fallback after the free
+local yt-dlp path: if yt-dlp has no transcript (or its captions come back
+otherwise unusable), Supadata and VidWords try their own extraction.
 
 The generic ``/transcript`` endpoint fetches an existing caption track
 (``mode=native``) or falls back to AI transcription (``mode=generate``/

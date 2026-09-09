@@ -6,7 +6,6 @@ from app.providers.media import MediaInfo, get_media_info, get_media_info_with_r
 from app.providers.registry import (
     TranscriptProviderSpec,
     build_provider,
-    build_provider_chain,
     ordered_specs,
     provider_spec,
     register_provider,
@@ -50,7 +49,6 @@ __all__ = [
     "YtDlpTranscriptStrategy",
     "YouTubeCaptionTranscriptProvider",
     "build_provider",
-    "build_provider_chain",
     "get_media_info",
     "get_media_info_with_raw",
     "get_transcript_provider",

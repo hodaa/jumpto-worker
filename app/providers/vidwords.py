@@ -1,8 +1,8 @@
-"""VidWords transcript provider (primary fast path).
+"""VidWords transcript provider (cloud fallback).
 
 VidWords proxies YouTube on their own infrastructure, so transcripts and
-video title arrive without yt-dlp, cookies, or PO-token providers — avoiding
-the datacenter-IP bot-checks that block direct YouTube access.
+video title arrive without yt-dlp, cookies, or PO-token providers — useful for
+videos whose local yt-dlp extraction is blocked by datacenter-IP bot-checks.
 
 The API returns caption ``segments`` (cue-level ``start``/``duration``), not
 per-word timestamps; word records are derived from each cue so the pipeline's
@@ -30,7 +30,7 @@ logger = get_logger(__name__)
 _TIMEOUT_SECONDS = 60.0
 
 # Per-video errors that mean "this video/account can never yield a transcript"
-# (falling back to the (currently blocked) yt-dlp path would just waste time).
+# (so moving on to yt-dlp would just waste time).
 _PERMANENT_ERRORS = {
     "invalid_id",
     "video_unavailable",

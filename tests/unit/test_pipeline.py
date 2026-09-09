@@ -21,7 +21,6 @@ from app.tasks.transcription import (
     _build_submission,
     _job_retry_countdown,
     _perform_transcription,
-    _provider_chain,
     _user_safe_message,
     download_and_transcribe,
     run_pipeline,
@@ -260,13 +259,20 @@ class TestLivePipelineEnabled:
 
 
 class TestPerformTranscription:
-    """Tests for the strategy-chain transcription loop."""
+    """Tests for the configured-provider-first, yt-dlp-fallback flow."""
+
+    @staticmethod
+    def _fallback(result=None, error=None) -> SimpleNamespace:
+        if error is not None:
+            return SimpleNamespace(name="yt-dlp", fetch=AsyncMock(side_effect=error))
+        return SimpleNamespace(
+            name="yt-dlp", fetch=AsyncMock(return_value=result or _ytdlp_result())
+        )
 
     @pytest.mark.asyncio
-    async def test_first_provider_used_when_it_returns_result(self, monkeypatch) -> None:
-        first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=_cloud_result()))
-        second = SimpleNamespace(name="supadata", fetch=AsyncMock())
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, second])
+    async def test_configured_provider_used_when_it_returns_result(self, monkeypatch) -> None:
+        provider = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=_cloud_result()))
+        monkeypatch.setattr(transcription_module, "_configured_provider", lambda: provider)
 
         submission = await _perform_transcription(_job())
 
@@ -274,123 +280,129 @@ class TestPerformTranscription:
         assert submission.duration_seconds == 19
         assert submission.language == "en"
         assert submission.provider == "vidwords"
-        first.fetch.assert_awaited_once()
-        second.fetch.assert_not_awaited()
+        provider.fetch.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_falls_through_to_second_provider_on_miss(self, monkeypatch) -> None:
-        first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=None))
-        second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, second])
-
-        submission = await _perform_transcription(_job())
-
-        assert submission.title == "Me at the zoo"
-        assert submission.provider == "supadata"
-        second.fetch.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_error_in_first_provider_tries_second(self, monkeypatch) -> None:
-        first = SimpleNamespace(
-            name="vidwords",
-            fetch=AsyncMock(side_effect=ExternalServiceError("oops", service="vidwords")),
-        )
-        second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, second])
-
-        submission = await _perform_transcription(_job())
-
-        assert submission.provider == "supadata"
-        second.fetch.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_resume_token_routed_only_to_its_provider(self, monkeypatch) -> None:
-        first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=_cloud_result()))
-        second = SimpleNamespace(name="supadata", fetch=AsyncMock(return_value=_cloud_result()))
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, second])
-
-        submission = await _perform_transcription(
-            _job(), resume_token="job-x", resume_provider="supadata"
-        )
-
-        assert submission.provider == "vidwords"
-        first.fetch.assert_awaited_once_with(
-            "https://www.youtube.com/watch?v=abcde12345", "abcde12345", resume_token=""
-        )
-        second.fetch.assert_not_awaited()
-
-        first.fetch.reset_mock()
-        first.fetch.return_value = None
-        await _perform_transcription(_job(), resume_token="job-x", resume_provider="supadata")
-
-        second.fetch.assert_awaited_once_with(
-            "https://www.youtube.com/watch?v=abcde12345", "abcde12345", resume_token="job-x"
-        )
-
-    @pytest.mark.asyncio
-    async def test_ytdlp_strategy_used_when_all_cloud_miss(self, monkeypatch) -> None:
-        first = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=None))
-        ytdlp = SimpleNamespace(name="yt-dlp", fetch=AsyncMock(return_value=_ytdlp_result()))
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [first, ytdlp])
+    async def test_ytdlp_fallback_on_miss(self, monkeypatch) -> None:
+        provider = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=None))
+        ytdlp = self._fallback()
+        monkeypatch.setattr(transcription_module, "_configured_provider", lambda: provider)
+        monkeypatch.setattr(transcription_module, "YtDlpTranscriptStrategy", lambda: ytdlp)
 
         submission = await _perform_transcription(_job())
 
         assert submission.title == "Fallback Video"
         assert submission.provider == "yt-dlp"
         assert submission.transcript_text == "Hello, world!"
-        first.fetch.assert_awaited_once()
+        provider.fetch.assert_awaited_once()
         ytdlp.fetch.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_no_strategies_raises_instead_of_completing_empty(self, monkeypatch) -> None:
-        monkeypatch.setattr(transcription_module, "_provider_chain", lambda: [])
+    async def test_ytdlp_fallback_on_error(self, monkeypatch) -> None:
+        provider = SimpleNamespace(
+            name="vidwords",
+            fetch=AsyncMock(side_effect=ExternalServiceError("oops", service="vidwords")),
+        )
+        ytdlp = self._fallback()
+        monkeypatch.setattr(transcription_module, "_configured_provider", lambda: provider)
+        monkeypatch.setattr(transcription_module, "YtDlpTranscriptStrategy", lambda: ytdlp)
+
+        submission = await _perform_transcription(_job())
+
+        assert submission.provider == "yt-dlp"
+        ytdlp.fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_configured_provider_uses_ytdlp_only(self, monkeypatch) -> None:
+        ytdlp = self._fallback()
+        monkeypatch.setattr(transcription_module, "_configured_provider", lambda: None)
+        monkeypatch.setattr(transcription_module, "YtDlpTranscriptStrategy", lambda: ytdlp)
+
+        submission = await _perform_transcription(_job())
+
+        assert submission.provider == "yt-dlp"
+        ytdlp.fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ytdlp_default_does_not_run_fallback_twice(self, monkeypatch) -> None:
+        ytdlp = SimpleNamespace(name="yt-dlp", fetch=AsyncMock(return_value=_ytdlp_result()))
+        unused = SimpleNamespace(name="yt-dlp", fetch=AsyncMock())
+        monkeypatch.setattr(transcription_module, "_configured_provider", lambda: ytdlp)
+        monkeypatch.setattr(transcription_module, "YtDlpTranscriptStrategy", lambda: unused)
+
+        submission = await _perform_transcription(_job())
+
+        assert submission.provider == "yt-dlp"
+        ytdlp.fetch.assert_awaited_once()
+        unused.fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resume_token_routed_only_to_its_provider(self, monkeypatch) -> None:
+        provider = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=None))
+        ytdlp = self._fallback()
+        monkeypatch.setattr(transcription_module, "_configured_provider", lambda: provider)
+        monkeypatch.setattr(transcription_module, "YtDlpTranscriptStrategy", lambda: ytdlp)
+
+        submission = await _perform_transcription(
+            _job(), resume_token="job-x", resume_provider="yt-dlp"
+        )
+
+        assert submission.provider == "yt-dlp"
+        provider.fetch.assert_awaited_once_with(
+            "https://www.youtube.com/watch?v=abcde12345", "abcde12345", resume_token=""
+        )
+        ytdlp.fetch.assert_awaited_once_with(
+            "https://www.youtube.com/watch?v=abcde12345", "abcde12345", resume_token="job-x"
+        )
+
+    @pytest.mark.asyncio
+    async def test_all_miss_raises_instead_of_completing_empty(self, monkeypatch) -> None:
+        provider = SimpleNamespace(name="vidwords", fetch=AsyncMock(return_value=None))
+        ytdlp = SimpleNamespace(name="yt-dlp", fetch=AsyncMock(return_value=None))
+        monkeypatch.setattr(transcription_module, "_configured_provider", lambda: provider)
+        monkeypatch.setattr(transcription_module, "YtDlpTranscriptStrategy", lambda: ytdlp)
 
         with pytest.raises(ExternalServiceError):
             await _perform_transcription(_job())
 
 
-class TestProviderChain:
-    """Tests for the configured strategy chain (default first, live gate)."""
+class TestConfiguredProvider:
+    """Tests for the single .env-configured provider selection."""
 
     @staticmethod
-    def _names(monkeypatch, settings) -> list[str]:
+    def _name(monkeypatch, settings) -> str | None:
         monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
-        return [strategy.name for strategy in _provider_chain()]
+        provider = transcription_module._configured_provider()
+        return provider.name if provider is not None else None
 
-    def test_standard_order_when_all_configured_and_live(self, monkeypatch) -> None:
-        assert self._names(monkeypatch, _full_settings()) == [
-            "transcriptfetch",
-            "supadata",
-            "vidwords",
-            "yt-dlp",
-        ]
+    def test_none_when_no_default(self, monkeypatch) -> None:
+        assert self._name(monkeypatch, _full_settings(default_video_provider="")) is None
 
-    def test_default_provider_leads_chain(self, monkeypatch) -> None:
-        assert self._names(monkeypatch, _full_settings(default_video_provider="vidwords")) == [
-            "vidwords",
-            "transcriptfetch",
-            "supadata",
-            "yt-dlp",
-        ]
+    def test_returns_configured_cloud_provider(self, monkeypatch) -> None:
+        assert (
+            self._name(monkeypatch, _full_settings(default_video_provider="vidwords")) == "vidwords"
+        )
 
-    def test_default_ytdlp_leads_chain(self, monkeypatch) -> None:
-        assert self._names(monkeypatch, _full_settings(default_video_provider="yt-dlp")) == [
-            "yt-dlp",
-            "transcriptfetch",
-            "supadata",
-            "vidwords",
-        ]
+    def test_default_is_case_insensitive(self, monkeypatch) -> None:
+        assert (
+            self._name(monkeypatch, _full_settings(default_video_provider="VidWords")) == "vidwords"
+        )
 
-    def test_cloud_strategies_skipped_when_not_live(self, monkeypatch) -> None:
-        assert self._names(monkeypatch, _full_settings(jumpto_live_external_calls=False)) == [
-            "yt-dlp"
-        ]
+    def test_ytdlp_default_stays_available(self, monkeypatch) -> None:
+        assert self._name(monkeypatch, _full_settings(default_video_provider="yt-dlp")) == "yt-dlp"
 
-    def test_only_configured_providers_built(self, monkeypatch) -> None:
-        assert self._names(
-            monkeypatch,
-            _full_settings(supadata_api_key="", vidwords_api_key=""),
-        ) == ["transcriptfetch", "yt-dlp"]
+    def test_cloud_provider_skipped_when_not_live(self, monkeypatch) -> None:
+        settings = _full_settings(
+            default_video_provider="vidwords", jumpto_live_external_calls=False
+        )
+        assert self._name(monkeypatch, settings) is None
+
+    def test_none_for_unconfigured_default(self, monkeypatch) -> None:
+        settings = _full_settings(default_video_provider="vidwords", vidwords_api_key="")
+        assert self._name(monkeypatch, settings) is None
+
+    def test_none_for_unknown_default(self, monkeypatch) -> None:
+        assert self._name(monkeypatch, _full_settings(default_video_provider="bogus")) is None
 
 
 class TestFailureMarking:

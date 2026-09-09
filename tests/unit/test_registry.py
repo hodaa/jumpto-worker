@@ -8,7 +8,6 @@ from app.providers.local import YtDlpTranscriptStrategy
 from app.providers.registry import (
     TranscriptProviderSpec,
     build_provider,
-    build_provider_chain,
     ordered_specs,
     provider_spec,
 )
@@ -41,10 +40,10 @@ class TestRegistry:
 
     def test_registers_expected_providers_in_standard_order(self) -> None:
         assert [spec.name for spec in ordered_specs()] == [
+            "yt-dlp",
             "transcriptfetch",
             "supadata",
             "vidwords",
-            "yt-dlp",
         ]
 
     def test_provider_spec_is_registered(self) -> None:
@@ -85,81 +84,6 @@ class TestBuildProvider:
         settings = _settings()
         for name in ("transcriptfetch", "supadata", "vidwords", "yt-dlp"):
             assert isinstance(build_provider(name, settings), TranscriptProviderStrategy)
-
-
-class TestBuildProviderChain:
-    """Tests for the ordered strategy chain."""
-
-    def test_standard_order_when_no_default(self) -> None:
-        chain = build_provider_chain(_settings(default_video_provider=""))
-
-        assert [strategy.name for strategy in chain] == [
-            "transcriptfetch",
-            "supadata",
-            "vidwords",
-            "yt-dlp",
-        ]
-
-    def test_default_provider_is_used_first(self) -> None:
-        chain = build_provider_chain(_settings(default_video_provider="vidwords"))
-
-        assert [strategy.name for strategy in chain] == [
-            "vidwords",
-            "transcriptfetch",
-            "supadata",
-            "yt-dlp",
-        ]
-
-    def test_default_ytdlp_starts_with_ytdlp(self) -> None:
-        chain = build_provider_chain(_settings(default_video_provider="yt-dlp"))
-
-        assert [strategy.name for strategy in chain] == [
-            "yt-dlp",
-            "transcriptfetch",
-            "supadata",
-            "vidwords",
-        ]
-
-    def test_skips_unconfigured_cloud_providers(self) -> None:
-        settings = _settings(supadata_api_key="", vidwords_api_key="")
-        chain = build_provider_chain(settings)
-
-        assert [strategy.name for strategy in chain] == ["transcriptfetch", "yt-dlp"]
-
-    def test_unconfigured_default_is_ignored(self) -> None:
-        settings = _settings(default_video_provider="vidwords", vidwords_api_key="")
-        chain = build_provider_chain(settings)
-
-        assert [strategy.name for strategy in chain] == [
-            "transcriptfetch",
-            "supadata",
-            "yt-dlp",
-        ]
-
-    def test_unknown_default_falls_back_to_standard_order(self) -> None:
-        chain = build_provider_chain(_settings(default_video_provider="bogus"))
-
-        assert [strategy.name for strategy in chain] == [
-            "transcriptfetch",
-            "supadata",
-            "vidwords",
-            "yt-dlp",
-        ]
-
-    def test_default_is_case_insensitive(self) -> None:
-        chain = build_provider_chain(_settings(default_video_provider="Supadata"))
-
-        assert chain[0].name == "supadata"
-
-    def test_no_providers_configured_keeps_ytdlp_terminal(self) -> None:
-        settings = _settings(
-            transcriptfetch_api_key="",
-            supadata_api_key="",
-            vidwords_api_key="",
-        )
-        chain = build_provider_chain(settings)
-
-        assert [strategy.name for strategy in chain] == ["yt-dlp"]
 
 
 class TestTranscriptProviderSpec:

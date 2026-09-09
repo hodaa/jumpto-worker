@@ -8,8 +8,8 @@ from app.core.config import _live_pipeline_enabled, get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.models import TranscriptSubmission, TranscriptWordData
-from app.providers import TranscriptData, TranscriptJobPending
-from app.providers.registry import build_provider_chain
+from app.providers import TranscriptData, TranscriptJobPending, YtDlpTranscriptStrategy
+from app.providers.registry import provider_spec
 from app.tasks.celery_app import celery_app
 from app.utils.text import normalize_word
 
@@ -81,19 +81,18 @@ async def run_pipeline(job_id: str, resume_token: str = "", resume_provider: str
 async def _perform_transcription(
     job, resume_token: str = "", resume_provider: str = ""
 ) -> TranscriptSubmission:
-    """Fetch a transcript through the configured strategy chain.
+    """Fetch a transcript — the configured provider first, then yt-dlp.
 
-    Each strategy is tried in order — the provider named by
-    ``DEFAULT_VIDEO_PROVIDER`` first (when configured), then the standard
-    priority order (TranscriptFetch -> Supadata -> VidWords -> yt-dlp). One
-    with no transcript or a transient/permanent error is skipped. A
-    still-processing async job raises ``TranscriptJobPending`` (bubbles to the
-    retry-aware task). If every strategy misses, the pipeline raises so the
-    job is failed rather than completed empty.
+    The single provider named by ``DEFAULT_VIDEO_PROVIDER`` is tried first
+    (when configured and live); the local yt-dlp strategy is the free
+    fallback. There is no provider cascade. A still-processing async job
+    raises ``TranscriptJobPending`` (bubbles to the retry-aware task). If
+    both miss, the pipeline raises so the job is failed rather than
+    completed empty.
     """
-    for provider in _provider_chain():
-        resume = resume_token if (resume_token and provider.name == resume_provider) else ""
-        result = await _try_cloud(provider, job, resume)
+    provider = _configured_provider()
+    if provider is not None:
+        result = await _try_cloud(provider, job, resume_token, resume_provider)
         if result is not None:
             logger.info(
                 "Transcript provider used",
@@ -101,42 +100,64 @@ async def _perform_transcription(
                 youtube_url=job.youtube_url,
             )
             return _build_result_submission(result, provider.name)
+
+    if provider is None or provider.name != "yt-dlp":
+        ytdlp = YtDlpTranscriptStrategy()
+        result = await _try_cloud(ytdlp, job, resume_token, resume_provider)
+        if result is not None:
+            logger.info(
+                "Transcript provider used",
+                provider=ytdlp.name,
+                youtube_url=job.youtube_url,
+            )
+            return _build_result_submission(result, ytdlp.name)
+
     raise ExternalServiceError(
         "Could not fetch the transcript for this video",
         service="transcription",
     )
 
 
-def _provider_chain() -> list:
-    """Build the configured transcript strategy chain in execution order.
+def _configured_provider():
+    """Build the single transcript provider named by ``DEFAULT_VIDEO_PROVIDER``.
 
-    The provider named by ``DEFAULT_VIDEO_PROVIDER`` leads the chain; every
-    other registered strategy follows in standard priority order. Cloud
-    strategies are skipped while live external calls are disabled; the local
-    ``yt-dlp`` strategy is always the terminal fallback.
+    Returns ``None`` when unset, unknown, or for a cloud provider that is not
+    configured or is disabled while live external calls are off. The local
+    yt-dlp strategy is returned as-is so it stays available offline.
     """
-    strategies = build_provider_chain(get_settings())
-    if not _live_pipeline_enabled(get_settings()):
-        return [strategy for strategy in strategies if not strategy.uses_cloud]
-    return strategies
+    settings = get_settings()
+    name = (getattr(settings, "default_video_provider", "") or "").strip().lower()
+    if not name:
+        return None
+    spec = provider_spec(name)
+    if spec is None:
+        logger.warning("Unknown default_video_provider; using yt-dlp", provider=name)
+        return None
+    provider = spec.build(settings)
+    if provider is None:
+        logger.warning("Default video provider not configured; using yt-dlp", provider=name)
+        return None
+    if provider.uses_cloud and not _live_pipeline_enabled(settings):
+        logger.info("Skipping cloud provider while live calls disabled", provider=name)
+        return None
+    return provider
 
 
-async def _try_cloud(provider, job, resume_token: str = ""):
-    """Fetch via a provider strategy; any miss/error moves to the next one.
+async def _try_cloud(provider, job, resume_token: str = "", resume_provider: str = ""):
+    """Fetch via a single provider strategy; a miss/error falls through.
 
     A still-processing async job (``TranscriptJobPending``) is re-raised so the
     task can decide whether to retry it or fail the job; everything else is
-    treated as a regular miss (next provider tried).
+    treated as a regular miss (the caller moves to the fallback).
     """
+    resume = resume_token if (resume_token and provider.name == resume_provider) else ""
     try:
-        return await provider.fetch(
-            job.youtube_url, job.youtube_video_id, resume_token=resume_token
-        )
+        return await provider.fetch(job.youtube_url, job.youtube_video_id, resume_token=resume)
     except TranscriptJobPending:
         raise
     except Exception:
         logger.exception(
-            "Cloud transcript provider failed; trying next provider",
+            "Transcript provider failed; falling back",
             provider=provider.name,
             youtube_url=job.youtube_url,
         )

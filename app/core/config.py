@@ -135,12 +135,13 @@ class Settings(BaseSettings):
         description="Application environment (development/production)",
     )
 
-    # Default transcript provider strategy (used first in the chain)
+    # Default transcript provider strategy (the single cloud one, led first)
     default_video_provider: str = Field(
         default="",
         description=(
-            "Default video transcript provider used first; empty uses the standard order "
-            "(transcriptfetch, supadata, vidwords, yt-dlp). e.g. DEFAULT_VIDEO_PROVIDER=yt-dlp"
+            "The single cloud transcript provider used first; empty uses yt-dlp only. "
+            "yt-dlp is always tried second as the free fallback. "
+            "e.g. DEFAULT_VIDEO_PROVIDER=vidwords"
         ),
     )
 

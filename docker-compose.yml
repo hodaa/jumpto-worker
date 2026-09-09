@@ -13,7 +13,9 @@
         # Point yt-dlp at the bgutil PO-token provider container (service DNS).
         YTDLP_BGUTIL_URL: http://bgutil-pot:4416
       volumes:
-        - /etc/jumpto/cookies.txt:/etc/jumpto/cookies.txt:ro
+        # Host cookie file to mount: default /etc/jumpto/cookies.txt (VPS),
+        # override with COOKIE_FILE for local dev where /etc/jumpto may not exist.
+        - ${COOKIE_FILE:-/etc/jumpto/cookies.txt}:/etc/jumpto/cookies.txt:ro
         # Writable marker that requests a host-side cookie refresh.
         - /etc/jumpto/state:/var/lib/jumpto/state
       depends_on:

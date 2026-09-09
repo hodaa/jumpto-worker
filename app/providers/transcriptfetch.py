@@ -1,9 +1,9 @@
-"""TranscriptFetch transcript provider (primary fast path).
+"""TranscriptFetch transcript provider (cloud fallback).
 
 TranscriptFetch proxies YouTube (and TikTok/Instagram/podcasts) on their own
 infrastructure behind bearer-token auth, so transcripts AND video title arrive
-without yt-dlp, cookies, or PO-token providers — avoiding the datacenter-IP
-bot-checks that block direct YouTube access.
+without yt-dlp, cookies, or PO-token providers — useful for videos whose local
+yt-dlp extraction is blocked by datacenter-IP bot-checks.
 
 The API runs ``mode=auto``: existing captions are returned immediately (HTTP
 200); videos without captions fall back to AI audio transcription. Short jobs

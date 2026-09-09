@@ -30,8 +30,8 @@ class TranscriptProviderStrategy(ABC):
     ``name`` is the stable provider id used for registry lookup, resume-token
     routing and submission provenance. ``uses_cloud`` marks strategies that
     need live external calls (API keys, network access); the local yt-dlp
-    strategy sets it to ``False`` so it stays available as the terminal
-    fallback even when live calls are disabled.
+    strategy sets it to ``False`` so it stays available as the free first
+    strategy even when live calls are disabled.
 
     ``fetch`` returns a :class:`VideoTranscriptResult`, ``None`` for a soft
     miss (so the caller tries the next strategy), or raises

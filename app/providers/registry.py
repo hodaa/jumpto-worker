@@ -1,12 +1,14 @@
 """Transcript provider registry and factory.
 
 The registry declares the available transcript strategies (name -> spec) and
-the factory builds a concrete strategy instance from settings. The chain
-builder orders the strategies honouring the configured default provider first,
-then the standard priority order.
+the factory builds a concrete strategy instance from settings. Callers build
+the single provider named by ``DEFAULT_VIDEO_PROVIDER`` (see
+``app.tasks.transcription._configured_provider``) with the always-available
+local yt-dlp strategy as its fallback — there is no chain to iterate.
 
-Registered strategies (in standard order):
-    transcriptfetch -> supadata -> vidwords -> yt-dlp (always available).
+Registered strategies:
+    transcriptfetch, supadata, vidwords (cloud, need credentials) and
+    yt-dlp (free, always available).
 """
 
 from __future__ import annotations
@@ -65,36 +67,6 @@ def build_provider(name: str, settings: Settings) -> TranscriptProviderStrategy 
     return spec.build(settings)
 
 
-def build_provider_chain(settings: Settings | None = None) -> list[TranscriptProviderStrategy]:
-    """Return the ordered chain of configured strategies for ``settings``.
-
-    When ``settings.default_video_provider`` names a registered and configured
-    provider it is moved to the front; an unknown or unconfigured default is
-    ignored (with a warning) and the standard order is used.
-    """
-    settings = settings or get_settings()
-    built: dict[str, TranscriptProviderStrategy] = {}
-    for spec in ordered_specs():
-        provider = spec.build(settings)
-        if provider is not None:
-            built[spec.name] = provider
-
-    default = (getattr(settings, "default_video_provider", "") or "").strip().lower()
-    chain: list[TranscriptProviderStrategy] = []
-    if default:
-        if default not in _REGISTRY:
-            known = ", ".join(spec.name for spec in ordered_specs())
-            logger.warning(
-                "Unknown default_video_provider; using standard order",
-                provider=default,
-                known_providers=known,
-            )
-        elif default in built:
-            chain.append(built.pop(default))
-    chain.extend(built.values())
-    return chain
-
-
 def _build_transcriptfetch(settings: Settings) -> TranscriptProviderStrategy | None:
     api_key = getattr(settings, "transcriptfetch_api_key", "")
     if not api_key:
@@ -134,10 +106,18 @@ def _build_ytdlp(settings: Settings) -> TranscriptProviderStrategy | None:
 
 register_provider(
     TranscriptProviderSpec(
+        name="yt-dlp",
+        build=_build_ytdlp,
+        order=5,
+        description="Local yt-dlp captions with Assembly.ai audio fallback (free, first provider).",
+    )
+)
+register_provider(
+    TranscriptProviderSpec(
         name="transcriptfetch",
         build=_build_transcriptfetch,
         order=10,
-        description="TranscriptFetch YouTube transcripts API (default first provider).",
+        description="TranscriptFetch YouTube transcripts API.",
     )
 )
 register_provider(
@@ -154,13 +134,5 @@ register_provider(
         build=_build_vidwords,
         order=30,
         description="VidWords YouTube transcripts API.",
-    )
-)
-register_provider(
-    TranscriptProviderSpec(
-        name="yt-dlp",
-        build=_build_ytdlp,
-        order=100,
-        description="Local yt-dlp captions with Assembly.ai audio fallback.",
     )
 )
