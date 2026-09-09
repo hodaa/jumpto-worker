@@ -69,7 +69,7 @@ class AssemblyTranscriptProvider(TranscriptProvider):
             response = await client.post(
                 f"{self.base_url}/upload",
                 headers={**headers, "content-type": "application/octet-stream"},
-                content=audio,
+                content=audio.read(),
                 timeout=_UPLOAD_TIMEOUT_SECONDS,
             )
         if response.status_code != 200:

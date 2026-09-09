@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from app.core.exceptions import ExternalServiceError
@@ -177,6 +178,26 @@ class TestAssignmentFetcher:
         assert transcript.words[0].word == "hello"
         assert client.post.call_count == 2
         assert not audio_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_upload_sends_bytes_not_file_object(self, tmp_path) -> None:
+        """Regression: AsyncClient rejects sync file objects as content, so the
+        audio body must be read to bytes before upload."""
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["content"] = request.read()
+            return httpx.Response(200, json={"upload_url": "https://cdn.assemblyai.com/x"})
+
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"fake-audio-bytes")
+
+        provider = AssemblyTranscriptProvider("key")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            upload_url = await provider._upload(client, {}, str(audio_file))
+
+        assert upload_url == "https://cdn.assemblyai.com/x"
+        assert captured["content"] == b"fake-audio-bytes"
 
     @pytest.mark.asyncio
     async def test_resume_checks_once_and_raises_pending(self, monkeypatch) -> None:
