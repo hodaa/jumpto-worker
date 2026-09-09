@@ -32,13 +32,14 @@ atexit.register(_cleanup_temp_cookie_copies)
 def _sanitize_cookie_lines(source: str, dest: str) -> None:
     """Copy ``source`` to ``dest``, normalizing rows yt-dlp's cookiejar rejects.
 
-    Python's ``http.cookiejar`` is strict about Netscape format: a dotted
-    domain (e.g. ``.youtube.com``) must have the includeSubdomains flag set to
-    TRUE, and expiry -1 (session cookies) must be 0. Files exported by older
-    cookie exporters (or the mac_export path) get this wrong, and yt-dlp then
-    aborts the whole download with "assert domain_specified == initial_dot".
-    Sanitizing here makes the worker resilient to any source file, stale or
-    freshly exported.
+    Python's ``http.cookiejar`` is strict about Netscape format: the
+    includeSubdomains flag (2nd field) must exactly match whether the domain
+    starts with a dot (TRUE for ``.youtube.com``, FALSE for plain
+    ``accounts.google.com``), and expiry -1 (session cookies) must be 0. Old
+    cookie exporters get both directions wrong, and yt-dlp then aborts the
+    whole download with "assert domain_specified == initial_dot". Sanitizing
+    here makes the worker resilient to any source file, stale or freshly
+    exported.
     """
     with Path(source).open(encoding="utf-8") as src, Path(dest).open("w", encoding="utf-8") as out:
         for line in src:
@@ -51,8 +52,7 @@ def _sanitize_cookie_lines(source: str, dest: str) -> None:
                 domain = fields[0]
                 if domain.startswith("#HttpOnly_"):
                     domain = domain[len("#HttpOnly_"):]
-                if domain.startswith("."):
-                    fields[1] = "TRUE"
+                fields[1] = "TRUE" if domain.startswith(".") else "FALSE"
                 try:
                     expires = int(fields[4])
                 except ValueError:

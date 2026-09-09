@@ -392,6 +392,7 @@ class TestYdlpOptions:
             ".youtube.com\tFALSE\t/\tTRUE\t1804257102\t__Secure-YNID\t21.YT=abc\n"
             ".youtube.com\tFALSE\t/\tTRUE\t-1\tYSC\tp6lOdrlT3gs\n"
             "youtube.com\tTRUE\t/\tFALSE\t-1\tCONSENT\tYES\n"
+            "accounts.google.com\tTRUE\t/\tTRUE\t1791297119\tOTZ\t8773352\n"
         )
         monkeypatch.setattr("app.providers.ytdlp.get_settings", lambda: self._settings(str(source)))
 
@@ -400,7 +401,8 @@ class TestYdlpOptions:
         body = Path(options["cookiefile"]).read_text()
         assert ".youtube.com\tTRUE\t/\tTRUE\t1804257102\t__Secure-YNID\t21.YT=abc\n" in body
         assert ".youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tp6lOdrlT3gs\n" in body
-        assert "youtube.com\tTRUE\t/\tFALSE\t0\tCONSENT\tYES\n" in body
+        assert "youtube.com\tFALSE\t/\tFALSE\t0\tCONSENT\tYES\n" in body
+        assert "accounts.google.com\tFALSE\t/\tTRUE\t1791297119\tOTZ\t8773352\n" in body
 
     def test_cookie_copy_sanitizes_httponly_dotted_domain(
         self, monkeypatch, tmp_path
