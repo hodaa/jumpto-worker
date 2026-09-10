@@ -27,13 +27,14 @@ from app.client.http import get_shared_http_client
 from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.core.logging import get_logger
 from app.providers.base import TranscriptProviderStrategy, VideoTranscriptResult
-from app.providers.transcript import (
+from app.providers.models import (
     TranscriptData,
     TranscriptJobPending,
     TranscriptWordData,
     _close_word_times,
     _language_base,
 )
+from app.providers.registry import TranscriptProviderSpec, register_provider
 
 logger = get_logger(__name__)
 
@@ -84,6 +85,7 @@ class TranscriptFetchTranscriptProvider(TranscriptProviderStrategy):
     """Fetches transcripts and video metadata from the TranscriptFetch API."""
 
     name = "transcriptfetch"
+    supports_resume = False
 
     def __init__(
         self,
@@ -110,20 +112,19 @@ class TranscriptFetchTranscriptProvider(TranscriptProviderStrategy):
         """Fetch a transcript for ``youtube_url`` in a single API call.
 
         One call per search (``resume_token`` is never used here: TranscriptFetch
-        jobs are not resumed, so a non-empty token is treated as a pending,
-        non-resumable job). Returns ``None`` when the video has no usable
-        transcript (caller falls through to the next provider). Raises
-        :class:`ExternalServiceError` on API/account failures or permanent
-        per-video errors, and :class:`TranscriptJobPending` (``resumable=False``)
-        when the request escalated to an async job (202) — never retried.
+        jobs are not resumed — the strategy is marked ``supports_resume=False``,
+        so the pipeline never routes a resume token to it. Returns ``None`` when
+        the video has no usable transcript (caller falls through to the next
+        provider). Raises :class:`ExternalServiceError` on API/account failures
+        or permanent per-video errors, and :class:`TranscriptJobPending`
+        (``resumable=False``) when the request escalated to an async job (202) —
+        never retried.
         """
         if resume_token:
-            raise TranscriptJobPending(
-                message="Transcription service is still processing; will not be retried",
-                provider="transcriptfetch",
-                resume_token=resume_token,
-                resumable=False,
-            ) from None
+            logger.warning(
+                "TranscriptFetch does not support resume tokens; ignoring",
+                youtube_url=youtube_url,
+            )
         payload = {
             "video": youtube_url,
             "mode": self.mode,
@@ -296,3 +297,25 @@ def _duration_from_segments(segments: list[dict]) -> int:
         for segment in segments
     )
     return math.ceil(last_end)
+
+
+def _build(settings) -> TranscriptFetchTranscriptProvider | None:
+    """Build a TranscriptFetch strategy from settings, or ``None`` when unconfigured."""
+    api_key = getattr(settings, "transcriptfetch_api_key", "")
+    if not api_key:
+        return None
+    return TranscriptFetchTranscriptProvider(
+        api_key=api_key,
+        lang=getattr(settings, "transcriptfetch_lang", "en") or "en",
+        mode=getattr(settings, "transcriptfetch_mode", "auto") or "auto",
+    )
+
+
+register_provider(
+    TranscriptProviderSpec(
+        name="transcriptfetch",
+        build=_build,
+        order=10,
+        description="TranscriptFetch YouTube transcripts API.",
+    )
+)

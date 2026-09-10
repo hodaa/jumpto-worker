@@ -15,7 +15,7 @@ if broker_url.startswith("rediss://"):
     separator = "&" if "?" in broker_url else "?"
     broker_url = f"{broker_url}{separator}ssl_cert_reqs=CERT_REQUIRED"
 
-celery_app = Celery("jumpto", broker=broker_url)
+celery_app = Celery(settings.celery_app_name, broker=broker_url)
 
 if broker_url.startswith("rediss://"):
     celery_app.conf.broker_use_ssl = {

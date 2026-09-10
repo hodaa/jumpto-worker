@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from app.core.exceptions import ExternalServiceError
-from app.providers.transcript import TranscriptJobPending
+from app.providers.models import TranscriptJobPending
 from app.providers.transcriptfetch import (
     TranscriptFetchPermanentError,
     TranscriptFetchTranscriptProvider,
@@ -153,7 +153,7 @@ class TestFetchMissAndErrors:
         assert excinfo.value.resumable is False
 
     @pytest.mark.asyncio
-    async def test_resume_token_is_refused_not_resumed(self) -> None:
+    async def test_resume_token_is_ignored_not_resumed(self) -> None:
         provider = _provider(
             lambda request: httpx.Response(
                 202, request=httpx.Request("POST", "https://transcriptfetch.test")
@@ -165,7 +165,7 @@ class TestFetchMissAndErrors:
 
         assert excinfo.value.provider == "transcriptfetch"
         assert excinfo.value.resumable is False
-        assert excinfo.value.resume_token == "asr_123"
+        assert excinfo.value.resume_token == ""
 
     @pytest.mark.asyncio
     async def test_network_error_is_external_service_error(self) -> None:

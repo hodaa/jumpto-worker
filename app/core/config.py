@@ -38,6 +38,14 @@ class Settings(BaseSettings):
         """Lowercase/strip QUEUE_PROVIDER so "Redis"/"RABBITMQ" both work."""
         return value.strip().lower() if isinstance(value, str) else value
 
+    @field_validator("provider_chain", mode="before")
+    @classmethod
+    def _split_provider_chain(cls, value: object) -> object:
+        """Split a comma-separated chain into lowercase, stripped provider names."""
+        if isinstance(value, str):
+            return [part.strip().lower() for part in value.split(",") if part.strip()]
+        return value
+
     # Backend communication
     backend_url: str = Field(
         default="http://localhost:8000",
@@ -60,6 +68,10 @@ class Settings(BaseSettings):
     rabbitmq_url: str = Field(
         default="amqp://guest:guest@localhost:5672//",
         description="RabbitMQ connection URL used as the Celery broker (when QUEUE_PROVIDER=rabbitmq)",
+    )
+    celery_app_name: str = Field(
+        default="jumpto",
+        description="Celery application/task namespace name; must match producer task names",
     )
     celery_worker_concurrency: int = Field(
         default=8,
@@ -150,15 +162,26 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Optional ordered transcript provider chain. When set, the pipeline tries
+    # exactly these providers in order (skipping unknown/unconfigured ones);
+    # when empty it uses DEFAULT_VIDEO_PROVIDER first and yt-dlp as fallback.
+    provider_chain: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices(
+            "provider_chain",
+            "TRANSCRIPT_PROVIDER_CHAIN",
+        ),
+        description=(
+            "Ordered transcript providers to try, comma-separated from "
+            "TRANSCRIPT_PROVIDER_CHAIN (e.g. vidwords,supadata); empty uses "
+            "DEFAULT_VIDEO_PROVIDER then yt-dlp"
+        ),
+    )
+
     # External calls
     jumpto_live_external_calls: Annotated[bool, BeforeValidator(_coerce_bool)] = Field(
         default=False,
         description="Enable live external API calls (yt-dlp, Assembly.ai)",
-    )
-    # Transcript mode
-    jumpto_transcript_mode: str = Field(
-        default="real",
-        description="Transcript mode: real or fake",
     )
 
     # yt-dlp cookie file (shared across providers)
@@ -178,13 +201,6 @@ class Settings(BaseSettings):
     cookie_refresh_marker_path: str = Field(
         default="/var/lib/jumpto/state/refresh-requested",
         description="Path worker touches to request a host-side cookie refresh (COOKIE_REFRESH_MARKER_PATH)",
-    )
-
-    # Optional HTTP(S)/SOCKS proxy for yt-dlp, e.g. a residential gateway, to
-    # avoid YouTube bot-blocks on datacenter IPs (YTDLP_PROXY env var).
-    ytdlp_proxy: str = Field(
-        default="",
-        description="Proxy URL for yt-dlp (e.g. http://user:pass@gateway:port)",
     )
 
     # Optional bgutil PO-token provider base URL (YTDLP_BGUTIL_URL env var).
@@ -260,6 +276,4 @@ def get_settings() -> Settings:
 def _live_pipeline_enabled(settings: Settings | None = None) -> bool:
     """Return whether live external transcription calls are active."""
     settings = settings or get_settings()
-    live = bool(getattr(settings, "jumpto_live_external_calls", False))
-    mode = str(getattr(settings, "jumpto_transcript_mode", "")).lower()
-    return live and mode != "fake"
+    return bool(getattr(settings, "jumpto_live_external_calls", False))

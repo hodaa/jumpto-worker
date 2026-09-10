@@ -20,7 +20,16 @@ class DomainError(Exception):
 
 
 class ExternalServiceError(DomainError):
-    """Exception for external service failures."""
+    """Transient external-service failure (network, API, captions, timeout).
+
+    The pipeline treats these as a soft miss: the job moves to the next
+    transcript provider. The ``service`` details key names the failing
+    provider/service. Permanent failures subclass
+    :class:`PermanentExternalServiceError`; an async job still processing is
+    signalled separately by ``TranscriptJobPending`` (in
+    ``app.providers.models``), and failures talking to the producer API use
+    :class:`BackendCommunicationError`.
+    """
 
     def __init__(
         self,
@@ -37,7 +46,12 @@ class ExternalServiceError(DomainError):
 
 
 class PermanentExternalServiceError(ExternalServiceError):
-    """External-service failure that fallback providers cannot recover from."""
+    """External-service failure that fallback providers cannot recover from.
+
+    Raised for credential/account errors and per-video errors that would fail
+    every provider the same way; the pipeline fails the job instead of falling
+    through to the next candidate.
+    """
 
 
 class BackendCommunicationError(DomainError):

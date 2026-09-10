@@ -97,8 +97,7 @@ def release_temp_cookie(options: dict) -> None:
 
 def build_ydlp_options(**overrides: object) -> dict:
     """
-    Build a base yt-dlp options dict wired with the shared cookie file and
-    optional proxy.
+    Build a base yt-dlp options dict wired with the shared cookie file.
 
     The cookie file is copied to a writable temp file first, so yt-dlp can
     read and refresh it even when the mounted source is read-only.
@@ -115,8 +114,6 @@ def build_ydlp_options(**overrides: object) -> dict:
     cookie_file = settings.resolved_ytdlp_cookie_file
     if cookie_file:
         options["cookiefile"] = _writable_cookie_copy(cookie_file)
-    if settings.ytdlp_proxy:
-        options["proxy"] = settings.ytdlp_proxy
     if settings.ytdlp_bgutil_url:
         options["extractor_args"] = {
             # yt-dlp stores extractor_args in nested {ie: {key: [value]}} form.

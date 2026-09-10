@@ -29,13 +29,14 @@ from app.client.http import get_shared_http_client
 from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.core.logging import get_logger
 from app.providers.base import TranscriptProviderStrategy, VideoTranscriptResult
-from app.providers.transcript import (
+from app.providers.models import (
     TranscriptData,
     TranscriptJobPending,
     TranscriptWordData,
     _close_word_times,
     _language_base,
 )
+from app.providers.registry import TranscriptProviderSpec, register_provider
 
 logger = get_logger(__name__)
 
@@ -64,6 +65,7 @@ class SupadataTranscriptProvider(TranscriptProviderStrategy):
     """Fetches transcripts and video metadata from the Supadata API."""
 
     name = "supadata"
+    supports_resume = True
 
     def __init__(
         self,
@@ -291,3 +293,25 @@ def _duration_from_chunks(chunks: list[dict]) -> int:
         for chunk in chunks
     )
     return math.ceil(last_end)
+
+
+def _build(settings) -> SupadataTranscriptProvider | None:
+    """Build a Supadata strategy from settings, or ``None`` when unconfigured."""
+    api_key = getattr(settings, "supadata_api_key", "")
+    if not api_key:
+        return None
+    return SupadataTranscriptProvider(
+        api_key=api_key,
+        lang=getattr(settings, "supadata_lang", "en") or "en",
+        mode=getattr(settings, "supadata_mode", "auto") or "auto",
+    )
+
+
+register_provider(
+    TranscriptProviderSpec(
+        name="supadata",
+        build=_build,
+        order=20,
+        description="Supadata YouTube transcripts/metadata API (async AI jobs).",
+    )
+)

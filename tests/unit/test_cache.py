@@ -1,11 +1,13 @@
 """Unit tests for the worker-side Redis transcript cache."""
 
+from types import SimpleNamespace
+
 import pytest
 from redis.exceptions import RedisError
 
-import app.providers.local as local_module
+import app.providers.ytdlp as ytdlp_module
 from app.providers.base import VideoTranscriptResult
-from app.providers.transcript import TranscriptData, TranscriptWordData
+from app.providers.models import TranscriptData, TranscriptWordData
 from app.storage.cache import (
     TranscriptCache,
     _deserialize_result,
@@ -164,16 +166,17 @@ class TestTranscriptCache:
 class TestStrategyCaching:
     """The yt-dlp strategy must consult and populate the cache only when live."""
 
-    def _install_cache(self, monkeypatch, *, enabled: bool = True, store=None):
-        cache, fake = _make_cache(monkeypatch, enabled=enabled, store=store)
-        monkeypatch.setattr(local_module, "get_transcript_cache", lambda: cache)
-        return cache, fake
+    @staticmethod
+    def _provider(cache, *, live_calls: bool) -> ytdlp_module.YtDlpTranscriptProvider:
+        return ytdlp_module.YtDlpTranscriptProvider(
+            settings=SimpleNamespace(jumpto_live_external_calls=live_calls),
+            cache=cache,
+        )
 
     @pytest.mark.asyncio
     async def test_cache_hit_skips_yt_dlp(self, monkeypatch) -> None:
         key = f"jumpto:transcript:{VIDEO_ID}"
-        cache, _ = self._install_cache(monkeypatch, store={key: _serialize_result(_result())})
-        monkeypatch.setattr(local_module, "_live_pipeline_enabled", lambda settings: True)
+        cache, _ = _make_cache(monkeypatch, store={key: _serialize_result(_result())})
 
         media_called = {"n": 0}
 
@@ -181,16 +184,17 @@ class TestStrategyCaching:
             media_called["n"] += 1
             raise AssertionError("media fetch must not run on cache hit")
 
-        monkeypatch.setattr(local_module, "get_media_info_with_raw", media_info)
+        monkeypatch.setattr(ytdlp_module, "get_media_info_with_raw", media_info)
         transcript_called = {"n": 0}
 
         async def fetch_transcript(url, info=None):
             transcript_called["n"] += 1
             raise AssertionError("transcript fetch must not run on cache hit")
 
-        monkeypatch.setattr(local_module, "_fetch_transcript_with_retry", fetch_transcript)
+        provider = self._provider(cache, live_calls=True)
+        monkeypatch.setattr(provider, "_fetch_transcript_with_retry", fetch_transcript)
 
-        result = await local_module.YtDlpTranscriptStrategy().fetch(WATCH_URL, VIDEO_ID)
+        result = await provider.fetch(WATCH_URL, VIDEO_ID)
 
         assert result.transcript.text == "hello world"
         assert media_called["n"] == 0
@@ -198,39 +202,39 @@ class TestStrategyCaching:
 
     @pytest.mark.asyncio
     async def test_cache_miss_fetches_and_populates(self, monkeypatch, tmp_path) -> None:
-        cache, fake = self._install_cache(monkeypatch)
-        monkeypatch.setattr(local_module, "_live_pipeline_enabled", lambda settings: True)
+        cache, fake = _make_cache(monkeypatch)
 
         media = type("Media", (), {"title": "T", "duration_seconds": 120})()
         monkeypatch.setattr(
-            local_module, "get_media_info_with_raw", lambda video_id, url: (media, {})
+            ytdlp_module, "get_media_info_with_raw", lambda video_id, url: (media, {})
         )
 
         async def fetch_transcript(url, info=None):
             return TranscriptData(language="en", text="cached me", words=[])
 
-        monkeypatch.setattr(local_module, "_fetch_transcript_with_retry", fetch_transcript)
+        provider = self._provider(cache, live_calls=True)
+        monkeypatch.setattr(provider, "_fetch_transcript_with_retry", fetch_transcript)
 
-        result = await local_module.YtDlpTranscriptStrategy().fetch(WATCH_URL)
+        result = await provider.fetch(WATCH_URL)
 
         assert result.transcript.text == "cached me"
         assert f"jumpto:transcript:{VIDEO_ID}" in fake.store  # parsed from URL
 
     @pytest.mark.asyncio
     async def test_non_live_pipeline_does_not_use_cache(self, monkeypatch) -> None:
-        cache, fake = self._install_cache(monkeypatch)
-        monkeypatch.setattr(local_module, "_live_pipeline_enabled", lambda settings: False)
+        cache, fake = _make_cache(monkeypatch)
 
         media = type("Media", (), {"title": "T", "duration_seconds": 120})()
         monkeypatch.setattr(
-            local_module, "get_media_info_with_raw", lambda video_id, url: (media, None)
+            ytdlp_module, "get_media_info_with_raw", lambda video_id, url: (media, None)
         )
 
         async def fetch_transcript(url, info=None):
             return TranscriptData(language="en", text="fake", words=[])
 
-        monkeypatch.setattr(local_module, "_fetch_transcript_with_retry", fetch_transcript)
+        provider = self._provider(cache, live_calls=False)
+        monkeypatch.setattr(provider, "_fetch_transcript_with_retry", fetch_transcript)
 
-        await local_module.YtDlpTranscriptStrategy().fetch(WATCH_URL, VIDEO_ID)
+        await provider.fetch(WATCH_URL, VIDEO_ID)
 
         assert fake.store == {}

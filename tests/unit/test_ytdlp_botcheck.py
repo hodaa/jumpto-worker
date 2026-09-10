@@ -48,18 +48,6 @@ def _media_settings(tmp_path) -> SimpleNamespace:
     )
 
 
-def _transcript_settings(tmp_path) -> SimpleNamespace:
-    """Settings needed by transcript helpers when options are built."""
-    return SimpleNamespace(
-        ytdlp_cookie_file="",
-        mounted_ytdlp_cookie_file="",
-        ytdlp_proxy=None,
-        ytdlp_bgutil_url=None,
-        cookie_refresh_marker_path=str(tmp_path / "refresh-requested"),
-        ytdlp_subtitle_max_retries=1,
-    )
-
-
 class TestIsYoutubeBotCheck:
     """Tests for bot-check detection."""
 
@@ -132,9 +120,6 @@ class TestBotCheckWiredIntoTranscript:
     """Bot-check errors during caption/audio download must flag a refresh."""
 
     def test_caption_download_requests_refresh(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setattr(
-            "app.providers.transcript.get_settings", lambda: _transcript_settings(tmp_path)
-        )
         monkeypatch.setattr("app.providers.transcript.build_ydlp_options", lambda **_: {})
         monkeypatch.setattr("yt_dlp.YoutubeDL", _BoomYoutubeDL)
         refresh = Mock()
@@ -147,9 +132,6 @@ class TestBotCheckWiredIntoTranscript:
         refresh.assert_called_once()
 
     def test_extract_video_info_requests_refresh(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setattr(
-            "app.providers.transcript.get_settings", lambda: _transcript_settings(tmp_path)
-        )
         monkeypatch.setattr("app.providers.transcript.build_ydlp_options", lambda **_: {})
         monkeypatch.setattr("yt_dlp.YoutubeDL", _BoomYoutubeDL)
         refresh = Mock()

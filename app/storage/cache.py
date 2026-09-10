@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - redis is a hard dependency
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.providers.base import VideoTranscriptResult
-from app.providers.transcript import TranscriptData, TranscriptWordData
+from app.providers.models import TranscriptData, TranscriptWordData
 
 logger = get_logger(__name__)
 
@@ -55,10 +55,6 @@ def extract_youtube_video_id(youtube_url: str) -> str:
     return ""
 
 
-def _cache_key(video_id: str) -> str:
-    return f"{_NAMESPACE}:{video_id}"
-
-
 def _cache_namespace(settings) -> str:
     """Build a versioned cache namespace from transcript-affecting settings."""
     values = (
@@ -67,10 +63,9 @@ def _cache_namespace(settings) -> str:
         getattr(settings, "supadata_lang", "en"),
         getattr(settings, "supadata_mode", "auto"),
         getattr(settings, "vidwords_lang", "en"),
-        getattr(settings, "jumpto_transcript_mode", "real"),
     )
     suffix = ":".join(re.sub(r"[^A-Za-z0-9_.-]", "_", str(value or "")) for value in values)
-    return f"{_NAMESPACE}:v2:{suffix}"
+    return f"{_NAMESPACE}:v3:{suffix}"
 
 
 def _serialize_result(result: VideoTranscriptResult, provider: str = "") -> str:

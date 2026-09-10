@@ -10,6 +10,7 @@ import httpx
 import yt_dlp
 
 from app.client.http import get_shared_http_client
+from app.core.config import Settings, get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.integrations.ytdlp import (
@@ -18,10 +19,10 @@ from app.integrations.ytdlp import (
     release_temp_cookie,
     request_cookie_refresh,
 )
-from app.providers.transcript import (
+from app.providers.base import TranscriptService
+from app.providers.models import (
     TranscriptData,
     TranscriptJobPending,
-    TranscriptProvider,
     TranscriptWordData,
 )
 
@@ -31,7 +32,7 @@ _ASSEMBLY_BASE_URL = "https://api.assemblyai.com/v2"
 _UPLOAD_TIMEOUT_SECONDS = 300
 
 
-class AssemblyTranscriptProvider(TranscriptProvider):
+class AssemblyTranscriptService(TranscriptService):
     """Real Assembly.ai transcription client (word-level timestamps)."""
 
     def __init__(self, api_key: str, base_url: str = _ASSEMBLY_BASE_URL) -> None:
@@ -41,7 +42,6 @@ class AssemblyTranscriptProvider(TranscriptProvider):
     async def fetch(
         self,
         youtube_url: str,
-        info: dict | None = None,
         resume_token: str = "",
     ) -> TranscriptData:
         """Submit or resume an Assembly.ai transcription without blocking a slot."""
@@ -109,9 +109,7 @@ class AssemblyTranscriptProvider(TranscriptProvider):
         transcript_id: str,
     ) -> TranscriptData:
         """Check once and let Celery backoff while Assembly processes the job."""
-        response = await client.get(
-            f"{self.base_url}/transcript/{transcript_id}", headers=headers
-        )
+        response = await client.get(f"{self.base_url}/transcript/{transcript_id}", headers=headers)
         if response.status_code != 200:
             raise ExternalServiceError(
                 "Transcription service status check failed", service="assemblyai"
@@ -195,3 +193,26 @@ def _parse_assembly_transcript(data: dict) -> TranscriptData:
         text=str(data.get("text") or ""),
         words=words,
     )
+
+
+def get_transcript_provider(
+    settings: Settings | None = None,
+) -> TranscriptService | None:
+    """
+    Return the Assembly.ai audio transcription service, or ``None``.
+
+    ``None`` means audio transcription is unavailable (live calls disabled or
+    no Assembly API key), so the caller can still use the caption fast path
+    and fail cleanly when captions are absent instead of fabricating data.
+    ``settings`` may be injected by callers that already resolved config;
+    when ``None`` the global settings are fetched.
+    """
+    settings = settings or get_settings()
+    if settings.jumpto_live_external_calls and settings.assembly_api_key:
+        return AssemblyTranscriptService(settings.assembly_api_key)
+    logger.warning(
+        "Audio transcription not configured",
+        live_external_calls=settings.jumpto_live_external_calls,
+        has_api_key=bool(settings.assembly_api_key),
+    )
+    return None

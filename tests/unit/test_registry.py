@@ -4,7 +4,6 @@ import pytest
 
 from app.core.config import Settings
 from app.providers.base import TranscriptProviderStrategy
-from app.providers.local import YtDlpTranscriptStrategy
 from app.providers.registry import (
     TranscriptProviderSpec,
     build_provider,
@@ -14,13 +13,13 @@ from app.providers.registry import (
 from app.providers.supadata import SupadataTranscriptProvider
 from app.providers.transcriptfetch import TranscriptFetchTranscriptProvider
 from app.providers.vidwords import VidWordsTranscriptProvider
+from app.providers.ytdlp import YtDlpTranscriptProvider
 
 
 def _settings(**overrides) -> Settings:
     """Build settings with every cloud provider configured."""
     values = {
         "jumpto_live_external_calls": True,
-        "jumpto_transcript_mode": "real",
         "transcriptfetch_api_key": "tf-key",
         "transcriptfetch_lang": "en",
         "transcriptfetch_mode": "auto",
@@ -55,7 +54,7 @@ class TestRegistry:
         assert provider_spec("bogus") is None
 
     def test_spec_carries_factory(self) -> None:
-        assert isinstance(provider_spec("yt-dlp").build(_settings()), YtDlpTranscriptStrategy)
+        assert isinstance(provider_spec("yt-dlp").build(_settings()), YtDlpTranscriptProvider)
 
 
 class TestBuildProvider:
@@ -70,7 +69,7 @@ class TestBuildProvider:
         assert isinstance(build_provider("vidwords", settings), VidWordsTranscriptProvider)
 
     def test_ytdlp_is_always_available(self) -> None:
-        assert isinstance(build_provider("yt-dlp", _settings()), YtDlpTranscriptStrategy)
+        assert isinstance(build_provider("yt-dlp", _settings()), YtDlpTranscriptProvider)
 
     def test_unconfigured_provider_returns_none(self) -> None:
         settings = _settings(supadata_api_key="")

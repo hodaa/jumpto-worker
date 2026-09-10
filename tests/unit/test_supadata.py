@@ -4,11 +4,11 @@ import httpx
 import pytest
 
 from app.core.exceptions import ExternalServiceError
+from app.providers.models import TranscriptJobPending
 from app.providers.supadata import (
     SupadataPermanentError,
     SupadataTranscriptProvider,
 )
-from app.providers.transcript import TranscriptJobPending
 
 WATCH_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 VIDEO_ID = "jNQXAC9IVRw"

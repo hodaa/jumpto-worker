@@ -1,4 +1,4 @@
-"""Media metadata providers (yt-dlp live / deterministic fake)."""
+"""Media metadata provider (yt-dlp live)."""
 
 import time
 from dataclasses import dataclass
@@ -16,9 +16,6 @@ from app.integrations.ytdlp import (
 )
 
 logger = get_logger(__name__)
-
-_FAKE_DURATION_SECONDS = 300
-_TITLE_PREFIX = "JumpTo test video"
 
 _METADATA_RETRY_ATTEMPTS = 3
 _METADATA_RETRY_DELAY_SECONDS = 2
@@ -47,7 +44,7 @@ def get_media_info(video_id: str, youtube_url: str) -> MediaInfo:
     return media
 
 
-def get_media_info_with_raw(video_id: str, youtube_url: str) -> tuple[MediaInfo, dict | None]:
+def get_media_info_with_raw(video_id: str, youtube_url: str) -> tuple[MediaInfo, dict]:
     """
     Return media info plus the raw yt-dlp metadata dict, reusing a single
     ``extract_info`` call so downstream providers don't re-fetch it.
@@ -57,31 +54,33 @@ def get_media_info_with_raw(video_id: str, youtube_url: str) -> tuple[MediaInfo,
         youtube_url: Original YouTube URL
 
     Returns:
-        A tuple of (MediaInfo, raw yt-dlp info dict). The dict is ``None`` when
-        live calls are disabled.
+        A tuple of (MediaInfo, raw yt-dlp info dict).
+
+    Raises:
+        ExternalServiceError: when live external calls are disabled or yt-dlp
+            cannot fetch metadata, so the pipeline fails instead of fabricating
+            deterministic fake data.
     """
-    if get_settings().jumpto_live_external_calls:
-        try:
-            info = _fetch_from_yt_dlp(youtube_url)
-            media = MediaInfo(
-                title=str(info.get("title") or "Untitled video"),
-                duration_seconds=int(info.get("duration") or 0),
-            )
-            return media, info
-        except ExternalServiceError:
-            raise
-        except Exception as exc:
-            logger.error("yt-dlp media fetch failed", video_id=video_id, error=str(exc))
-            raise ExternalServiceError(
-                "Could not fetch video metadata",
-                service="yt-dlp",
-            ) from exc
-    return _fake_media_info(video_id), None
-
-
-def _fake_media_info(video_id: str) -> MediaInfo:
-    """Build deterministic media info without external calls."""
-    return MediaInfo(title=f"{_TITLE_PREFIX} {video_id}", duration_seconds=_FAKE_DURATION_SECONDS)
+    if not get_settings().jumpto_live_external_calls:
+        raise ExternalServiceError(
+            "Live external calls are disabled; cannot fetch video metadata",
+            service="yt-dlp",
+        )
+    try:
+        info = _fetch_from_yt_dlp(youtube_url)
+        media = MediaInfo(
+            title=str(info.get("title") or "Untitled video"),
+            duration_seconds=int(info.get("duration") or 0),
+        )
+        return media, info
+    except ExternalServiceError:
+        raise
+    except Exception as exc:
+        logger.error("yt-dlp media fetch failed", video_id=video_id, error=str(exc))
+        raise ExternalServiceError(
+            "Could not fetch video metadata",
+            service="yt-dlp",
+        ) from exc
 
 
 def _fetch_from_yt_dlp(youtube_url: str) -> dict:

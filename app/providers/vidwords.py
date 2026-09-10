@@ -19,12 +19,13 @@ from app.client.http import get_shared_http_client
 from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.core.logging import get_logger
 from app.providers.base import TranscriptProviderStrategy, VideoTranscriptResult
-from app.providers.transcript import (
+from app.providers.models import (
     TranscriptData,
     TranscriptWordData,
     _close_word_times,
     _language_base,
 )
+from app.providers.registry import TranscriptProviderSpec, register_provider
 
 logger = get_logger(__name__)
 
@@ -58,6 +59,7 @@ class VidWordsTranscriptProvider(TranscriptProviderStrategy):
     """Fetches transcripts and basic metadata from the VidWords API."""
 
     name = "vidwords"
+    supports_resume = False
 
     def __init__(
         self,
@@ -81,12 +83,15 @@ class VidWordsTranscriptProvider(TranscriptProviderStrategy):
     ) -> VidWordsResult | None:
         """Fetch a transcript for ``youtube_url``.
 
-        ``resume_token`` is accepted for interface uniformity across cloud
-        providers but never used: VidWords is synchronous (no async jobs).
         Returns ``None`` when the video has no caption track (caller should
         fall back). Raises :class:`ExternalServiceError` on API/account
         failures or permanent per-video errors.
         """
+        if resume_token:
+            logger.warning(
+                "VidWords is synchronous and does not use resume tokens; ignoring",
+                youtube_url=youtube_url,
+            )
         payload = {"ids": [youtube_url], "lang": self.lang}
         headers = {
             "Authorization": f"Basic {self.api_key}",
@@ -217,3 +222,25 @@ def _duration_from_segments(segments: list[dict]) -> int:
         for segment in segments
     )
     return math.ceil(last_end)
+
+
+def _build(settings) -> VidWordsTranscriptProvider | None:
+    """Build a VidWords strategy from settings, or ``None`` when unconfigured."""
+    api_key = getattr(settings, "vidwords_api_key", "")
+    if not api_key:
+        return None
+    return VidWordsTranscriptProvider(
+        api_key=api_key,
+        base_url=getattr(settings, "vidwords_api_url", "https://vidwords.com"),
+        lang=getattr(settings, "vidwords_lang", "en") or "en",
+    )
+
+
+register_provider(
+    TranscriptProviderSpec(
+        name="vidwords",
+        build=_build,
+        order=30,
+        description="VidWords YouTube transcripts API.",
+    )
+)

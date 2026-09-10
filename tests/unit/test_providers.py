@@ -1,4 +1,4 @@
-"""Unit tests for external service providers (fake/live switch)."""
+"""Unit tests for external service providers (selection, Assembly flow, captions)."""
 
 import os
 from pathlib import Path
@@ -11,51 +11,40 @@ import pytest
 from app.core.exceptions import ExternalServiceError
 from app.integrations.ytdlp import build_ydlp_options
 from app.providers.assembly import (
-    AssemblyTranscriptProvider,
+    AssemblyTranscriptService,
     _parse_assembly_transcript,
     _run_download,
+    get_transcript_provider,
 )
 from app.providers.media import get_media_info
+from app.providers.models import TranscriptData, TranscriptJobPending
 from app.providers.transcript import (
-    FakeTranscriptProvider,
-    TranscriptData,
-    TranscriptJobPending,
-    YouTubeCaptionTranscriptProvider,
+    YouTubeCaptionTranscriptService,
     _caption_language,
     _caption_targets,
     _download_caption,
     _parse_vtt,
     _preferred_vtt_file,
-    get_transcript_provider,
-)
-
-_FAKE_SETTINGS_FAKE_MODE = SimpleNamespace(
-    jumpto_transcript_mode="fake",
-    jumpto_live_external_calls=True,
-    assembly_api_key="secret-key",
 )
 
 
-def _settings(*, mode: str, live: bool, api_key: str) -> SimpleNamespace:
+def _settings(*, live: bool, api_key: str) -> SimpleNamespace:
     """Build a minimal settings object for provider selection."""
     return SimpleNamespace(
-        jumpto_transcript_mode=mode,
         jumpto_live_external_calls=live,
         assembly_api_key=api_key,
     )
 
 
 class TestMediaInfoProvider:
-    """Tests for the media info provider selection."""
+    """Tests for the media info provider."""
 
-    def test_no_live_calls_returns_fake_media_info(self, monkeypatch) -> None:
+    def test_no_live_calls_raises(self, monkeypatch) -> None:
         settings = SimpleNamespace(jumpto_live_external_calls=False)
         monkeypatch.setattr("app.providers.media.get_settings", lambda: settings)
 
-        info = get_media_info("abcde12345", "https://youtu.be/abcde12345")
-
-        assert info.duration_seconds == 300
-        assert "abcde12345" in info.title
+        with pytest.raises(ExternalServiceError, match="disabled"):
+            get_media_info("abcde12345", "https://youtu.be/abcde12345")
 
     def test_live_provider_error_is_wrapped(self, monkeypatch) -> None:
         settings = SimpleNamespace(jumpto_live_external_calls=True)
@@ -73,46 +62,30 @@ class TestMediaInfoProvider:
 class TestTranscriptProviderSelection:
     """Tests for transcript provider factory selection."""
 
-    def test_fake_mode_wins_even_with_credentials(self, monkeypatch) -> None:
-        monkeypatch.setattr(
-            "app.providers.transcript.get_settings", lambda: _FAKE_SETTINGS_FAKE_MODE
-        )
+    def test_returns_none_when_live_not_configured(self, monkeypatch) -> None:
+        settings = _settings(live=False, api_key="")
+        monkeypatch.setattr("app.providers.assembly.get_settings", lambda: settings)
 
         provider = get_transcript_provider()
 
-        assert isinstance(provider, FakeTranscriptProvider)
+        assert provider is None
 
-    def test_falls_back_to_fake_when_live_not_configured(self, monkeypatch) -> None:
-        settings = _settings(mode="real", live=False, api_key="")
-        monkeypatch.setattr("app.providers.transcript.get_settings", lambda: settings)
+    def test_returns_none_when_no_api_key(self, monkeypatch) -> None:
+        settings = _settings(live=True, api_key="")
+        monkeypatch.setattr("app.providers.assembly.get_settings", lambda: settings)
 
         provider = get_transcript_provider()
 
-        assert isinstance(provider, FakeTranscriptProvider)
+        assert provider is None
 
     def test_returns_assembly_when_fully_configured(self, monkeypatch) -> None:
-        settings = _settings(mode="real", live=True, api_key="key-123")
-        monkeypatch.setattr("app.providers.transcript.get_settings", lambda: settings)
+        settings = _settings(live=True, api_key="key-123")
+        monkeypatch.setattr("app.providers.assembly.get_settings", lambda: settings)
 
         provider = get_transcript_provider()
 
-        assert isinstance(provider, AssemblyTranscriptProvider)
+        assert isinstance(provider, AssemblyTranscriptService)
         assert provider.api_key == "key-123"
-
-
-class TestFakeTranscriptProvider:
-    """Tests for the deterministic fake transcript."""
-
-    @pytest.mark.asyncio
-    async def test_fetch_returns_timestamped_words(self) -> None:
-        provider = FakeTranscriptProvider()
-
-        transcript = await provider.fetch("https://youtu.be/abcde12345")
-
-        assert transcript.language == "en"
-        assert len(transcript.words) > 0
-        assert transcript.words[0].start_time == 0.0
-        assert transcript.text == " ".join(word.word for word in transcript.words)
 
 
 class TestAssemblyParser:
@@ -171,7 +144,7 @@ class TestAssignmentFetcher:
 
         monkeypatch.setattr("app.providers.assembly.httpx.AsyncClient", lambda: client)
 
-        provider = AssemblyTranscriptProvider("key")
+        provider = AssemblyTranscriptService("key")
         transcript = await provider.fetch("https://youtu.be/abcde12345")
 
         assert transcript.text == "hello world"
@@ -192,7 +165,7 @@ class TestAssignmentFetcher:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"fake-audio-bytes")
 
-        provider = AssemblyTranscriptProvider("key")
+        provider = AssemblyTranscriptService("key")
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             upload_url = await provider._upload(client, {}, str(audio_file))
 
@@ -207,7 +180,7 @@ class TestAssignmentFetcher:
         client.get.return_value = poll_response
         monkeypatch.setattr("app.providers.assembly.httpx.AsyncClient", lambda: client)
 
-        provider = AssemblyTranscriptProvider("key")
+        provider = AssemblyTranscriptService("key")
         with pytest.raises(TranscriptJobPending) as excinfo:
             await provider.fetch(
                 "https://youtu.be/abcde12345", resume_token="transcript-1"
@@ -247,7 +220,7 @@ class TestCaptionSelection:
 
 
 class TestCaptionLanguageSelection:
-    """Tests for the caption-track selection (language-agnostic)."""
+    """Tests for the caption-track selection (original-language restricted)."""
 
     def test_prefers_manual_subtitles_over_auto(self) -> None:
         info = {
@@ -269,18 +242,42 @@ class TestCaptionLanguageSelection:
 
         assert targets[0] == "it-1-orig"
 
+    def test_excludes_translated_tracks_when_original_known(self) -> None:
+        info = {
+            "automatic_captions": {"en-orig": [], "en": [], "fr-orig": [], "de": []},
+            "subtitles": {},
+            "original_language": "en",
+        }
+
+        targets = _caption_targets(info)
+
+        assert targets == ["en-orig", "en"]
+
+    def test_no_original_language_track_is_a_soft_miss(self) -> None:
+        info = {
+            "automatic_captions": {"fr-orig": [], "de": []},
+            "subtitles": {"es": []},
+            "original_language": "en",
+        }
+
+        assert _caption_targets(info) == []
+
+    def test_unknown_original_language_uses_any_track(self) -> None:
+        info = {"automatic_captions": {"fr": [], "de": []}, "subtitles": {}}
+
+        targets = _caption_targets(info)
+
+        assert targets == ["de"]
+
     def test_falls_back_to_any_auto_caption(self) -> None:
         info = {"automatic_captions": {"ar": [], "en": []}, "subtitles": {}}
 
         assert _caption_targets(info) == ["ar"] or _caption_targets(info) == ["en"]
 
-    def test_no_captions_raises(self) -> None:
-        from app.core.exceptions import ExternalServiceError
-
+    def test_no_captions_returns_empty_targets(self) -> None:
         info = {"automatic_captions": {}, "subtitles": {}}
 
-        with pytest.raises(ExternalServiceError):
-            _caption_targets(info)
+        assert _caption_targets(info) == []
 
 
 class TestCaptionParser:
@@ -322,7 +319,7 @@ class TestYouTubeCaptionFetcher:
 
     @pytest.mark.asyncio
     async def test_fetch_returns_parsed_transcript(self, monkeypatch) -> None:
-        provider = YouTubeCaptionTranscriptProvider()
+        provider = YouTubeCaptionTranscriptService()
         monkeypatch.setattr(
             "app.providers.transcript._download_caption",
             lambda url, langs, info=None: (
@@ -373,9 +370,9 @@ class TestDownloadCaptionMetadataReuse:
             "subtitles": {},
         }
 
-        with pytest.raises(ExternalServiceError):  # no temp captions written
-            _download_caption("https://youtu.be/abcde12345", info)
+        result = _download_caption("https://youtu.be/abcde12345", info)
 
+        assert result is None
         extract.assert_not_called()
         assert fake.replayed == (info, True)
 
@@ -385,9 +382,9 @@ class TestDownloadCaptionMetadataReuse:
         extract = Mock(return_value={"automatic_captions": {}, "subtitles": {}})
         monkeypatch.setattr("app.providers.transcript._extract_video_info", extract)
 
-        with pytest.raises(ExternalServiceError):
-            _download_caption("https://youtu.be/abcde12345")
+        result = _download_caption("https://youtu.be/abcde12345")
 
+        assert result is None
         extract.assert_called_once_with("https://youtu.be/abcde12345")
 
 
@@ -414,12 +411,11 @@ class TestYdlpOptions:
     def _settings(self, cookie_file):
         return SimpleNamespace(
             resolved_ytdlp_cookie_file=cookie_file,
-            ytdlp_proxy="http://user:pass@residential:8080",
             ytdlp_bgutil_url="",
             ytdlp_socket_timeout=30,
         )
 
-    def test_sets_writable_cookie_copy_and_proxy_when_configured(
+    def test_sets_writable_cookie_copy_when_configured(
         self, monkeypatch, tmp_path
     ) -> None:
         source = tmp_path / "cookies.txt"
@@ -432,7 +428,6 @@ class TestYdlpOptions:
         assert cookie_path != str(source)
         assert Path(cookie_path).read_text() == source.read_text()
         assert os.access(cookie_path, os.W_OK)
-        assert options["proxy"] == "http://user:pass@residential:8080"
 
     def test_cookie_copy_sanitizes_broken_netscape_rows(self, monkeypatch, tmp_path) -> None:
         source = tmp_path / "cookies.txt"
@@ -465,10 +460,9 @@ class TestYdlpOptions:
         body = Path(options["cookiefile"]).read_text()
         assert "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tv\n" in body
 
-    def test_omits_cookiefile_and_proxy_when_unset(self, monkeypatch) -> None:
+    def test_omits_cookiefile_when_unset(self, monkeypatch) -> None:
         settings = SimpleNamespace(
             resolved_ytdlp_cookie_file=None,
-            ytdlp_proxy="",
             ytdlp_bgutil_url="",
             ytdlp_socket_timeout=30,
         )
@@ -477,7 +471,6 @@ class TestYdlpOptions:
         options = build_ydlp_options()
 
         assert "cookiefile" not in options
-        assert "proxy" not in options
         assert "extractor_args" not in options
 
     def test_sets_bgutil_extractor_args_when_configured(self, monkeypatch, tmp_path) -> None:
@@ -485,7 +478,6 @@ class TestYdlpOptions:
         source.write_text("# Netscape HTTP Cookie File\n")
         settings = SimpleNamespace(
             resolved_ytdlp_cookie_file=str(source),
-            ytdlp_proxy="",
             ytdlp_bgutil_url="http://bgutil-pot:4416",
             ytdlp_socket_timeout=30,
         )
@@ -502,8 +494,8 @@ class TestYdlpOptions:
         source.write_text("# Netscape HTTP Cookie File\n")
         monkeypatch.setattr("app.integrations.ytdlp.get_settings", lambda: self._settings(str(source)))
 
-        options = build_ydlp_options(proxy="http://override:3128", noplaylist=False)
+        options = build_ydlp_options(format="best", noplaylist=False)
 
-        assert options["proxy"] == "http://override:3128"
+        assert options["format"] == "best"
         assert options["noplaylist"] is False
         assert options["cookiefile"] != str(source)

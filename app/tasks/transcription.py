@@ -1,19 +1,16 @@
-"""Transcription pipeline task for the JumpTo worker."""
-
 import asyncio
 import atexit
 import os
-import uuid
-from types import SimpleNamespace
+from collections.abc import Callable
 
 from app.client import BackendClient
 from app.client.http import close_shared_http_clients
-from app.core.config import _live_pipeline_enabled, get_settings
+from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.core.logging import get_logger
 from app.models import TranscriptSubmission, TranscriptWordData
-from app.providers import TranscriptData, TranscriptJobPending, YtDlpTranscriptStrategy
-from app.providers.registry import provider_spec
+from app.providers import TranscriptData, TranscriptJobPending
+from app.providers.registry import candidates
 from app.tasks.celery_app import celery_app
 from app.utils.text import normalize_word
 
@@ -30,13 +27,49 @@ _CLOUD_JOB_TIMEOUT_SAFE_MESSAGE = "Transcription timed out. Please try again lat
 _CLOUD_JOB_ATTEMPTS = 9
 _CLOUD_JOB_RETRY_BASE_SECONDS = 2
 _CLOUD_JOB_RETRY_MAX_SECONDS = 60
-_CACHE_LOCK_WAIT_INTERVAL_SECONDS = 0.5
-_CACHE_LOCK_MAX_WAIT_SECONDS = 15
 
 # A Celery prefork process executes tasks serially, so one persistent loop per
 # process lets async clients and their connection pools survive task boundaries.
 _EVENT_LOOP: asyncio.AbstractEventLoop | None = None
 _EVENT_LOOP_PID: int | None = None
+
+
+@celery_app.task(bind=True, max_retries=_CLOUD_JOB_ATTEMPTS, default_retry_delay=60)
+def download_and_transcribe(
+    self,
+    job_id: str,
+    resume_token: str = "",
+    resume_provider: str = "",
+    client_factory: Callable[..., BackendClient] | None = None,
+) -> dict:
+
+    try:
+        _run_async(
+            run_pipeline(
+                job_id,
+                resume_token,
+                resume_provider,
+                client_factory=client_factory,
+            )
+        )
+    except TranscriptJobPending as exc:
+        if not exc.resumable:
+            _run_async(
+                _fail_job(job_id, _EXTERNAL_FAILURE, client_factory=client_factory)
+            )
+            raise
+        if self.request.retries >= _CLOUD_JOB_ATTEMPTS - 1:
+            _run_async(
+                _fail_job(job_id, _CLOUD_JOB_TIMEOUT_SAFE_MESSAGE, client_factory=client_factory)
+            )
+            raise
+        raise self.retry(
+            exc=exc,
+            max_retries=_CLOUD_JOB_ATTEMPTS,
+            countdown=_job_retry_countdown(self.request.retries),
+            args=[job_id, exc.resume_token, exc.provider],
+        ) from exc
+    return {"status": "completed"}
 
 
 def _run_async(coro):
@@ -63,7 +96,12 @@ def _close_worker_event_loop() -> None:
 atexit.register(_close_worker_event_loop)
 
 
-async def run_pipeline(job_id: str, resume_token: str = "", resume_provider: str = "") -> dict:
+async def run_pipeline(
+    job_id: str,
+    resume_token: str = "",
+    resume_provider: str = "",
+    client_factory: Callable[..., BackendClient] | None = None,
+) -> dict:
     """Run the transcription pipeline for a job against the backend API.
 
     ``resume_token``/``resume_provider`` carry a pending cloud async job across
@@ -72,22 +110,16 @@ async def run_pipeline(job_id: str, resume_token: str = "", resume_provider: str
     provider) instead of requeueing a new transcription.
     """
     settings = get_settings()
-    client = BackendClient(settings.backend_url, settings.internal_api_key)
+    factory = client_factory or _new_client
+    client = factory(settings)
 
     try:
-        job = await client.get_job(job_id)
-        if not resume_token and job.status != "pending":
-            logger.info("Skipping non-pending job", job_id=job_id, status=job.status)
-            return {"status": job.status}
-        if job.status == "pending":
-            await client.advance_job(job_id)
-
+        job = await _load_job(client, job_id)
         submission = await asyncio.wait_for(
             _perform_transcription(job, resume_token, resume_provider),
             timeout=settings.job_timeout_seconds,
         )
-        await client.store_transcript(job_id, submission)
-        await client.complete_job(job_id)
+        await _submit_result(client, job_id, submission)
     except TranscriptJobPending:
         logger.info(
             "Cloud provider job still processing; task will retry or fail",
@@ -99,113 +131,80 @@ async def run_pipeline(job_id: str, resume_token: str = "", resume_provider: str
     except Exception as exc:
         error = _user_safe_message(exc)
         logger.exception("Transcription pipeline failed", job_id=job_id, error=error)
-        try:
-            await client.fail_job(job_id, error)
-        except Exception:
-            logger.exception("Failed to mark job as failed", job_id=job_id)
+        await _mark_failed(client, job_id, error)
         raise
     finally:
-        close = getattr(client, "close", None)
-        if close is not None:
-            await close()
+        await _close_client(client)
 
     logger.info("Pipeline completed", job_id=job_id)
     return {"status": "completed", "video_id": job.video_id}
 
 
+def _new_client(settings) -> BackendClient:
+    """Build a backend client from worker settings."""
+    return BackendClient(settings.backend_url, settings.internal_api_key)
+
+
+async def _close_client(client) -> None:
+    """Best-effort close a backend client."""
+    close = getattr(client, "close", None)
+    if close is not None:
+        await close()
+
+
+async def _load_job(client, job_id: str):
+    """Fetch a job and advance it from ``pending`` to ``processing``."""
+    job = await client.get_job(job_id)
+    if job.status == "pending":
+        await client.advance_job(job_id)
+    return job
+
+
+async def _submit_result(client, job_id: str, submission) -> None:
+    """Submit the transcript and mark the job completed."""
+    await client.store_transcript(job_id, submission)
+    await client.complete_job(job_id)
+
+
+async def _mark_failed(client, job_id: str, message: str) -> None:
+    """Best-effort mark a job as failed through an existing client."""
+    try:
+        await client.fail_job(job_id, message)
+    except Exception:
+        logger.exception("Failed to mark job as failed", job_id=job_id)
+
+
 async def _perform_transcription(
     job, resume_token: str = "", resume_provider: str = ""
 ) -> TranscriptSubmission:
-    """Fetch a transcript — the configured provider first, then yt-dlp.
-    The single provider named by ``DEFAULT_VIDEO_PROVIDER`` is tried first
-    (when configured and live); the local yt-dlp strategy is the free
-    fallback. There is no provider cascade. A still-processing async job
-    raises ``TranscriptJobPending`` (bubbles to the retry-aware task). If
-    both miss, the pipeline raises so the job is failed rather than
-    completed empty.
-    """
-    provider = _configured_provider()
-    if provider is not None:
-        result = await _try_cloud(provider, job, resume_token, resume_provider)
+    for candidate in candidates(get_settings()):
+        result = await _try_provider(candidate, job, resume_token, resume_provider)
         if result is not None:
             logger.info(
                 "Transcript provider used",
-                provider=provider.name,
+                provider=candidate.name,
                 youtube_url=job.youtube_url,
             )
-            return _build_result_submission(result, provider.name)
-
-    if provider is None or provider.name != "yt-dlp":
-        ytdlp = YtDlpTranscriptStrategy()
-        result = await _try_cloud(ytdlp, job, resume_token, resume_provider)
-        if result is not None:
-            logger.info(
-                "Transcript provider used",
-                provider=ytdlp.name,
-                youtube_url=job.youtube_url,
-            )
-            return _build_result_submission(result, ytdlp.name)
+            return _build_result_submission(result, candidate.name)
 
     raise ExternalServiceError(
         "Could not fetch the transcript for this video",
         service="transcription",
     )
 
-async def _acquire_cache_lock(cache, video_id: str) -> str:
-    """Wait briefly for another worker to populate a cache miss."""
-    owner = uuid.uuid4().hex
-    deadline = asyncio.get_running_loop().time() + _CACHE_LOCK_MAX_WAIT_SECONDS
-    while True:
-        acquired, owner = await asyncio.to_thread(cache.acquire_lock, video_id, owner)
-        if acquired:
-            return owner
-        if asyncio.get_running_loop().time() >= deadline:
-            logger.warning("Transcript cache lock wait timed out; proceeding", video_id=video_id)
-            return ""
-        await asyncio.sleep(_CACHE_LOCK_WAIT_INTERVAL_SECONDS)
-        cached = await asyncio.to_thread(cache.get_with_provider, video_id)
-        if cached is not None:
-            # The caller will perform the final cache read after acquiring a
-            # lock. Returning an empty owner allows it to continue without
-            # holding a lock that it does not own.
-            return ""
 
-
-
-
-def _configured_provider():
-    """Build the single transcript provider named by ``DEFAULT_VIDEO_PROVIDER``.
-
-    Returns ``None`` when unset, unknown, or for a cloud provider that is not
-    configured or is disabled while live external calls are off. The local
-    yt-dlp strategy is returned as-is so it stays available offline.
-    """
-    settings = get_settings()
-    name = (getattr(settings, "default_video_provider", "") or "").strip().lower()
-    if not name:
-        return None
-    spec = provider_spec(name)
-    if spec is None:
-        logger.warning("Unknown default_video_provider; using yt-dlp", provider=name)
-        return None
-    provider = spec.build(settings)
-    if provider is None:
-        logger.warning("Default video provider not configured; using yt-dlp", provider=name)
-        return None
-    if provider.uses_cloud and not _live_pipeline_enabled(settings):
-        logger.info("Skipping cloud provider while live calls disabled", provider=name)
-        return None
-    return provider
-
-
-async def _try_cloud(provider, job, resume_token: str = "", resume_provider: str = ""):
+async def _try_provider(provider, job, resume_token: str = "", resume_provider: str = ""):
     """Fetch via a single provider strategy; a miss/error falls through.
 
     A still-processing async job (``TranscriptJobPending``) is re-raised so the
     task can decide whether to retry it or fail the job; everything else is
     treated as a regular miss (the caller moves to the fallback).
     """
-    resume = resume_token if (resume_token and provider.name == resume_provider) else ""
+    resume = (
+        resume_token
+        if (resume_token and provider.supports_resume and provider.name == resume_provider)
+        else ""
+    )
     try:
         return await provider.fetch(job.youtube_url, job.youtube_video_id, resume_token=resume)
     except TranscriptJobPending:
@@ -217,7 +216,7 @@ async def _try_cloud(provider, job, resume_token: str = "", resume_provider: str
             youtube_url=job.youtube_url,
         )
         raise
-    except Exception:
+    except ExternalServiceError:
         logger.exception(
             "Transcript provider failed; falling back",
             provider=provider.name,
@@ -228,15 +227,20 @@ async def _try_cloud(provider, job, resume_token: str = "", resume_provider: str
 
 def _build_result_submission(result, provider: str) -> TranscriptSubmission:
     """Build a submission payload directly from a provider strategy result."""
-    media = SimpleNamespace(
+    return _build_submission(
         title=result.title or "Untitled video",
         duration_seconds=result.duration_seconds,
+        transcript=result.transcript,
+        provider=provider,
     )
-    return _build_submission(media, result.transcript, provider=provider)
 
 
 def _build_submission(
-    media, transcript: TranscriptData, provider: str = ""
+    *,
+    title: str,
+    duration_seconds: int,
+    transcript: TranscriptData,
+    provider: str = "",
 ) -> TranscriptSubmission:
     """Build a transcript submission payload from media and transcript data."""
     words: list[TranscriptWordData] = []
@@ -252,8 +256,8 @@ def _build_submission(
                 )
             )
     return TranscriptSubmission(
-        title=media.title,
-        duration_seconds=media.duration_seconds,
+        title=title,
+        duration_seconds=duration_seconds,
         language=transcript.language,
         transcript_text=transcript.text,
         words=words,
@@ -261,49 +265,19 @@ def _build_submission(
     )
 
 
-@celery_app.task(bind=True, max_retries=_CLOUD_JOB_ATTEMPTS, default_retry_delay=60)
-def download_and_transcribe(
-    self, job_id: str, resume_token: str = "", resume_provider: str = ""
-) -> dict:
-    """Run the transcription pipeline from the Celery worker.
-
-    While a resumable cloud async job (e.g. Supadata) is processing, the task
-    returns early (instead of blocking in a poll loop) and re-enqueues itself
-    with an exponential backoff, carrying the job's resume token routed to its
-    originating provider. A non-resumable pending job (e.g. TranscriptFetch's
-    one-call rule) is failed immediately. When the waiting budget runs out the
-    job is marked failed and the task gives up.
-    """
-    try:
-        _run_async(run_pipeline(job_id, resume_token, resume_provider))
-    except TranscriptJobPending as exc:
-        if not exc.resumable:
-            _run_async(_fail_job(job_id, _EXTERNAL_FAILURE))
-            raise
-        if self.request.retries >= _CLOUD_JOB_ATTEMPTS - 1:
-            _run_async(_fail_job(job_id, _CLOUD_JOB_TIMEOUT_SAFE_MESSAGE))
-            raise
-        raise self.retry(
-            exc=exc,
-            max_retries=_CLOUD_JOB_ATTEMPTS,
-            countdown=_job_retry_countdown(self.request.retries),
-            args=[job_id, exc.resume_token, exc.provider],
-        ) from exc
-    return {"status": "completed"}
-
-
-async def _fail_job(job_id: str, message: str) -> None:
+async def _fail_job(
+    job_id: str,
+    message: str,
+    client_factory: Callable[..., BackendClient] | None = None,
+) -> None:
     """Best-effort mark a job as failed in the backend."""
     settings = get_settings()
-    client = BackendClient(settings.backend_url, settings.internal_api_key)
+    factory = client_factory or _new_client
+    client = factory(settings)
     try:
-        await client.fail_job(job_id, message)
-    except Exception:
-        logger.exception("Failed to mark job as failed", job_id=job_id)
+        await _mark_failed(client, job_id, message)
     finally:
-        close = getattr(client, "close", None)
-        if close is not None:
-            await close()
+        await _close_client(client)
 
 
 def _job_retry_countdown(retries: int) -> int:
