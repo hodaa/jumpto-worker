@@ -20,6 +20,11 @@ class TranscriptJobPending(ExternalServiceError):
     the caller may wait on (retry with backoff, carrying the resume token)
     from providers running a strict one-call policy (e.g. TranscriptFetch),
     where the job must be failed rather than polled or retried.
+
+    ``webhook`` marks a job whose completion is expected to arrive via an
+    externally wired webhook (the submit already armed it); the pipeline must
+    end the task cleanly instead of poller-retrying, since Assembly waits for
+    the async transcription that outlasts the local retry budget.
     """
 
     def __init__(
@@ -29,11 +34,13 @@ class TranscriptJobPending(ExternalServiceError):
         provider: str,
         resume_token: str = "",
         resumable: bool = True,
+        webhook: bool = False,
         details: dict[str, Any] | None = None,
     ) -> None:
         self.provider = provider
         self.resume_token = resume_token
         self.resumable = resumable
+        self.webhook = webhook
         super().__init__(
             message,
             service=provider,

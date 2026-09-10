@@ -96,6 +96,15 @@ class Settings(BaseSettings):
         default="",
         description="Assembly.ai API key for transcription",
     )
+    assembly_webhook_base_url: str = Field(
+        default="",
+        description=(
+            "Public base URL the backend exposes for Assembly.ai completion "
+            "callbacks. When set, the worker submits Assembly transcripts with "
+            "job context appended and ends the task instead of poller-retrying; "
+            "empty keeps the legacy in-worker retry (ASSEMBLY_WEBHOOK_BASE_URL)"
+        ),
+    )
 
     # VidWords (YouTube transcripts API)
     vidwords_api_key: str = Field(

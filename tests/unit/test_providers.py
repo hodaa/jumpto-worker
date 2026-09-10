@@ -1,5 +1,6 @@
 """Unit tests for external service providers (selection, Assembly flow, captions)."""
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -190,6 +191,76 @@ class TestAssignmentFetcher:
         assert excinfo.value.resumable is True
         client.get.assert_awaited_once()
         client.post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_submit_attaches_webhook_url_when_given(self) -> None:
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["json"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"id": "transcript-1"})
+
+        provider = AssemblyTranscriptService("key")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            transcript_id = await provider._submit(
+                client,
+                {},
+                "https://cdn.assemblyai.com/fake",
+                "https://backend.test/api/webhooks/assembly?job_id=job-1",
+            )
+
+        assert transcript_id == "transcript-1"
+        assert captured["json"] == {
+            "audio_url": "https://cdn.assemblyai.com/fake",
+            "webhook_url": "https://backend.test/api/webhooks/assembly?job_id=job-1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_submit_omits_webhook_url_when_not_given(self) -> None:
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["json"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"id": "transcript-1"})
+
+        provider = AssemblyTranscriptService("key")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await provider._submit(client, {}, "https://cdn.assemblyai.com/fake")
+
+        assert captured["json"] == {"audio_url": "https://cdn.assemblyai.com/fake"}
+
+    @pytest.mark.asyncio
+    async def test_fetch_with_webhook_flags_pending(self, monkeypatch, tmp_path) -> None:
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"fake-audio")
+        monkeypatch.setattr(
+            "app.providers.assembly._download_audio", lambda url: str(audio_file)
+        )
+
+        upload_response = Mock(status_code=200)
+        upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/fake"}
+        submit_response = Mock(status_code=200)
+        submit_response.json.return_value = {"id": "transcript-1"}
+        poll_response = Mock(status_code=200)
+        poll_response.json.return_value = {"status": "processing"}
+
+        client = AsyncMock()
+        client.post.side_effect = [upload_response, submit_response]
+        client.get.return_value = poll_response
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr("app.providers.assembly.httpx.AsyncClient", lambda: client)
+
+        provider = AssemblyTranscriptService("key")
+        with pytest.raises(TranscriptJobPending) as excinfo:
+            await provider.fetch(
+                "https://youtu.be/abcde12345",
+                webhook_url="https://backend.test/api/webhooks/assembly",
+            )
+
+        assert excinfo.value.webhook is True
+        assert excinfo.value.resume_token == "transcript-1"
+        assert not audio_file.exists()
 
 
 class TestCaptionSelection:

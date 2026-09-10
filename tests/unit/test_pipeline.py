@@ -21,8 +21,10 @@ from app.providers.vidwords import VidWordsPermanentError
 from app.tasks import transcription as transcription_module
 from app.tasks.transcription import (
     _build_submission,
+    _build_webhook_url,
     _job_retry_countdown,
     _perform_transcription,
+    _try_provider,
     _user_safe_message,
     download_and_transcribe,
     run_pipeline,
@@ -275,6 +277,66 @@ class TestFetchTranscriptWithRetry:
         assert excinfo.value.resume_token == "asm-1"
         assert excinfo.value.resumable is True
         assert audio.fetch.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_pending_webhook_flag_survives_strategy_remap(self) -> None:
+        """A webhook-armed Assembly pending must reach the task still flagged,
+        so it ends cleanly instead of consuming the in-worker retry budget."""
+
+        def no_captions(url, info=None):
+            raise ExternalServiceError("No captions", service="youtube-captions")
+
+        captions = AsyncMock()
+        captions.fetch.side_effect = no_captions
+
+        audio = AsyncMock()
+        audio.fetch.side_effect = TranscriptJobPending(
+            message="still processing",
+            provider="assemblyai",
+            resume_token="asm-1",
+            resumable=True,
+            webhook=True,
+        )
+
+        provider = self._provider(
+            captions_service=captions,
+            assembly_provider=lambda settings: audio,
+        )
+
+        with pytest.raises(TranscriptJobPending) as excinfo:
+            await provider._fetch_transcript_with_retry(
+                "https://youtu.be/abcde12345",
+                webhook_url="https://backend.test/api/webhooks/assembly?job_id=job-1",
+            )
+
+        assert excinfo.value.provider == "yt-dlp"
+        assert excinfo.value.webhook is True
+        assert excinfo.value.resume_token == "asm-1"
+
+    @pytest.mark.asyncio
+    async def test_webhook_url_forwarded_to_audio_provider_on_submit(self) -> None:
+        def fail(url, info=None):
+            raise ExternalServiceError("No captions", service="youtube-captions")
+
+        captions = AsyncMock()
+        captions.fetch.side_effect = fail
+
+        fallback = AsyncMock()
+        fallback.fetch.return_value = _transcript()
+
+        provider = self._provider(
+            captions_service=captions,
+            assembly_provider=lambda settings: fallback,
+        )
+
+        webhook = "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=yt-dlp"
+        result = await provider._fetch_transcript_with_retry(
+            "https://youtu.be/abcde12345", webhook_url=webhook
+        )
+
+        assert result.text == "Hello, world!"
+        fallback.fetch.assert_awaited_once()
+        fallback.fetch.assert_awaited_with("https://youtu.be/abcde12345", webhook_url=webhook)
 
     @pytest.mark.asyncio
     async def test_raises_after_retries_exhausted(self, monkeypatch) -> None:
@@ -639,6 +701,92 @@ class TestDownloadAndTranscribe:
         assert _job_retry_countdown(0) == 2
         assert _job_retry_countdown(4) == 32
         assert _job_retry_countdown(10) == 60
+
+    def test_ends_cleanly_when_completion_webhook_armed(self, monkeypatch) -> None:
+        async def webhook_pending(
+            job_id: str,
+            resume_token: str = "",
+            resume_provider: str = "",
+            client_factory=None,
+        ) -> None:
+            raise TranscriptJobPending(
+                provider="yt-dlp", resume_token="asm-1", resumable=True, webhook=True
+            )
+
+        monkeypatch.setattr(transcription_module, "run_pipeline", webhook_pending)
+
+        client = _FakeClient()
+        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+        settings = _settings(live_calls=False)
+        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
+
+        stub = _StubTask(retries=0)
+        result = download_and_transcribe.run.__func__(stub, "job-1")
+
+        assert result == {"status": "submitted"}
+        assert stub.retry_call is None
+        assert client.failed is False
+        assert client.calls == []
+
+
+class TestWebhookRouting:
+    """Tests for per-job provider webhook callback URLs."""
+
+    @staticmethod
+    def _settings(base: str) -> SimpleNamespace:
+        return SimpleNamespace(assembly_webhook_base_url=base)
+
+    def test_empty_when_webhooks_not_configured(self) -> None:
+        assert _build_webhook_url(_settings(live_calls=True), "job-1", "yt-dlp") == ""
+
+    def test_empty_without_job_id(self) -> None:
+        settings = self._settings("https://backend.test/api/webhooks/assembly")
+        assert _build_webhook_url(settings, "", "yt-dlp") == ""
+
+    def test_appends_job_context(self) -> None:
+        settings = self._settings("https://backend.test/api/webhooks/assembly")
+        url = _build_webhook_url(settings, "job-1", "yt-dlp")
+        assert url == "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=yt-dlp"
+
+    def test_joins_existing_query_string(self) -> None:
+        settings = self._settings("https://backend.test/api/webhooks/assembly?src=asm")
+        url = _build_webhook_url(settings, "job-1", "yt-dlp")
+        assert url == (
+            "https://backend.test/api/webhooks/assembly?src=asm&job_id=job-1&provider=yt-dlp"
+        )
+
+    @pytest.mark.asyncio
+    async def test_try_provider_forwards_webhook_url_only_on_first_submit(
+        self, monkeypatch
+    ) -> None:
+        provider = SimpleNamespace(
+            name="yt-dlp", supports_resume=True, fetch=AsyncMock(return_value=_ytdlp_result())
+        )
+        webhook = "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=yt-dlp"
+
+        await _try_provider(provider, _job(), webhook_url=webhook)
+
+        provider.fetch.assert_awaited_once_with(
+            "https://www.youtube.com/watch?v=abcde12345",
+            "abcde12345",
+            resume_token="",
+            webhook_url=webhook,
+        )
+
+        provider.fetch.reset_mock()
+        await _try_provider(
+            provider,
+            _job(),
+            resume_token="asm-1",
+            resume_provider="yt-dlp",
+            webhook_url=webhook,
+        )
+
+        provider.fetch.assert_awaited_once_with(
+            "https://www.youtube.com/watch?v=abcde12345",
+            "abcde12345",
+            resume_token="asm-1",
+        )
 
 
 class _RetryRaised(Exception):

@@ -51,8 +51,15 @@ class TranscriptProviderStrategy(ABC):
         youtube_url: str,
         youtube_video_id: str = "",
         resume_token: str = "",
+        *,
+        webhook_url: str = "",
     ) -> VideoTranscriptResult | None:
-        """Fetch transcript data, returning ``None`` on a soft miss."""
+        """Fetch transcript data, returning ``None`` on a soft miss.
+
+        ``webhook_url`` is an opaque public callback URL the pipeline built for
+        this job; only asynchronous strategies that support completion
+        callbacks (Assembly) use it. Others must ignore it.
+        """
 
 
 class TranscriptService(ABC):

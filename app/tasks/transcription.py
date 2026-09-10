@@ -2,6 +2,7 @@ import asyncio
 import atexit
 import os
 from collections.abc import Callable
+from urllib.parse import urlencode
 
 from app.client import BackendClient
 from app.client.http import close_shared_http_clients
@@ -53,6 +54,14 @@ def download_and_transcribe(
             )
         )
     except TranscriptJobPending as exc:
+        if exc.webhook:
+            logger.info(
+                "Cloud provider completion webhook armed; ending task",
+                job_id=job_id,
+                resume_token=exc.resume_token,
+                resume_provider=exc.provider,
+            )
+            return {"status": "submitted"}
         if not exc.resumable:
             _run_async(
                 _fail_job(job_id, _EXTERNAL_FAILURE, client_factory=client_factory)
@@ -122,7 +131,7 @@ async def run_pipeline(
         await _submit_result(client, job_id, submission)
     except TranscriptJobPending:
         logger.info(
-            "Cloud provider job still processing; task will retry or fail",
+            "Cloud provider job still processing; task will decide the outcome",
             job_id=job_id,
             resume_token=resume_token,
             resume_provider=resume_provider,
@@ -177,8 +186,12 @@ async def _mark_failed(client, job_id: str, message: str) -> None:
 async def _perform_transcription(
     job, resume_token: str = "", resume_provider: str = ""
 ) -> TranscriptSubmission:
-    for candidate in candidates(get_settings()):
-        result = await _try_provider(candidate, job, resume_token, resume_provider)
+    settings = get_settings()
+    for candidate in candidates(settings):
+        webhook_url = _build_webhook_url(settings, job.job_id, candidate.name)
+        result = await _try_provider(
+            candidate, job, resume_token, resume_provider, webhook_url
+        )
         if result is not None:
             logger.info(
                 "Transcript provider used",
@@ -193,12 +206,35 @@ async def _perform_transcription(
     )
 
 
-async def _try_provider(provider, job, resume_token: str = "", resume_provider: str = ""):
+def _build_webhook_url(settings, job_id: str, provider_name: str) -> str:
+    """Build the public completion-callback URL for a provider job.
+
+    The backend exposes a fixed webhook base URL; job context is appended so
+    its receiver can resume the right job. Returns ``""`` when webhooks are not
+    armed (no base URL configured or no job id), preserving the legacy
+    in-worker retry behaviour.
+    """
+    base = str(getattr(settings, "assembly_webhook_base_url", "") or "").strip()
+    if not base or not job_id:
+        return ""
+    query = urlencode({"job_id": job_id, "provider": provider_name})
+    separator = "&" if "?" in base else "?"
+    return f"{base}{separator}{query}"
+
+
+async def _try_provider(
+    provider,
+    job,
+    resume_token: str = "",
+    resume_provider: str = "",
+    webhook_url: str = "",
+):
     """Fetch via a single provider strategy; a miss/error falls through.
 
     A still-processing async job (``TranscriptJobPending``) is re-raised so the
-    task can decide whether to retry it or fail the job; everything else is
-    treated as a regular miss (the caller moves to the fallback).
+    task can decide whether to retry it, end it (a completion webhook was
+    armed), or fail the job; everything else is treated as a regular miss (the
+    caller moves to the fallback).
     """
     resume = (
         resume_token
@@ -206,7 +242,10 @@ async def _try_provider(provider, job, resume_token: str = "", resume_provider: 
         else ""
     )
     try:
-        return await provider.fetch(job.youtube_url, job.youtube_video_id, resume_token=resume)
+        kwargs: dict = {"resume_token": resume}
+        if webhook_url and not resume:
+            kwargs["webhook_url"] = webhook_url
+        return await provider.fetch(job.youtube_url, job.youtube_video_id, **kwargs)
     except TranscriptJobPending:
         raise
     except PermanentExternalServiceError:

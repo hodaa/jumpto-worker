@@ -15,9 +15,11 @@ interchangeable at the registry level (`app/providers/registry.py`):
 | `vidwords`       | `VidWordsTranscriptProvider`              | `app/providers/vidwords.py`     |
 
 - Every provider implements `TranscriptProviderStrategy` (`app/providers/base.py`):
-  it has a stable `name`, and a `fetch()` returning
+  it has a stable `name`, a `supports_resume` flag, and a `fetch()` returning
   `VideoTranscriptResult | None` (``None`` = soft miss, so the pipeline tries the
-  next candidate) or raising `ExternalServiceError`.
+  next candidate) or raising `ExternalServiceError`. `fetch()` accepts an
+  optional keyword-only `webhook_url` (an opaque public callback URL, consumed
+  only by the Assembly path).
 - **All four are providers.** Do not model "cloud vs local" as a first-class
   concept; whether a provider needs API keys/network access is an internal
   detail. Providers are kept independently switchable via `DEFAULT_VIDEO_PROVIDER`
@@ -104,13 +106,45 @@ call sites previously caused a 403 regression — keep it centralized.
    fallback. Unknown or unconfigured providers are silently skipped; cloud
    providers are skipped when live calls are off.
 2. `_try_provider()` calls each candidate's `fetch()`, routing resumes by
-   provider `name`, and returns the first non-`None` result.
+   provider `name`, and returns the first non-`None` result. `fetch()` accepts
+   an optional keyword-only `webhook_url` (ignored by every strategy except
+   Assembly); the pipeline builds it per job via `_build_webhook_url()`.
 3. The result is submitted via `_build_result_submission()`.
 
 `_live_pipeline_enabled()` gates whether live external calls are allowed
 (`JUMPTO_LIVE_EXTERNAL_CALLS`); treat the gate as a runtime switch, not a
 provider-category property. When disabled, live data is never fabricated —
 jobs fail with `ExternalServiceError`.
+
+## Completion webhooks (Assembly)
+
+Assembly transcription runs ~real-time, far beyond the in-worker retry budget.
+When `ASSEMBLY_WEBHOOK_BASE_URL` is set, the worker stops poller-retrying and
+lets Assembly deliver completion out-of-band:
+
+1. The pipeline builds a callback URL — ``<base>?job_id=<job_id>&provider=yt-dlp``
+   (`app/tasks/transcription.py:_build_webhook_url`) and passes it to
+   `AssemblyTranscriptService.fetch(..., webhook_url=...)`.
+2. Assembly submits the transcript with that `webhook_url`; a still-processing
+   poll raises `TranscriptJobPending(..., webhook=True)`.
+3. The Celery task ends cleanly with `{"status": "submitted"}` — the job is
+   **not** failed and **not** retried; it stays `processing` until completion.
+
+The webhook receiver lives on the **backend** (separate repo). Contract:
+
+- Endpoint: the exact URL the worker submitted (`assembly_webhook_base_url`
+  with the job/provider query params preserved).
+- Assembly posts `{"transcript_id": "...", "status": "completed"|"error", ...}`.
+- On `completed`, the backend must re-enqueue the worker task
+  `download_and_transcribe(job_id, resume_token=<transcript_id>,
+  resume_provider="yt-dlp")` (resume must route to provider `"yt-dlp"`, the
+  strategy name, not `assemblyai`).
+- On `error`, the backend should fail the job.
+
+Behaviour without a configured webhook base URL is unchanged legacy
+poller-retry. When the setting is present, the backend is responsible for
+recovering jobs whose webhook never fires (e.g. replay/timeout), since the
+worker no longer holds a retry budget for them.
 
 ## Celery application name
 

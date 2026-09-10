@@ -187,7 +187,7 @@ class TestStrategyCaching:
         monkeypatch.setattr(ytdlp_module, "get_media_info_with_raw", media_info)
         transcript_called = {"n": 0}
 
-        async def fetch_transcript(url, info=None):
+        async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
             transcript_called["n"] += 1
             raise AssertionError("transcript fetch must not run on cache hit")
 
@@ -209,7 +209,7 @@ class TestStrategyCaching:
             ytdlp_module, "get_media_info_with_raw", lambda video_id, url: (media, {})
         )
 
-        async def fetch_transcript(url, info=None):
+        async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
             return TranscriptData(language="en", text="cached me", words=[])
 
         provider = self._provider(cache, live_calls=True)
@@ -229,7 +229,7 @@ class TestStrategyCaching:
             ytdlp_module, "get_media_info_with_raw", lambda video_id, url: (media, None)
         )
 
-        async def fetch_transcript(url, info=None):
+        async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
             return TranscriptData(language="en", text="fake", words=[])
 
         provider = self._provider(cache, live_calls=False)

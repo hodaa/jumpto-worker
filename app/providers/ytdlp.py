@@ -84,13 +84,17 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         youtube_url: str,
         youtube_video_id: str = "",
         resume_token: str = "",
+        *,
+        webhook_url: str = "",
     ) -> VideoTranscriptResult:
         """Fetch media metadata and the best available transcript.
 
         The caption fast path is tried first; captionless or failing videos
         fall back to audio transcription via Assembly.ai. ``resume_token``
         resumes a previously queued Assembly job so a retry re-polls it instead
-        of re-downloading the audio.
+        of re-downloading the audio. ``webhook_url`` is a public callback URL for
+        the pending Assembly job (built by the pipeline); it arms a completion
+        webhook instead of in-worker polling.
 
         When the live pipeline is on, finished transcripts are cached in Redis
         keyed by the video id, so a later job for the same video skips yt-dlp
@@ -105,12 +109,9 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         media, info = await asyncio.to_thread(
             get_media_info_with_raw, youtube_video_id, youtube_url
         )
-        if resume_token:
-            transcript = await self._fetch_transcript_with_retry(
-                youtube_url, info, resume_token=resume_token
-            )
-        else:
-            transcript = await self._fetch_transcript_with_retry(youtube_url, info)
+        transcript = await self._fetch_transcript_with_retry(
+            youtube_url, info, resume_token=resume_token, webhook_url=webhook_url
+        )
         result = _build_video_result(media, transcript)
 
         await self._write_cache(video_id, result)
@@ -147,23 +148,27 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         youtube_url: str,
         info: dict | None = None,
         resume_token: str = "",
+        webhook_url: str = "",
     ) -> TranscriptData:
         """Fetch a transcript, prioritizing captions and falling back to audio.
 
         A ``resume_token`` skips the caption fast path and directly resumes the
         pending Assembly job. Otherwise captions are tried first; when they are
         missing or fail, audio transcription via Assembly.ai runs with retry.
+        ``webhook_url`` is forwarded to Assembly only on the initial submit.
         ``None`` from the assembly provider means audio transcription is not
         configured, so captionless videos fail cleanly instead of fabricating
         data.
         """
         if resume_token:
-            return await self._fetch_audio_with_retry(youtube_url, resume_token=resume_token)
+            return await self._fetch_audio_with_retry(
+                youtube_url, resume_token=resume_token, webhook_url=webhook_url
+            )
 
         captions = await self._try_captions(youtube_url, info)
         if captions is not None:
             return captions
-        return await self._fetch_audio_with_retry(youtube_url)
+        return await self._fetch_audio_with_retry(youtube_url, webhook_url=webhook_url)
 
     async def _try_captions(
         self, youtube_url: str, info: dict | None = None
@@ -197,13 +202,15 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         self,
         youtube_url: str,
         resume_token: str = "",
+        webhook_url: str = "",
     ) -> TranscriptData:
         """Transcribe audio via Assembly.ai, retrying transient failures.
 
         A pending Assembly job bubbles up as ``TranscriptJobPending`` re-routed
-        to the ``yt-dlp`` strategy name so the task resumes it. Uses the
-        provider only when audio transcription is configured; otherwise the job
-        fails cleanly.
+        to the ``yt-dlp`` strategy name so the task resumes it (or ends cleanly
+        when a completion webhook was armed). ``webhook_url`` is forwarded to
+        Assembly on the initial submit. Uses the provider only when audio
+        transcription is configured; otherwise the job fails cleanly.
         """
         provider = self._assembly_provider(self._settings)
         if provider is None:
@@ -220,6 +227,8 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
                 kwargs: dict = {}
                 if resume_token:
                     kwargs["resume_token"] = resume_token
+                if webhook_url:
+                    kwargs["webhook_url"] = webhook_url
                 return await provider.fetch(youtube_url, **kwargs)
             except TranscriptJobPending as exc:
                 raise _strategy_pending(exc) from exc
@@ -259,6 +268,7 @@ def _strategy_pending(exc: TranscriptJobPending) -> TranscriptJobPending:
         provider="yt-dlp",
         resume_token=exc.resume_token,
         resumable=exc.resumable,
+        webhook=exc.webhook,
         details=exc.details,
     )
 

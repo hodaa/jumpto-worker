@@ -80,6 +80,8 @@ class VidWordsTranscriptProvider(TranscriptProviderStrategy):
         youtube_url: str,
         youtube_video_id: str = "",
         resume_token: str = "",
+        *,
+        webhook_url: str = "",
     ) -> VidWordsResult | None:
         """Fetch a transcript for ``youtube_url``.
 

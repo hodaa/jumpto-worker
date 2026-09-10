@@ -43,8 +43,16 @@ class AssemblyTranscriptService(TranscriptService):
         self,
         youtube_url: str,
         resume_token: str = "",
+        webhook_url: str = "",
     ) -> TranscriptData:
-        """Submit or resume an Assembly.ai transcription without blocking a slot."""
+        """Submit or resume an Assembly.ai transcription without blocking a slot.
+
+        On the initial submit, ``webhook_url`` (a public callback URL built by
+        the pipeline) is attached to the Assembly job so completion is delivered
+        out-of-band; a ``TranscriptJobPending`` raised for that job is flagged
+        ``webhook=True`` so the task ends instead of poller-retrying. Resume
+        polls never arm webhooks (Assembly fires the callback once, on submit).
+        """
         headers = {"authorization": self.api_key}
         client = get_shared_http_client()
         if resume_token:
@@ -53,8 +61,8 @@ class AssemblyTranscriptService(TranscriptService):
         audio_path = await asyncio.to_thread(_download_audio, youtube_url)
         try:
             upload_url = await self._upload(client, headers, audio_path)
-            transcript_id = await self._submit(client, headers, upload_url)
-            return await self._poll(client, headers, transcript_id)
+            transcript_id = await self._submit(client, headers, upload_url, webhook_url)
+            return await self._poll(client, headers, transcript_id, webhook=bool(webhook_url))
         finally:
             _remove_file(audio_path)
 
@@ -86,12 +94,21 @@ class AssemblyTranscriptService(TranscriptService):
         client: httpx.AsyncClient,
         headers: dict,
         audio_url: str,
+        webhook_url: str = "",
     ) -> str:
-        """Create a transcription job and return its id."""
+        """Create a transcription job and return its id.
+
+        ``webhook_url`` (when non-empty) arms an Assembly.ai completion
+        callback so the pipeline does not need to poll for the full
+        transcription duration.
+        """
+        payload: dict[str, object] = {"audio_url": audio_url}
+        if webhook_url:
+            payload["webhook_url"] = webhook_url
         response = await client.post(
             f"{self.base_url}/transcript",
             headers=headers,
-            json={"audio_url": audio_url},
+            json=payload,
         )
         if response.status_code != 200:
             logger.error(
@@ -107,8 +124,14 @@ class AssemblyTranscriptService(TranscriptService):
         client: httpx.AsyncClient,
         headers: dict,
         transcript_id: str,
+        webhook: bool = False,
     ) -> TranscriptData:
-        """Check once and let Celery backoff while Assembly processes the job."""
+        """Check once and let the caller back off while Assembly processes.
+
+        ``webhook=True`` marks a job whose completion is delivered externally;
+        the pending signal then tells the pipeline to end the task instead of
+        retrying.
+        """
         response = await client.get(f"{self.base_url}/transcript/{transcript_id}", headers=headers)
         if response.status_code != 200:
             raise ExternalServiceError(
@@ -125,6 +148,7 @@ class AssemblyTranscriptService(TranscriptService):
             provider="assemblyai",
             resume_token=transcript_id,
             resumable=True,
+            webhook=webhook,
         ) from None
 
 

@@ -89,6 +89,8 @@ class SupadataTranscriptProvider(TranscriptProviderStrategy):
         youtube_url: str,
         youtube_video_id: str = "",
         resume_token: str = "",
+        *,
+        webhook_url: str = "",
     ) -> SupadataResult | None:
         """Fetch a transcript for a YouTube video.
 
