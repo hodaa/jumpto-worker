@@ -14,6 +14,11 @@
       environment:
         # Point yt-dlp at the bgutil PO-token provider container (service DNS).
         YTDLP_BGUTIL_URL: http://bgutil-pot:4416
+      ports:
+        # debugpy remote attach (VSCode "Debugger: Attach" on localhost:5678).
+        # Nothing binds this port until the worker process calls
+        # debugpy.listen(); the default celery command does not.
+        - "127.0.0.1:5678:5678"
       volumes:
         # Host cookie file to mount: default /etc/jumpto/cookies.txt (VPS),
         # override with COOKIE_FILE for local dev where /etc/jumpto may not exist.

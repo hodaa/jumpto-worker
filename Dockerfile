@@ -25,4 +25,11 @@ RUN pip install --no-cache-dir .
 # Install yt-dlp PO Token provider plugin
 RUN pip install --no-cache-dir bgutil-ytdlp-pot-provider
 
+# Debugging: debugpy lets the worker process accept a remote attach (VSCode
+# "Debugger: Attach" on port 5678). Nothing listens on the port by default; a
+# debug entrypoint must call debugpy.listen() first.
+RUN pip install --no-cache-dir debugpy
+
+EXPOSE 5678
+
 CMD ["celery", "-A", "app.tasks.celery_app.celery_app", "worker", "--loglevel=info"]
