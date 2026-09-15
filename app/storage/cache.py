@@ -1,14 +1,14 @@
 """Worker-side transcript cache.
 
 Reprocessing the same YouTube video re-runs yt-dlp end-to-end (metadata
-extraction + caption/audio download). The cache stores the finished
-:class:`VideoTranscriptResult` keyed by YouTube video id in Redis — which is
-already running as the Celery broker — so a second job for the same video is
-served without any network call.
+extraction + caption/audio download).  The cache stores the finished
+:class:`VideoTranscriptResult` keyed by YouTube video id on the local disk
+via :mod:`diskcache` — no separate service needed — so a second job for the
+same video is served without any network call.
 
-Failures degrade gracefully: a Redis outage, a corrupt entry, or an empty
-video id all behave as a cache miss, and writes are best-effort. The frontend's
-in-memory cache only helps one browser session; this one is shared and durable.
+When ``TRANSCRIPT_CACHE_ENABLED=false`` the factory returns
+:class:`NoOpTranscriptCache`, which satisfies the same interface without touching
+the filesystem.
 """
 
 from __future__ import annotations
@@ -16,18 +16,15 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from abc import ABC, abstractmethod
 from functools import lru_cache
 
-try:
-    import redis as _redis
-    from redis.exceptions import RedisError as _RedisError
-except ImportError:  # pragma: no cover - redis is a hard dependency
-    _redis = None
-    _RedisError = Exception
+from diskcache import Cache as _DiskCache
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.providers.base import VideoTranscriptResult
+from app.providers.media import MediaInfo
 from app.providers.models import TranscriptData, TranscriptWordData
 
 logger = get_logger(__name__)
@@ -118,28 +115,120 @@ def _deserialize_result(payload: str) -> VideoTranscriptResult | None:
         return None
 
 
-class TranscriptCache:
-    """Redis-backed transcript cache with a TTL and fail-open semantics."""
+# ---------------------------------------------------------------------------
+# TranscriptCache — abstract interface (Strategy / Interface Segregation)
+# ---------------------------------------------------------------------------
+
+
+class TranscriptCache(ABC):
+    """Abstract worker-side transcript cache.
+
+    Concrete implementations (:class:`DiskBackedTranscriptCache`,
+    :class:`NoOpTranscriptCache`) are selected by :func:`get_transcript_cache`
+    based on configuration.
+    """
+
+    ttl_seconds: int
+    lock_ttl_seconds: int
+    namespace: str
+
+    @abstractmethod
+    def get_with_provider(self, video_id: str) -> tuple[VideoTranscriptResult, str] | None:
+        ...
+
+    @abstractmethod
+    def set(self, video_id: str, result: VideoTranscriptResult, provider: str = "") -> None:
+        ...
+
+    @abstractmethod
+    def acquire_lock(self, video_id: str, owner: str | None = None) -> tuple[bool, str]:
+        ...
+
+    @abstractmethod
+    def release_lock(self, video_id: str, owner: str) -> None:
+        ...
+
+    def get(self, video_id: str) -> VideoTranscriptResult | None:
+        """Read a cached transcript, ignoring any stored provenance."""
+        entry = self.get_with_provider(video_id)
+        return entry[0] if entry is not None else None
+
+    def get_media(self, video_id: str) -> MediaInfo | None:
+        """Read cached media metadata (title/duration), or ``None`` on a miss.
+
+        Metadata is cached ahead of Assembly submission so a resume of a
+        pending job can skip the full yt-dlp metadata re-extract and go
+        straight to the Assembly poll. Default no-op: caches that don't
+        support metadata return a quiet miss.
+        """
+        return None
+
+    def set_media(self, video_id: str, title: str, duration_seconds: int) -> None:
+        """Store media metadata so a later resume can skip the re-extract.
+
+        Default no-op; overridden by disk-backed caches.
+        """
+        return
+
+
+# ---------------------------------------------------------------------------
+# NoOpTranscriptCache — satisfied interface that never touches I/O
+# ---------------------------------------------------------------------------
+
+
+class NoOpTranscriptCache(TranscriptCache):
+    """Cache disabled or unavailable; every operation is a silent no-op."""
 
     def __init__(
         self,
-        redis_url: str,
-        ttl_seconds: int,
-        enabled: bool = True,
+        ttl_seconds: int = 0,
         lock_ttl_seconds: int = _DEFAULT_LOCK_TTL_SECONDS,
         namespace: str = _NAMESPACE,
     ) -> None:
         self.ttl_seconds = ttl_seconds
         self.lock_ttl_seconds = lock_ttl_seconds
         self.namespace = namespace
-        self.enabled = enabled
-        if enabled and _redis is not None:
-            # Short timeouts so a dead broker never stalls a transcription job.
-            self._client = _redis.from_url(
-                redis_url, decode_responses=True, socket_connect_timeout=1, socket_timeout=1
-            )
-        else:
-            self._client = None
+
+    def get_with_provider(self, video_id: str) -> tuple[VideoTranscriptResult, str] | None:
+        return None
+
+    def set(self, video_id: str, result: VideoTranscriptResult, provider: str = "") -> None:
+        return
+
+    def acquire_lock(self, video_id: str, owner: str | None = None) -> tuple[bool, str]:
+        return True, (owner or uuid.uuid4().hex)
+
+    def release_lock(self, video_id: str, owner: str) -> None:
+        return
+
+
+# ---------------------------------------------------------------------------
+# DiskBackedTranscriptCache — SQLite + filesystem via diskcache
+# ---------------------------------------------------------------------------
+
+
+class DiskBackedTranscriptCache(TranscriptCache):
+    """Disk-backed transcript cache with a TTL and fail-open semantics.
+
+    Uses :class:`diskcache.Cache` (SQLite + filesystem) so cached transcripts
+    survive process restarts, are shared across prefork workers, and need no
+    external service.
+    """
+
+    def __init__(
+        self,
+        directory: str,
+        ttl_seconds: int,
+        lock_ttl_seconds: int = _DEFAULT_LOCK_TTL_SECONDS,
+        namespace: str = _NAMESPACE,
+    ) -> None:
+        self.ttl_seconds = ttl_seconds
+        self.lock_ttl_seconds = lock_ttl_seconds
+        self.namespace = namespace
+        # Short timeout so a locked database never stalls a transcription job.
+        self._backend = _DiskCache(directory, timeout=0.1)
+
+    # -- key helpers --------------------------------------------------------
 
     def _key(self, video_id: str) -> str:
         return f"{self.namespace}:{video_id}"
@@ -147,22 +236,22 @@ class TranscriptCache:
     def _lock_key(self, video_id: str) -> str:
         return f"{self.namespace}:lock:{video_id}"
 
-    def get(self, video_id: str) -> VideoTranscriptResult | None:
-        """Read a cached transcript, ignoring any stored provenance."""
-        entry = self.get_with_provider(video_id)
-        return entry[0] if entry is not None else None
+    def _media_key(self, video_id: str) -> str:
+        return f"{self.namespace}:media:{video_id}"
+
+    # -- public API ---------------------------------------------------------
 
     def get_with_provider(self, video_id: str) -> tuple[VideoTranscriptResult, str] | None:
         """Read a cached transcript and the provider that produced it."""
-        if not self.enabled or self._client is None or not video_id:
+        if not video_id:
             return None
         key = self._key(video_id)
         try:
-            payload = self._client.get(key)
-        except _RedisError as exc:
+            payload = self._backend.get(key)
+        except Exception as exc:  # noqa: BLE001 – fail-open
             logger.warning("Transcript cache read failed", key=key, error=str(exc))
             return None
-        if not payload:
+        if payload is None:
             return None
         result = _deserialize_result(payload)
         if result is None:
@@ -174,60 +263,110 @@ class TranscriptCache:
         return result, provider
 
     def set(self, video_id: str, result: VideoTranscriptResult, provider: str = "") -> None:
-        if not self.enabled or self._client is None or not video_id:
+        """Store a finished transcript in the cache, best-effort."""
+        if not video_id:
             return
         key = self._key(video_id)
         try:
-            self._client.set(key, _serialize_result(result, provider), ex=self.ttl_seconds)
-        except _RedisError as exc:
+            self._backend.set(key, _serialize_result(result, provider), expire=self.ttl_seconds)
+        except Exception as exc:  # noqa: BLE001 – fail-open
             logger.warning("Transcript cache write failed", key=key, error=str(exc))
 
-    def acquire_lock(self, video_id: str, owner: str | None = None) -> tuple[bool, str]:
-        """Acquire a short-lived distributed lock for a video cache miss.
+    def get_media(self, video_id: str) -> MediaInfo | None:
+        """Read cached media metadata (title/duration), or ``None`` on a miss.
 
-        Redis failures fail open: duplicate work is preferable to blocking every
-        transcription when the optional cache is unavailable.
+        A corrupt or expired entry is treated as a miss (fail-open), so a
+        resume falls back to the full metadata fetch rather than failing.
+        """
+        if not video_id:
+            return None
+        key = self._media_key(video_id)
+        try:
+            payload = self._backend.get(key)
+        except Exception as exc:  # noqa: BLE001 – fail-open
+            logger.warning("Media metadata cache read failed", key=key, error=str(exc))
+            return None
+        if payload is None:
+            return None
+        try:
+            data = json.loads(payload)
+            return MediaInfo(
+                title=str(data["title"]),
+                duration_seconds=int(data["duration_seconds"]),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("Discarding corrupt media metadata cache entry", key=key, error=str(exc))
+            return None
+
+    def set_media(self, video_id: str, title: str, duration_seconds: int) -> None:
+        """Store media metadata so a later resume can skip the re-extract."""
+        if not video_id:
+            return
+        key = self._media_key(video_id)
+        try:
+            payload = json.dumps(
+                {"title": title, "duration_seconds": int(duration_seconds)},
+                separators=(",", ":"),
+            )
+            self._backend.set(key, payload, expire=self.ttl_seconds)
+        except Exception as exc:  # noqa: BLE001 – fail-open
+            logger.warning("Media metadata cache write failed", key=key, error=str(exc))
+
+    def acquire_lock(self, video_id: str, owner: str | None = None) -> tuple[bool, str]:
+        """Acquire a short-lived lock for a video cache miss.
+
+        DiskCache failures fail open: duplicate work is preferable to blocking
+        every transcription when the cache is unavailable.
         """
         owner = owner or uuid.uuid4().hex
-        if not self.enabled or self._client is None or not video_id:
+        if not video_id:
             return True, owner
         key = self._lock_key(video_id)
         try:
-            acquired = self._client.set(
-                key, owner, ex=self.lock_ttl_seconds, nx=True
-            )
+            acquired = self._backend.add(key, owner, expire=self.lock_ttl_seconds)
             return bool(acquired), owner
-        except (_RedisError, TypeError) as exc:
+        except Exception as exc:  # noqa: BLE001 – fail-open
             logger.warning("Transcript cache lock failed open", key=key, error=str(exc))
             return True, owner
 
     def release_lock(self, video_id: str, owner: str) -> None:
         """Release a lock only when it is still owned by this worker."""
-        if not self.enabled or self._client is None or not video_id or not owner:
+        if not video_id or not owner:
             return
         key = self._lock_key(video_id)
         try:
-            # Compare-and-delete prevents an expired lock from being deleted
-            # after another worker has acquired it.
-            self._client.eval(
-                "if redis.call('get', KEYS[1]) == ARGV[1] then "
-                "return redis.call('del', KEYS[1]) else return 0 end",
-                1,
-                key,
-                owner,
-            )
-        except (_RedisError, AttributeError) as exc:
+            with self._backend.transact():
+                if self._backend.get(key) == owner:
+                    self._backend.delete(key)
+        except Exception as exc:  # noqa: BLE001 – fail-open
             logger.warning("Transcript cache lock release failed", key=key, error=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Factory — single enforcement point for the feature-flag seam
+# ---------------------------------------------------------------------------
 
 
 @lru_cache
 def get_transcript_cache() -> TranscriptCache:
-    """Return the shared cache instance built from the current settings."""
+    """Return the shared cache instance built from the current settings.
+
+    When ``TRANSCRIPT_CACHE_ENABLED=false`` a :class:`NoOpTranscriptCache` is
+    returned so that callers never branch on availability.
+    """
     settings = get_settings()
-    return TranscriptCache(
-        redis_url=settings.redis_url,
+    if not settings.transcript_cache_enabled:
+        return NoOpTranscriptCache(
+            ttl_seconds=settings.transcript_cache_ttl_seconds,
+            lock_ttl_seconds=max(
+                getattr(settings, "transcript_cache_lock_ttl_seconds", 900),
+                getattr(settings, "job_timeout_seconds", 600) + 60,
+            ),
+            namespace=_cache_namespace(settings),
+        )
+    return DiskBackedTranscriptCache(
+        directory=settings.transcript_cache_directory,
         ttl_seconds=settings.transcript_cache_ttl_seconds,
-        enabled=settings.transcript_cache_enabled,
         lock_ttl_seconds=max(
             getattr(settings, "transcript_cache_lock_ttl_seconds", 900),
             getattr(settings, "job_timeout_seconds", 600) + 60,

@@ -17,14 +17,15 @@ interchangeable at the registry level (`app/providers/registry.py`):
 - Every provider implements `TranscriptProviderStrategy` (`app/providers/base.py`):
   it has a stable `name`, `supports_resume` and `supports_webhook` flags, and a
   `fetch()` returning `VideoTranscriptResult | None` (``None`` = soft miss, so
-  the pipeline tries the next candidate) or raising `ExternalServiceError`.
+  the pipeline fails the job) or raising `ExternalServiceError`.
   `fetch()` accepts an optional keyword-only `webhook_url` (an opaque public
   callback URL, consumed only by the Assembly path, which declares
   ``supports_webhook``).
 - **All four are providers.** Do not model "cloud vs local" as a first-class
   concept; whether a provider needs API keys/network access is an internal
-  detail. Providers are kept independently switchable via `DEFAULT_VIDEO_PROVIDER`
-  or the ordered `TRANSCRIPT_PROVIDER_CHAIN` list.
+  detail. Exactly one provider runs per job, selected via `VIDEO_PROVIDER`
+  (default `yt-dlp`); there is no fallback chain — an unavailable provider
+  fails the job loudly.
 - A provider doing work in the background (e.g. Assembly) reports in-progress
   via `TranscriptJobPending`, so the pipeline can resume the same job
   (`resume_token`/`resume_provider`) instead of re-downloading.
@@ -108,17 +109,15 @@ call sites previously caused a 403 regression — keep it centralized.
 `app/services/pipeline.py` (orchestrated by the thin Celery task
 `app/tasks/transcription.py`) runs in this order:
 
-1. `registry.candidates(settings)` resolves the ordered chain of providers from
-   settings: either the explicit `provider_chain` list
-   (`TRANSCRIPT_PROVIDER_CHAIN` env var, comma-separated), or the default chain
-   — `DEFAULT_VIDEO_PROVIDER` first, then `yt-dlp` as the always-available
-   fallback. Unknown or unconfigured providers are silently skipped; cloud
-   providers are skipped when live calls are off.
-2. `try_provider()` calls each candidate's `fetch()`, routing resumes by
-   provider `name`, and returns the first non-`None` result. `fetch()` accepts
-   an optional keyword-only `webhook_url` (ignored by every strategy except
-   Assembly); the pipeline builds it per job via
-   `build_assembly_webhook_url()` (`app/services/webhooks.py`) and forwards it
+1. `registry.resolve_provider(settings)` builds the single configured provider
+   from `VIDEO_PROVIDER` (default `yt-dlp`). Unknown or unconfigured providers
+   and cloud providers while live calls are disabled raise instead of being
+   silently skipped — there is no fallback chain.
+2. `try_provider()` calls the provider's `fetch()`, routing resume tokens when
+   `resume_provider` matches the provider `name`, and returns the result or
+   `None` on a soft miss. `fetch()` accepts an optional keyword-only
+   `webhook_url` (ignored by every strategy except Assembly); the pipeline
+   builds it per job via `build_assembly_webhook_url()` (`app/services/webhooks.py`) and forwards it
    only to strategies declaring `supports_webhook`.
 3. The result is submitted via `build_result_submission()`
    (`app/services/submissions.py`) through the backend `JobService`

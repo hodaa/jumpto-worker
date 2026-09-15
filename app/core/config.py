@@ -38,14 +38,6 @@ class Settings(BaseSettings):
         """Lowercase/strip QUEUE_PROVIDER so "Redis"/"RABBITMQ" both work."""
         return value.strip().lower() if isinstance(value, str) else value
 
-    @field_validator("provider_chain", mode="before")
-    @classmethod
-    def _split_provider_chain(cls, value: object) -> object:
-        """Split a comma-separated chain into lowercase, stripped provider names."""
-        if isinstance(value, str):
-            return [part.strip().lower() for part in value.split(",") if part.strip()]
-        return value
-
     # Backend communication
     backend_url: str = Field(
         default="http://localhost:8000",
@@ -161,29 +153,14 @@ class Settings(BaseSettings):
         description="Application environment (development/production)",
     )
 
-    # Default transcript provider strategy (the single cloud one, led first)
-    default_video_provider: str = Field(
-        default="",
+    # The single transcript provider strategy. Exactly one provider runs per
+    # job; unknown, unconfigured, or cloud providers while live calls are
+    # disabled raise instead of silently falling through.
+    video_provider: str = Field(
+        default="yt-dlp",
         description=(
-            "The single cloud transcript provider used first; empty uses yt-dlp only. "
-            "yt-dlp is always tried second as the free fallback. "
-            "e.g. DEFAULT_VIDEO_PROVIDER=vidwords"
-        ),
-    )
-
-    # Optional ordered transcript provider chain. When set, the pipeline tries
-    # exactly these providers in order (skipping unknown/unconfigured ones);
-    # when empty it uses DEFAULT_VIDEO_PROVIDER first and yt-dlp as fallback.
-    provider_chain: list[str] = Field(
-        default_factory=list,
-        validation_alias=AliasChoices(
-            "provider_chain",
-            "TRANSCRIPT_PROVIDER_CHAIN",
-        ),
-        description=(
-            "Ordered transcript providers to try, comma-separated from "
-            "TRANSCRIPT_PROVIDER_CHAIN (e.g. vidwords,supadata); empty uses "
-            "DEFAULT_VIDEO_PROVIDER then yt-dlp"
+            "The single transcript provider used for every job (VIDEO_PROVIDER "
+            "env var); empty uses yt-dlp. e.g. VIDEO_PROVIDER=vidwords"
         ),
     )
 
@@ -231,11 +208,16 @@ class Settings(BaseSettings):
         description="Network socket timeout (seconds) for yt-dlp requests (YTDLP_SOCKET_TIMEOUT)",
     )
 
-    # Worker-side transcript cache (Redis). Reprocessing the same YouTube video
-    # is served from cache keyed by video id instead of re-running yt-dlp.
+    # Worker-side transcript cache (DiskCache / SQLite). Reprocessing the same
+    # YouTube video is served from a local on-disk cache keyed by video id
+    # instead of re-running yt-dlp.
     transcript_cache_enabled: Annotated[bool, BeforeValidator(_coerce_bool)] = Field(
         default=True,
-        description="Enable the Redis-backed worker transcript cache (TRANSCRIPT_CACHE_ENABLED)",
+        description="Enable the disk-backed worker transcript cache (TRANSCRIPT_CACHE_ENABLED)",
+    )
+    transcript_cache_directory: str = Field(
+        default="/var/tmp/jumpto-transcript-cache",
+        description="Directory for the disk-backed transcript cache (TRANSCRIPT_CACHE_DIRECTORY)",
     )
     transcript_cache_ttl_seconds: int = Field(
         default=86400,

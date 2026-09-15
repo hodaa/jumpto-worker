@@ -36,15 +36,15 @@ class TestTranscriptFetchApiKey:
         assert Settings(_env_file=None).transcriptfetch_api_key == "secret-2"
 
 
-class TestDefaultVideoProvider:
-    """Tests for the default transcript provider selection setting."""
+class TestVideoProvider:
+    """Tests for the single transcript provider setting."""
 
-    def test_defaults_to_empty(self) -> None:
-        assert Settings(_env_file=None).default_video_provider == ""
+    def test_defaults_to_ytdlp(self) -> None:
+        assert Settings(_env_file=None).video_provider == "yt-dlp"
 
     def test_reads_configured_value_from_env(self, monkeypatch) -> None:
-        monkeypatch.setenv("DEFAULT_VIDEO_PROVIDER", "yt-dlp")
-        assert Settings(_env_file=None).default_video_provider == "yt-dlp"
+        monkeypatch.setenv("VIDEO_PROVIDER", "vidwords")
+        assert Settings(_env_file=None).video_provider == "vidwords"
 
 
 class TestQueueProvider:

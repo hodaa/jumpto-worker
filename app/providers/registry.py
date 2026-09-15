@@ -85,64 +85,23 @@ def build_provider(name: str, settings: Settings) -> TranscriptProviderStrategy 
     return spec.build(settings)
 
 
-def _resolve_chain(settings: Settings) -> list[str]:
-    """Return the ordered list of provider names to try.
+def resolve_provider(settings: Settings) -> TranscriptProviderStrategy:
+    """Build and return the single configured transcript provider.
 
-    Uses the explicit ``provider_chain`` list when set; otherwise falls back
-    to ``default_video_provider`` (if set) followed by ``yt-dlp`` as the
-    always-available last resort.
+    Exactly one provider runs per job (``VIDEO_PROVIDER``, default ``yt-dlp``).
+    There is no fallback chain: an unknown name, an unconfigured provider, or a
+    cloud provider while live calls are disabled raises a :class:`ValueError`
+    so the job fails loudly instead of silently switching strategies.
     """
-    chain = [
-        name.strip().lower()
-        for name in (getattr(settings, "provider_chain", None) or [])
-        if name.strip()
-    ]
-    if chain:
-        return chain
-
-    default = (getattr(settings, "default_video_provider", "") or "").strip().lower()
-    return ([default] if default else []) + ["yt-dlp"]
-
-
-def _build_candidate(
-    name: str, settings: Settings
-) -> TranscriptProviderStrategy | None:
-    """Build a provider, returning None when it's unavailable.
-
-    Skips unknown names, unconfigured providers, and cloud providers
-    when live external calls are disabled.
-    """
+    name = (getattr(settings, "video_provider", "") or "yt-dlp").strip().lower()
     spec = provider_spec(name)
     if spec is None:
-        logger.warning("Unknown transcript provider in chain; skipping", provider=name)
-        return None
+        raise ValueError(f"Unknown transcript provider: {name}")
     if spec.uses_cloud and not _live_pipeline_enabled(settings):
-        logger.info("Skipping cloud provider while live calls disabled", provider=name)
-        return None
+        raise ValueError(
+            f"Transcript provider {name!r} needs live external calls, which are disabled"
+        )
     provider = spec.build(settings)
     if provider is None:
-        logger.warning(
-            "Transcript provider in chain not configured; skipping", provider=name
-        )
-        return None
+        raise ValueError(f"Transcript provider {name!r} is not configured")
     return provider
-
-
-def candidates(settings: Settings) -> list[TranscriptProviderStrategy]:
-    """Build and return the ordered list of transcript providers to try.
-
-    Resolves the provider chain from ``settings``, builds each candidate,
-    and skips unknown/unconfigured/cloud providers when live calls are off.
-    Deduplicates, keeping the first occurrence of each provider name.
-    """
-    chain = _resolve_chain(settings)
-    result: list[TranscriptProviderStrategy] = []
-    seen: set[str] = set()
-    for name in chain:
-        if name in seen:
-            continue
-        seen.add(name)
-        provider = _build_candidate(name, settings)
-        if provider is not None:
-            result.append(provider)
-    return result

@@ -1,10 +1,10 @@
 """Transcription pipeline orchestration.
 
-Owns the end-to-end flow: resolve the candidate provider chain from settings,
-fetch a transcript (resuming pending async jobs by provider), build the
-submission, and report back through the backend's ``JobService``. Provider
-strategy details, webhook URL building, and submission payload mapping live in
-their own service modules; this module composes them.
+Owns the end-to-end flow: resolve the single configured provider from settings,
+fetch a transcript (resuming pending async jobs when the provider supports it),
+build the submission, and report back through the backend's ``JobService``.
+Provider strategy details, webhook URL building, and submission payload mapping
+live in their own service modules; this module composes them.
 """
 
 import asyncio
@@ -16,7 +16,7 @@ from app.core.exceptions import ExternalServiceError, PermanentExternalServiceEr
 from app.core.logging import get_logger
 from app.models import TranscriptSubmission
 from app.providers import TranscriptJobPending
-from app.providers.registry import candidates
+from app.providers.registry import resolve_provider
 from app.services.jobs import JobService
 from app.services.submissions import build_result_submission
 from app.services.webhooks import build_assembly_webhook_url
@@ -72,18 +72,18 @@ async def perform_transcription(
     job, resume_token: str = "", resume_provider: str = ""
 ) -> TranscriptSubmission:
     settings = get_settings()
-    for candidate in candidates(settings):
-        webhook_url = build_assembly_webhook_url(settings, job.job_id, candidate.name)
-        result = await try_provider(
-            candidate, job, resume_token, resume_provider, webhook_url
+    provider = resolve_provider(settings)
+    webhook_url = build_assembly_webhook_url(settings, job.job_id, provider.name)
+    result = await try_provider(
+        provider, job, resume_token, resume_provider, webhook_url
+    )
+    if result is not None:
+        logger.info(
+            "Transcript provider used",
+            provider=provider.name,
+            youtube_url=job.youtube_url,
         )
-        if result is not None:
-            logger.info(
-                "Transcript provider used",
-                provider=candidate.name,
-                youtube_url=job.youtube_url,
-            )
-            return build_result_submission(result, candidate.name)
+        return build_result_submission(result, provider.name)
 
     raise ExternalServiceError(
         "Could not fetch the transcript for this video",
@@ -98,12 +98,13 @@ async def try_provider(
     resume_provider: str = "",
     webhook_url: str = "",
 ):
-    """Fetch via a single provider strategy; a miss/error falls through.
+    """Fetch via a single provider strategy; a soft miss returns ``None``.
 
     A still-processing async job (``TranscriptJobPending``) is re-raised so the
     task can decide whether to retry it, end it (a completion webhook was
-    armed), or fail the job; everything else is treated as a regular miss (the
-    caller moves to the fallback).
+    armed), or fail the job; a transient ``ExternalServiceError`` is logged and
+    returned as ``None`` so the caller can fail the job with a user-safe
+    message.
 
     The completion callback URL is only forwarded to strategies that declare
     ``supports_webhook`` (interface segregation: the pipeline checks the

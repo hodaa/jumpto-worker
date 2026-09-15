@@ -67,7 +67,8 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         ``assembly_provider``, and ``cache`` abstract the leaf collaborators
         (caption fast path, Assembly audio, and the transcript cache); when
         omitted they fall back to the concrete service, the Assembly factory,
-        and the shared cache, preserving current behavior.
+        and the shared cache built by :func:`~app.storage.cache.get_transcript_cache`,
+        preserving current behavior.
         """
         self._settings = settings
         self._captions_service = captions_service
@@ -97,26 +98,40 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         the pending Assembly job (built by the pipeline); it arms a completion
         webhook instead of in-worker polling.
 
-        When the live pipeline is on, finished transcripts are cached in Redis
+        When the live pipeline is on, finished transcripts are cached on disk
         keyed by the video id, so a later job for the same video skips yt-dlp
         entirely. The id comes from the job when present or is parsed from the
         URL otherwise; unparseable ids simply disable caching.
+
+        A resume of a pending Assembly job reads the title/duration from the
+        cache (written when the job was first submitted) instead of re-running
+        the yt-dlp metadata extract — the only work left is a single Assembly
+        poll. A cache miss falls back to a fresh metadata fetch.
         """
         video_id = youtube_video_id or extract_youtube_video_id(youtube_url)
         cached = await self._read_cache(video_id)
         if cached is not None:
             return cached
 
-        media, info = await asyncio.to_thread(
-            get_media_info_with_raw, youtube_video_id, youtube_url,
-            settings=self._resolve_settings(),
-        )
+        media = None
+        if resume_token:
+            media = await self._read_media(video_id)
+
+        if media is not None:
+            info = None  # resume skips the caption fast path entirely
+        else:
+            media, info = await asyncio.to_thread(
+                get_media_info_with_raw, youtube_video_id, youtube_url,
+                settings=self._resolve_settings(),
+            )
+
         transcript = await self._fetch_transcript_with_retry(
             youtube_url, info, resume_token=resume_token, webhook_url=webhook_url
         )
         result = _build_video_result(media, transcript)
 
         await self._write_cache(video_id, result)
+        await self._write_media(video_id, media)
         return result
 
     def _usable_cache(self, video_id: str):
@@ -144,6 +159,23 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         if cache is None:
             return
         await asyncio.to_thread(cache.set, video_id, result)
+
+    async def _read_media(self, video_id: str) -> MediaInfo | None:
+        """Read cached title/duration so a resume skips the metadata extract."""
+        cache = self._usable_cache(video_id)
+        if cache is None:
+            return None
+        media = await asyncio.to_thread(cache.get_media, video_id)
+        if media is not None:
+            logger.info("Media metadata cache hit", video_id=video_id)
+        return media
+
+    async def _write_media(self, video_id: str, media: MediaInfo) -> None:
+        """Cache title/duration so a later resume can skip the re-extract."""
+        cache = self._usable_cache(video_id)
+        if cache is None:
+            return
+        await asyncio.to_thread(cache.set_media, video_id, media.title, media.duration_seconds)
 
     async def _fetch_transcript_with_retry(
         self,

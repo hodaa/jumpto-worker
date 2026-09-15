@@ -1,15 +1,15 @@
-"""Unit tests for the worker-side Redis transcript cache."""
+"""Unit tests for the worker-side disk-backed transcript cache."""
 
 from types import SimpleNamespace
 
 import pytest
-from redis.exceptions import RedisError
 
 import app.providers.ytdlp as ytdlp_module
 from app.providers.base import VideoTranscriptResult
 from app.providers.models import TranscriptData, TranscriptWordData
 from app.storage.cache import (
-    TranscriptCache,
+    DiskBackedTranscriptCache,
+    NoOpTranscriptCache,
     _deserialize_result,
     _serialize_result,
     extract_youtube_video_id,
@@ -17,30 +17,6 @@ from app.storage.cache import (
 
 VIDEO_ID = "abc123xyz99"
 WATCH_URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
-
-
-class _FakeRedis:
-    """Minimal redis client stub backed by an in-memory dict."""
-
-    def __init__(self, store=None) -> None:
-        self.store = dict(store or {})
-        self.set_calls: list[tuple[str, str, int | None]] = []
-
-    def get(self, key: str):
-        return self.store.get(key)
-
-    def set(self, key: str, value: str, ex=None, nx: bool = False) -> bool | None:
-        if nx and key in self.store:
-            return None
-        self.store[key] = value
-        self.set_calls.append((key, value, ex))
-        return True
-
-    def eval(self, _script: str, _numkeys: int, key: str, owner: str) -> int:
-        if self.store.get(key) == owner:
-            del self.store[key]
-            return 1
-        return 0
 
 
 def _result() -> VideoTranscriptResult:
@@ -60,11 +36,16 @@ def _result() -> VideoTranscriptResult:
     )
 
 
-def _make_cache(monkeypatch, *, enabled: bool = True, ttl: int = 3600, store=None):
-    fake = _FakeRedis(store)
-    monkeypatch.setattr("app.storage.cache._redis.from_url", lambda *args, **kwargs: fake)
-    cache = TranscriptCache("redis://unused:6379/0", ttl, enabled=enabled)
-    return cache, fake
+def _disk_cache(tmp_path, *, ttl: int = 3600) -> DiskBackedTranscriptCache:
+    return DiskBackedTranscriptCache(
+        directory=str(tmp_path / "cache"),
+        ttl_seconds=ttl,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Video id extraction
+# ---------------------------------------------------------------------------
 
 
 class TestExtractYouTubeVideoId:
@@ -83,6 +64,11 @@ class TestExtractYouTubeVideoId:
     def test_empty_or_bad_url(self) -> None:
         assert extract_youtube_video_id("") == ""
         assert extract_youtube_video_id("https://www.youtube.com/playlist?list=xyz") == ""
+
+
+# ---------------------------------------------------------------------------
+# Serialization round-trip
+# ---------------------------------------------------------------------------
 
 
 class TestSerialization:
@@ -107,60 +93,135 @@ class TestSerialization:
         assert _deserialize_result("[]") is None
 
 
-class TestTranscriptCache:
-    def test_set_then_get_roundtrip(self, monkeypatch) -> None:
-        cache, fake = _make_cache(monkeypatch)
+# ---------------------------------------------------------------------------
+# DiskBackedTranscriptCache
+# ---------------------------------------------------------------------------
 
+
+class TestDiskBackedTranscriptCache:
+    def test_set_then_get_roundtrip(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
         cache.set(VIDEO_ID, _result())
 
-        assert fake.set_calls[0][0] == f"jumpto:transcript:{VIDEO_ID}"
-        assert fake.set_calls[0][2] == 3600  # TTL propagated
         cached = cache.get(VIDEO_ID)
         assert cached is not None and cached.transcript.text == "hello world"
 
-    def test_miss_returns_none(self, monkeypatch) -> None:
-        cache, _ = _make_cache(monkeypatch)
-
-        assert cache.get(VIDEO_ID) is None
-
-    def test_disabled_cache_never_reads_or_writes(self, monkeypatch) -> None:
-        cache, fake = _make_cache(monkeypatch, enabled=False)
-
-        assert cache.get(VIDEO_ID) is None
+    def test_namespace_is_prefixed(self, tmp_path) -> None:
+        cache = DiskBackedTranscriptCache(
+            directory=str(tmp_path / "cache"),
+            ttl_seconds=3600,
+            namespace="ns:v2:en",
+        )
         cache.set(VIDEO_ID, _result())
-        assert fake.store == {}
 
-    def test_redis_read_error_degrades_to_miss(self, monkeypatch) -> None:
-        def boom(*args, **kwargs):
-            raise RedisError("connection refused")
+        # The on-disk key includes the namespace.
+        key = f"ns:v2:en:{VIDEO_ID}"
+        assert cache._backend.get(key) is not None
 
-        cache, _ = _make_cache(monkeypatch)
-        monkeypatch.setattr(cache, "_client", type("Cl", (), {"get": boom})())
-
+    def test_miss_returns_none(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
         assert cache.get(VIDEO_ID) is None
 
-    def test_redis_write_error_is_best_effort(self, monkeypatch) -> None:
-        def boom(*args, **kwargs):
-            raise RedisError("connection refused")
+    def test_empty_video_id_returns_none(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        assert cache.get("") is None
+        cache.set("", _result())  # must not raise
 
-        cache, _ = _make_cache(monkeypatch)
-        monkeypatch.setattr(cache, "_client", type("Cl", (), {"set": boom})())
+    def test_corrupt_payload_returns_none(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        cache._backend.set(cache._key(VIDEO_ID), "not-valid-json")
+        assert cache.get(VIDEO_ID) is None
 
+    def test_disk_write_error_is_best_effort(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        # Force an error by replacing the backend with an object that raises on set.
+        cache._backend = type("Fake", (), {"set": staticmethod(lambda *a, **kw: (_ for _ in ()).throw(Exception("boom"))), "get": staticmethod(lambda *a, **kw: None)})()
         cache.set(VIDEO_ID, _result())  # must not raise
 
-    def test_lock_is_single_flight_and_owner_safe(self, monkeypatch) -> None:
-        cache, fake = _make_cache(monkeypatch)
+    def test_disk_read_error_degrades_to_miss(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        cache._backend = type("Fake", (), {"get": staticmethod(lambda *a, **kw: (_ for _ in ()).throw(Exception("boom")))})()
+        assert cache.get(VIDEO_ID) is None
 
-        acquired, owner = cache.acquire_lock(VIDEO_ID, "owner-a")
+    def test_media_set_then_get_roundtrip(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        cache.set_media(VIDEO_ID, "My Video", 120)
+        media = cache.get_media(VIDEO_ID)
+        assert media is not None
+        assert media.title == "My Video"
+        assert media.duration_seconds == 120
+
+    def test_media_miss_returns_none(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        assert cache.get_media(VIDEO_ID) is None
+
+    def test_media_empty_video_id_returns_none(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        assert cache.get_media("") is None
+        cache.set_media("", "X", 1)  # must not raise
+
+    def test_media_corrupt_entry_returns_none(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        cache._backend.set(cache._media_key(VIDEO_ID), "not-valid-json")
+        assert cache.get_media(VIDEO_ID) is None
+
+    def test_media_key_is_separate_from_transcript_key(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        cache.set(VIDEO_ID, _result())
+        cache.set_media(VIDEO_ID, "Meta", 50)
+        # Both should be readable independently.
+        assert cache.get(VIDEO_ID) is not None
+        assert cache.get_media(VIDEO_ID) is not None
+
+    def test_acquire_lock_is_single_flight(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        acquired, owner_a = cache.acquire_lock(VIDEO_ID, "owner-a")
         assert acquired is True
-        acquired_again, other_owner = cache.acquire_lock(VIDEO_ID, "owner-b")
-        assert acquired_again is False
-        assert other_owner == "owner-b"
 
-        cache.release_lock(VIDEO_ID, "owner-b")
-        assert f"jumpto:transcript:lock:{VIDEO_ID}" in fake.store
-        cache.release_lock(VIDEO_ID, owner)
-        assert f"jumpto:transcript:lock:{VIDEO_ID}" not in fake.store
+        acquired_b, owner_b = cache.acquire_lock(VIDEO_ID, "owner-b")
+        assert acquired_b is False
+        assert owner_b == "owner-b"
+
+        cache.release_lock(VIDEO_ID, owner_a)
+        # After release, a new acquisition should succeed.
+        acquired_c, _ = cache.acquire_lock(VIDEO_ID, "owner-c")
+        assert acquired_c is True
+
+
+# ---------------------------------------------------------------------------
+# NoOpTranscriptCache
+# ---------------------------------------------------------------------------
+
+
+class TestNoOpTranscriptCache:
+    def test_get_always_misses(self) -> None:
+        cache = NoOpTranscriptCache()
+        assert cache.get(VIDEO_ID) is None
+        assert cache.get_with_provider(VIDEO_ID) is None
+
+    def test_get_media_always_misses(self) -> None:
+        cache = NoOpTranscriptCache()
+        assert cache.get_media(VIDEO_ID) is None
+
+    def test_set_does_not_raise(self) -> None:
+        cache = NoOpTranscriptCache()
+        cache.set(VIDEO_ID, _result())
+
+    def test_set_media_does_not_raise(self) -> None:
+        cache = NoOpTranscriptCache()
+        cache.set_media(VIDEO_ID, "X", 1)
+
+    def test_acquire_and_release_do_not_raise(self) -> None:
+        cache = NoOpTranscriptCache()
+        acquired, owner = cache.acquire_lock(VIDEO_ID, "test-owner")
+        assert acquired is True
+        assert owner == "test-owner"
+        cache.release_lock(VIDEO_ID, "owner")
+
+
+# ---------------------------------------------------------------------------
+# Strategy integration — provider uses injected cache; live-gate respected.
+# ---------------------------------------------------------------------------
 
 
 class TestStrategyCaching:
@@ -174,9 +235,9 @@ class TestStrategyCaching:
         )
 
     @pytest.mark.asyncio
-    async def test_cache_hit_skips_yt_dlp(self, monkeypatch) -> None:
-        key = f"jumpto:transcript:{VIDEO_ID}"
-        cache, _ = _make_cache(monkeypatch, store={key: _serialize_result(_result())})
+    async def test_cache_hit_skips_yt_dlp(self, tmp_path, monkeypatch) -> None:
+        cache = _disk_cache(tmp_path)
+        cache.set(VIDEO_ID, _result())
 
         media_called = {"n": 0}
 
@@ -201,8 +262,8 @@ class TestStrategyCaching:
         assert transcript_called["n"] == 0
 
     @pytest.mark.asyncio
-    async def test_cache_miss_fetches_and_populates(self, monkeypatch, tmp_path) -> None:
-        cache, fake = _make_cache(monkeypatch)
+    async def test_cache_miss_fetches_and_populates(self, tmp_path, monkeypatch) -> None:
+        cache = _disk_cache(tmp_path)
 
         media = type("Media", (), {"title": "T", "duration_seconds": 120})()
         monkeypatch.setattr(
@@ -218,11 +279,11 @@ class TestStrategyCaching:
         result = await provider.fetch(WATCH_URL)
 
         assert result.transcript.text == "cached me"
-        assert f"jumpto:transcript:{VIDEO_ID}" in fake.store  # parsed from URL
+        assert cache.get(VIDEO_ID) is not None  # parsed from URL and stored
 
     @pytest.mark.asyncio
-    async def test_non_live_pipeline_does_not_use_cache(self, monkeypatch) -> None:
-        cache, fake = _make_cache(monkeypatch)
+    async def test_non_live_pipeline_does_not_use_cache(self, tmp_path, monkeypatch) -> None:
+        cache = _disk_cache(tmp_path)
 
         media = type("Media", (), {"title": "T", "duration_seconds": 120})()
         monkeypatch.setattr(
@@ -237,4 +298,59 @@ class TestStrategyCaching:
 
         await provider.fetch(WATCH_URL, VIDEO_ID)
 
-        assert fake.store == {}
+        assert cache.get(VIDEO_ID) is None  # cache never populated
+
+    @pytest.mark.asyncio
+    async def test_resume_skips_metadata_fetch_when_media_cached(self, tmp_path, monkeypatch) -> None:
+        """On resume with a metadata cache hit, get_media_info_with_raw must not run."""
+        cache = _disk_cache(tmp_path)
+        cache.set_media(VIDEO_ID, "Cached Title", 99)
+
+        media_called = {"n": 0}
+
+        def media_info(video_id, url, settings=None):
+            media_called["n"] += 1
+            raise AssertionError("get_media_info_with_raw must not run on resume")
+
+        monkeypatch.setattr(ytdlp_module, "get_media_info_with_raw", media_info)
+
+        async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
+            assert resume_token == "asm-123"
+            assert info is None  # info not needed — captions are skipped on resume
+            return TranscriptData(language="en", text="resumed transcript", words=[])
+
+        provider = self._provider(cache, live_calls=True)
+        monkeypatch.setattr(provider, "_fetch_transcript_with_retry", fetch_transcript)
+
+        result = await provider.fetch(WATCH_URL, VIDEO_ID, resume_token="asm-123")
+
+        assert result.title == "Cached Title"
+        assert result.duration_seconds == 99
+        assert result.transcript.text == "resumed transcript"
+        assert media_called["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_resume_falls_back_to_metadata_fetch_on_cache_miss(self, tmp_path, monkeypatch) -> None:
+        """On resume with a metadata cache miss, get_media_info_with_raw runs."""
+        cache = _disk_cache(tmp_path)
+
+        media = type("Media", (), {"title": "Fresh Title", "duration_seconds": 60})()
+        monkeypatch.setattr(
+            ytdlp_module, "get_media_info_with_raw", lambda video_id, url, settings=None: (media, {})
+        )
+
+        async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
+            assert resume_token == "asm-456"
+            return TranscriptData(language="en", text="fresh transcript", words=[])
+
+        provider = self._provider(cache, live_calls=True)
+        monkeypatch.setattr(provider, "_fetch_transcript_with_retry", fetch_transcript)
+
+        result = await provider.fetch(WATCH_URL, VIDEO_ID, resume_token="asm-456")
+
+        assert result.title == "Fresh Title"
+        assert result.transcript.text == "fresh transcript"
+        # Metadata should now be cached for a future resume.
+        cached_media = cache.get_media(VIDEO_ID)
+        assert cached_media is not None
+        assert cached_media.title == "Fresh Title"
