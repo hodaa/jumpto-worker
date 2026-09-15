@@ -49,6 +49,7 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
 
     name = "yt-dlp"
     supports_resume = True
+    supports_webhook = True
 
     def __init__(
         self,
@@ -107,7 +108,8 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
             return cached
 
         media, info = await asyncio.to_thread(
-            get_media_info_with_raw, youtube_video_id, youtube_url
+            get_media_info_with_raw, youtube_video_id, youtube_url,
+            settings=self._resolve_settings(),
         )
         transcript = await self._fetch_transcript_with_retry(
             youtube_url, info, resume_token=resume_token, webhook_url=webhook_url

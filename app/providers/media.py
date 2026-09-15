@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import yt_dlp
 
-from app.core.config import get_settings
+from app.core.config import Settings, _live_pipeline_enabled, get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.integrations.ytdlp import (
@@ -29,22 +29,30 @@ class MediaInfo:
     duration_seconds: int
 
 
-def get_media_info(video_id: str, youtube_url: str) -> MediaInfo:
+def get_media_info(video_id: str, youtube_url: str, settings: Settings | None = None) -> MediaInfo:
     """
     Return media info, using live yt-dlp only when explicitly enabled.
 
     Args:
         video_id: YouTube video ID
         youtube_url: Original YouTube URL
+        settings: Optional injected settings; when None the process-wide
+            singleton is used. Accepting an explicit instance lets the
+            composite strategy pass its injected settings instead of
+            re-reading the global singleton.
 
     Returns:
         MediaInfo with title and duration
     """
-    media, _ = get_media_info_with_raw(video_id, youtube_url)
+    media, _ = get_media_info_with_raw(video_id, youtube_url, settings=settings)
     return media
 
 
-def get_media_info_with_raw(video_id: str, youtube_url: str) -> tuple[MediaInfo, dict]:
+def get_media_info_with_raw(
+    video_id: str,
+    youtube_url: str,
+    settings: Settings | None = None,
+) -> tuple[MediaInfo, dict]:
     """
     Return media info plus the raw yt-dlp metadata dict, reusing a single
     ``extract_info`` call so downstream providers don't re-fetch it.
@@ -52,6 +60,8 @@ def get_media_info_with_raw(video_id: str, youtube_url: str) -> tuple[MediaInfo,
     Args:
         video_id: YouTube video ID
         youtube_url: Original YouTube URL
+        settings: Optional injected settings; when None the process-wide
+            singleton is used.
 
     Returns:
         A tuple of (MediaInfo, raw yt-dlp info dict).
@@ -61,13 +71,14 @@ def get_media_info_with_raw(video_id: str, youtube_url: str) -> tuple[MediaInfo,
             cannot fetch metadata, so the pipeline fails instead of fabricating
             deterministic fake data.
     """
-    if not get_settings().jumpto_live_external_calls:
+    settings = settings or get_settings()
+    if not _live_pipeline_enabled(settings):
         raise ExternalServiceError(
             "Live external calls are disabled; cannot fetch video metadata",
             service="yt-dlp",
         )
     try:
-        info = _fetch_from_yt_dlp(youtube_url)
+        info = _fetch_from_yt_dlp(youtube_url, settings=settings)
         media = MediaInfo(
             title=str(info.get("title") or "Untitled video"),
             duration_seconds=int(info.get("duration") or 0),
@@ -83,13 +94,13 @@ def get_media_info_with_raw(video_id: str, youtube_url: str) -> tuple[MediaInfo,
         ) from exc
 
 
-def _fetch_from_yt_dlp(youtube_url: str) -> dict:
+def _fetch_from_yt_dlp(youtube_url: str, settings: Settings | None = None) -> dict:
     """Fetch live metadata with yt-dlp (no download) and return the raw info dict.
 
     Transient ``DownloadError``s (rate limits, network blips, YouTube hiccups)
     are retried with a short backoff so a single failure doesn't kill the job.
     """
-    options = build_ydlp_options()
+    options = build_ydlp_options(settings=settings)
     last_error: yt_dlp.utils.DownloadError | None = None
     try:
         for attempt in range(_METADATA_RETRY_ATTEMPTS):

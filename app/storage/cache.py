@@ -56,15 +56,21 @@ def extract_youtube_video_id(youtube_url: str) -> str:
 
 
 def _cache_namespace(settings) -> str:
-    """Build a versioned cache namespace from transcript-affecting settings."""
-    values = (
-        getattr(settings, "transcriptfetch_lang", "en"),
-        getattr(settings, "transcriptfetch_mode", "auto"),
-        getattr(settings, "supadata_lang", "en"),
-        getattr(settings, "supadata_mode", "auto"),
-        getattr(settings, "vidwords_lang", "en"),
-    )
-    suffix = ":".join(re.sub(r"[^A-Za-z0-9_.-]", "_", str(value or "")) for value in values)
+    """Build a versioned cache namespace from each spec's declared cache fields.
+
+    Every provider spec declares which settings knobs affect the transcript it
+    returns (language, mode, etc.) via ``cache_config_fields``. The namespace
+    iterates specs in their canonical priority order and reads those attributes,
+    so adding a new provider's cache-affecting settings never requires editing
+    the cache module itself.
+    """
+    from app.providers.registry import ordered_specs
+
+    values = []
+    for spec in ordered_specs():
+        for name in spec.cache_config_fields:
+            values.append(getattr(settings, name, "") or "")
+    suffix = ":".join(re.sub(r"[^A-Za-z0-9_.-]", "_", str(v)) for v in values)
     return f"{_NAMESPACE}:v3:{suffix}"
 
 

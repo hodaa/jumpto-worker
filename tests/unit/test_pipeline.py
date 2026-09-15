@@ -18,17 +18,18 @@ from app.providers import (
 from app.providers import ytdlp as ytdlp_module
 from app.providers.registry import candidates as provider_candidates
 from app.providers.vidwords import VidWordsPermanentError
-from app.tasks import transcription as transcription_module
-from app.tasks.transcription import (
-    _build_submission,
-    _build_webhook_url,
-    _job_retry_countdown,
-    _perform_transcription,
-    _try_provider,
-    _user_safe_message,
-    download_and_transcribe,
+from app.services import jobs as jobs_module
+from app.services import pipeline as pipeline_module
+from app.services.pipeline import (
+    perform_transcription,
     run_pipeline,
+    try_provider,
+    user_safe_message,
 )
+from app.services.submissions import build_submission
+from app.services.webhooks import build_assembly_webhook_url
+from app.tasks import transcription as transcription_module
+from app.tasks.transcription import _job_retry_countdown, download_and_transcribe
 
 
 def _job() -> JobData:
@@ -46,7 +47,7 @@ class TestBuildSubmission:
     """Tests for building a transcript submission payload."""
 
     def test_build_submission_normalizes_words(self) -> None:
-        submission = _build_submission(
+        submission = build_submission(
             title=_media().title,
             duration_seconds=_media().duration_seconds,
             transcript=_transcript(),
@@ -71,7 +72,7 @@ class TestBuildSubmission:
             ],
         )
 
-        submission = _build_submission(
+        submission = build_submission(
             title=_media().title,
             duration_seconds=_media().duration_seconds,
             transcript=transcript,
@@ -88,11 +89,11 @@ class TestRunPipeline:
     @pytest.mark.asyncio
     async def test_happy_path_calls_all_steps(self, monkeypatch) -> None:
         client = _FakeClient()
-        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+        monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
 
         settings = _settings(live_calls=False)
-        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
-        monkeypatch.setattr(transcription_module, "_perform_transcription", _perform_mock)
+        monkeypatch.setattr(pipeline_module, "get_settings", lambda: settings)
+        monkeypatch.setattr(pipeline_module, "perform_transcription", _perform_mock)
 
         result = await run_pipeline("job-1")
 
@@ -103,10 +104,10 @@ class TestRunPipeline:
     @pytest.mark.asyncio
     async def test_transcribes_non_pending_job_without_advancing(self, monkeypatch) -> None:
         client = _FakeClient(status="completed")
-        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+        monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
         settings = _settings(live_calls=False)
-        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
-        monkeypatch.setattr(transcription_module, "_perform_transcription", _perform_mock)
+        monkeypatch.setattr(pipeline_module, "get_settings", lambda: settings)
+        monkeypatch.setattr(pipeline_module, "perform_transcription", _perform_mock)
 
         result = await run_pipeline("job-1")
 
@@ -117,15 +118,15 @@ class TestRunPipeline:
     @pytest.mark.asyncio
     async def test_failure_marks_job_failed(self, monkeypatch) -> None:
         client = _FakeClient()
-        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+        monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
 
         settings = _settings(live_calls=False)
-        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
+        monkeypatch.setattr(pipeline_module, "get_settings", lambda: settings)
 
         def boom(job, resume_token="", resume_provider=""):
             raise RuntimeError("boom")
 
-        monkeypatch.setattr(transcription_module, "_perform_transcription", boom)
+        monkeypatch.setattr(pipeline_module, "perform_transcription", boom)
 
         with pytest.raises(RuntimeError):
             await run_pipeline("job-1")
@@ -136,12 +137,12 @@ class TestRunPipeline:
     @pytest.mark.asyncio
     async def test_first_attempt_advances_then_raises_pending(self, monkeypatch) -> None:
         client = _FakeClient()
-        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+        monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
 
         def pending(job, resume_token="", resume_provider=""):
             raise TranscriptJobPending(provider="supadata", resume_token="job-x")
 
-        monkeypatch.setattr(transcription_module, "_perform_transcription", pending)
+        monkeypatch.setattr(pipeline_module, "perform_transcription", pending)
 
         with pytest.raises(TranscriptJobPending):
             await run_pipeline("job-1")
@@ -152,12 +153,12 @@ class TestRunPipeline:
     @pytest.mark.asyncio
     async def test_resume_pending_is_not_advanced_or_failed(self, monkeypatch) -> None:
         client = _FakeClient(status="processing")
-        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+        monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
 
         def pending(job, resume_token="", resume_provider=""):
             raise TranscriptJobPending(provider="supadata", resume_token="job-x")
 
-        monkeypatch.setattr(transcription_module, "_perform_transcription", pending)
+        monkeypatch.setattr(pipeline_module, "perform_transcription", pending)
 
         with pytest.raises(TranscriptJobPending):
             await run_pipeline("job-1", resume_token="job-x", resume_provider="supadata")
@@ -167,9 +168,9 @@ class TestRunPipeline:
 
     def test_user_safe_message_maps_errors(self) -> None:
         assert (
-            _user_safe_message(RuntimeError("x")) == "Transcription failed. Please try again later."
+            user_safe_message(RuntimeError("x")) == "Transcription failed. Please try again later."
         )
-        assert "timed out" in _user_safe_message(TimeoutError())
+        assert "timed out" in user_safe_message(TimeoutError())
 
 
 class TestFetchTranscriptWithRetry:
@@ -390,9 +391,9 @@ class TestPerformTranscription:
         provider = SimpleNamespace(
             name="vidwords", supports_resume=False, fetch=AsyncMock(return_value=_cloud_result())
         )
-        monkeypatch.setattr(transcription_module, "candidates", lambda settings: [provider])
+        monkeypatch.setattr(pipeline_module, "candidates", lambda settings: [provider])
 
-        submission = await _perform_transcription(_job())
+        submission = await perform_transcription(_job())
 
         assert submission.title == "Me at the zoo"
         assert submission.duration_seconds == 19
@@ -406,9 +407,9 @@ class TestPerformTranscription:
             name="vidwords", supports_resume=False, fetch=AsyncMock(return_value=None)
         )
         ytdlp = self._fallback()
-        monkeypatch.setattr(transcription_module, "candidates", lambda settings: [provider, ytdlp])
+        monkeypatch.setattr(pipeline_module, "candidates", lambda settings: [provider, ytdlp])
 
-        submission = await _perform_transcription(_job())
+        submission = await perform_transcription(_job())
 
         assert submission.provider == "yt-dlp"
         assert submission.title == "Fallback Video"
@@ -426,10 +427,10 @@ class TestPerformTranscription:
             ),
         )
         ytdlp = self._fallback()
-        monkeypatch.setattr(transcription_module, "candidates", lambda settings: [provider, ytdlp])
+        monkeypatch.setattr(pipeline_module, "candidates", lambda settings: [provider, ytdlp])
 
         with pytest.raises(VidWordsPermanentError):
-            await _perform_transcription(_job())
+            await perform_transcription(_job())
 
         ytdlp.fetch.assert_not_awaited()
 
@@ -439,9 +440,9 @@ class TestPerformTranscription:
             name="supadata", supports_resume=True, fetch=AsyncMock(return_value=_cloud_result())
         )
         ytdlp = self._fallback()
-        monkeypatch.setattr(transcription_module, "candidates", lambda settings: [provider, ytdlp])
+        monkeypatch.setattr(pipeline_module, "candidates", lambda settings: [provider, ytdlp])
 
-        submission = await _perform_transcription(
+        submission = await perform_transcription(
             _job(), resume_token="job-x", resume_provider="supadata"
         )
 
@@ -459,9 +460,9 @@ class TestPerformTranscription:
             fetch=AsyncMock(side_effect=ExternalServiceError("oops", service="vidwords")),
         )
         ytdlp = self._fallback()
-        monkeypatch.setattr(transcription_module, "candidates", lambda settings: [provider, ytdlp])
+        monkeypatch.setattr(pipeline_module, "candidates", lambda settings: [provider, ytdlp])
 
-        submission = await _perform_transcription(_job())
+        submission = await perform_transcription(_job())
 
         assert submission.provider == "yt-dlp"
         ytdlp.fetch.assert_awaited_once()
@@ -469,9 +470,9 @@ class TestPerformTranscription:
     @pytest.mark.asyncio
     async def test_no_configured_provider_uses_ytdlp_only(self, monkeypatch) -> None:
         ytdlp = self._fallback()
-        monkeypatch.setattr(transcription_module, "candidates", lambda settings: [ytdlp])
+        monkeypatch.setattr(pipeline_module, "candidates", lambda settings: [ytdlp])
 
-        submission = await _perform_transcription(_job())
+        submission = await perform_transcription(_job())
 
         assert submission.provider == "yt-dlp"
         ytdlp.fetch.assert_awaited_once()
@@ -482,9 +483,9 @@ class TestPerformTranscription:
             name="vidwords", supports_resume=False, fetch=AsyncMock(return_value=None)
         )
         ytdlp = self._fallback()
-        monkeypatch.setattr(transcription_module, "candidates", lambda settings: [provider, ytdlp])
+        monkeypatch.setattr(pipeline_module, "candidates", lambda settings: [provider, ytdlp])
 
-        submission = await _perform_transcription(
+        submission = await perform_transcription(
             _job(), resume_token="job-x", resume_provider="yt-dlp"
         )
 
@@ -504,10 +505,10 @@ class TestPerformTranscription:
         ytdlp = SimpleNamespace(
             name="yt-dlp", supports_resume=True, fetch=AsyncMock(return_value=None)
         )
-        monkeypatch.setattr(transcription_module, "candidates", lambda settings: [provider, ytdlp])
+        monkeypatch.setattr(pipeline_module, "candidates", lambda settings: [provider, ytdlp])
 
         with pytest.raises(ExternalServiceError):
-            await _perform_transcription(_job())
+            await perform_transcription(_job())
 
 
 class TestCandidateProviders:
@@ -576,14 +577,14 @@ class TestFailureMarking:
                 raise RuntimeError("marking failed")
 
         client = _RaisingClient()
-        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+        monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
         settings = _settings(live_calls=False)
-        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
+        monkeypatch.setattr(pipeline_module, "get_settings", lambda: settings)
 
         def boom(job, resume_token="", resume_provider=""):
             raise RuntimeError("transcription boom")
 
-        monkeypatch.setattr(transcription_module, "_perform_transcription", boom)
+        monkeypatch.setattr(pipeline_module, "perform_transcription", boom)
 
         with pytest.raises(RuntimeError):
             await run_pipeline("job-1")
@@ -647,9 +648,9 @@ class TestDownloadAndTranscribe:
         monkeypatch.setattr(transcription_module, "run_pipeline", self._pending_pipeline)
 
         client = _FakeClient()
-        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+        monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
         settings = _settings(live_calls=False)
-        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
+        monkeypatch.setattr(jobs_module, "get_settings", lambda: settings)
 
         stub = _StubTask(retries=transcription_module._CLOUD_JOB_ATTEMPTS - 1)
         with pytest.raises(TranscriptJobPending):
@@ -665,9 +666,9 @@ class TestDownloadAndTranscribe:
         )
 
         client = _FakeClient()
-        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+        monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
         settings = _settings(live_calls=False)
-        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
+        monkeypatch.setattr(jobs_module, "get_settings", lambda: settings)
 
         stub = _StubTask(retries=0)
         with pytest.raises(TranscriptJobPending):
@@ -716,9 +717,9 @@ class TestDownloadAndTranscribe:
         monkeypatch.setattr(transcription_module, "run_pipeline", webhook_pending)
 
         client = _FakeClient()
-        monkeypatch.setattr(transcription_module, "BackendClient", lambda base, key: client)
+        monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
         settings = _settings(live_calls=False)
-        monkeypatch.setattr(transcription_module, "get_settings", lambda: settings)
+        monkeypatch.setattr(jobs_module, "get_settings", lambda: settings)
 
         stub = _StubTask(retries=0)
         result = download_and_transcribe.run.__func__(stub, "job-1")
@@ -737,20 +738,20 @@ class TestWebhookRouting:
         return SimpleNamespace(assembly_webhook_base_url=base)
 
     def test_empty_when_webhooks_not_configured(self) -> None:
-        assert _build_webhook_url(_settings(live_calls=True), "job-1", "yt-dlp") == ""
+        assert build_assembly_webhook_url(_settings(live_calls=True), "job-1", "yt-dlp") == ""
 
     def test_empty_without_job_id(self) -> None:
         settings = self._settings("https://backend.test/api/webhooks/assembly")
-        assert _build_webhook_url(settings, "", "yt-dlp") == ""
+        assert build_assembly_webhook_url(settings, "", "yt-dlp") == ""
 
     def test_appends_job_context(self) -> None:
         settings = self._settings("https://backend.test/api/webhooks/assembly")
-        url = _build_webhook_url(settings, "job-1", "yt-dlp")
+        url = build_assembly_webhook_url(settings, "job-1", "yt-dlp")
         assert url == "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=yt-dlp"
 
     def test_joins_existing_query_string(self) -> None:
         settings = self._settings("https://backend.test/api/webhooks/assembly?src=asm")
-        url = _build_webhook_url(settings, "job-1", "yt-dlp")
+        url = build_assembly_webhook_url(settings, "job-1", "yt-dlp")
         assert url == (
             "https://backend.test/api/webhooks/assembly?src=asm&job_id=job-1&provider=yt-dlp"
         )
@@ -760,11 +761,14 @@ class TestWebhookRouting:
         self, monkeypatch
     ) -> None:
         provider = SimpleNamespace(
-            name="yt-dlp", supports_resume=True, fetch=AsyncMock(return_value=_ytdlp_result())
+            name="yt-dlp",
+            supports_resume=True,
+            supports_webhook=True,
+            fetch=AsyncMock(return_value=_ytdlp_result()),
         )
         webhook = "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=yt-dlp"
 
-        await _try_provider(provider, _job(), webhook_url=webhook)
+        await try_provider(provider, _job(), webhook_url=webhook)
 
         provider.fetch.assert_awaited_once_with(
             "https://www.youtube.com/watch?v=abcde12345",
@@ -774,7 +778,7 @@ class TestWebhookRouting:
         )
 
         provider.fetch.reset_mock()
-        await _try_provider(
+        await try_provider(
             provider,
             _job(),
             resume_token="asm-1",
@@ -883,7 +887,7 @@ def _ytdlp_result() -> VideoTranscriptResult:
 
 async def _perform_mock(job, resume_token="", resume_provider=""):
     """Mock the transcription step to return a submission."""
-    return _build_submission(
+    return build_submission(
         title=_media().title,
         duration_seconds=_media().duration_seconds,
         transcript=_transcript(),

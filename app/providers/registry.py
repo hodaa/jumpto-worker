@@ -17,6 +17,11 @@ class TranscriptProviderSpec:
     ``uses_cloud`` records whether the strategy needs live external API calls —
     a deployment property kept here rather than on the strategy interface so
     strategies stay pure transcript behavior.
+
+    ``cache_config_fields`` lists the settings attribute names whose values
+    change what transcript a provider returns (language, mode, ...). The worker
+    transcript cache uses them to version its namespace, so a provider declares
+    its own cache-affecting knobs instead of the cache module hardcoding them.
     """
 
     name: str
@@ -24,6 +29,7 @@ class TranscriptProviderSpec:
     order: int
     description: str = ""
     uses_cloud: bool = True
+    cache_config_fields: tuple[str, ...] = ()
 
 
 _REGISTRY: dict[str, TranscriptProviderSpec] = {}
@@ -31,11 +37,23 @@ _PROVIDERS_LOADED = False
 
 
 def _ensure_registered() -> None:
-    """Import every provider module so its module-level registration runs."""
+    """Import every provider module so its module-level registration runs.
+
+    This is the closed-registry extension point: adding a provider means
+    writing a module with a spec and adding one import line here. ``_REGISTRY``
+    is never mutated by the registry itself; each provider module calls
+    ``register_provider()`` at import time.
+    """
     global _PROVIDERS_LOADED
     if _PROVIDERS_LOADED:
         return
     _PROVIDERS_LOADED = True
+    from app.providers import (
+        supadata,  # noqa: F401
+        transcriptfetch,  # noqa: F401
+        vidwords,  # noqa: F401
+        ytdlp,  # noqa: F401
+    )
 
 
 def register_provider(spec: TranscriptProviderSpec) -> None:

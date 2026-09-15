@@ -315,5 +315,6 @@ register_provider(
         build=_build,
         order=20,
         description="Supadata YouTube transcripts/metadata API (async AI jobs).",
+        cache_config_fields=("supadata_lang", "supadata_mode"),
     )
 )

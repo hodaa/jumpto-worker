@@ -44,6 +44,7 @@ class TranscriptProviderStrategy(ABC):
 
     name: str = ""
     supports_resume: bool = False
+    supports_webhook: bool = False
 
     @abstractmethod
     async def fetch(

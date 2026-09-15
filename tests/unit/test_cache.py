@@ -180,7 +180,7 @@ class TestStrategyCaching:
 
         media_called = {"n": 0}
 
-        def media_info(video_id, url):
+        def media_info(video_id, url, settings=None):
             media_called["n"] += 1
             raise AssertionError("media fetch must not run on cache hit")
 
@@ -206,7 +206,7 @@ class TestStrategyCaching:
 
         media = type("Media", (), {"title": "T", "duration_seconds": 120})()
         monkeypatch.setattr(
-            ytdlp_module, "get_media_info_with_raw", lambda video_id, url: (media, {})
+            ytdlp_module, "get_media_info_with_raw", lambda video_id, url, settings=None: (media, {})
         )
 
         async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
@@ -226,7 +226,7 @@ class TestStrategyCaching:
 
         media = type("Media", (), {"title": "T", "duration_seconds": 120})()
         monkeypatch.setattr(
-            ytdlp_module, "get_media_info_with_raw", lambda video_id, url: (media, None)
+            ytdlp_module, "get_media_info_with_raw", lambda video_id, url, settings=None: (media, None)
         )
 
         async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):

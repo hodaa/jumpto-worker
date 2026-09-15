@@ -319,5 +319,6 @@ register_provider(
         build=_build,
         order=10,
         description="TranscriptFetch YouTube transcripts API.",
+        cache_config_fields=("transcriptfetch_lang", "transcriptfetch_mode"),
     )
 )

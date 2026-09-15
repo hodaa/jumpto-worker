@@ -15,11 +15,12 @@ interchangeable at the registry level (`app/providers/registry.py`):
 | `vidwords`       | `VidWordsTranscriptProvider`              | `app/providers/vidwords.py`     |
 
 - Every provider implements `TranscriptProviderStrategy` (`app/providers/base.py`):
-  it has a stable `name`, a `supports_resume` flag, and a `fetch()` returning
-  `VideoTranscriptResult | None` (``None`` = soft miss, so the pipeline tries the
-  next candidate) or raising `ExternalServiceError`. `fetch()` accepts an
-  optional keyword-only `webhook_url` (an opaque public callback URL, consumed
-  only by the Assembly path).
+  it has a stable `name`, `supports_resume` and `supports_webhook` flags, and a
+  `fetch()` returning `VideoTranscriptResult | None` (``None`` = soft miss, so
+  the pipeline tries the next candidate) or raising `ExternalServiceError`.
+  `fetch()` accepts an optional keyword-only `webhook_url` (an opaque public
+  callback URL, consumed only by the Assembly path, which declares
+  ``supports_webhook``).
 - **All four are providers.** Do not model "cloud vs local" as a first-class
   concept; whether a provider needs API keys/network access is an internal
   detail. Providers are kept independently switchable via `DEFAULT_VIDEO_PROVIDER`
@@ -30,10 +31,14 @@ interchangeable at the registry level (`app/providers/registry.py`):
 - `supports_resume` marks strategies that can honour a `resume_token` (Supadata,
   yt-dlp); the pipeline only routes resumes to them. `fetch()` returns `None`
   on a soft miss for cloud strategies; the terminal yt-dlp strategy never
-  returns `None` — it produces a result or raises.
+  returns `None` — it produces a result or raises. `supports_webhook` marks
+  strategies that consume a completion callback URL; the pipeline only forwards
+  one to strategies that declare it.
 - Deployment metadata that is not transcript behavior (e.g. `uses_cloud` —
-  whether the strategy needs live external API calls) lives on the **registry
-  spec** (`TranscriptProviderSpec`), not on the strategy interface.
+  whether the strategy needs live external API calls, or
+  `cache_config_fields` — which settings knobs change a provider's output and
+  therefore version its cache namespace) lives on the **registry spec**
+  (`TranscriptProviderSpec`), not on the strategy interface.
 
 ### Self-registration (closed registry)
 
@@ -75,7 +80,10 @@ Provider modules are split by concern:
   to next provider), `PermanentExternalServiceError` (fails the job),
   `TranscriptJobPending` (async job still processing, may resume), and
   `BackendCommunicationError` (producer API failures) — don't add finer
-  subclasses unless a consumer needs them.
+  subclasses unless a consumer needs them. `PermanentExternalServiceError` and
+  `TranscriptJobPending` are **siblings** of `ExternalServiceError` (both derive
+  from `DomainError`), never subclasses: their meaning is the opposite of a soft
+  miss, so `except ExternalServiceError` must never swallow them.
 - `app/providers/models.py` — shared domain types: `TranscriptData`,
   `TranscriptWordData`, and the `TranscriptJobPending` signal.
 - `app/providers/transcript.py` — the YouTube caption service + VTT parsing.
@@ -97,7 +105,8 @@ call sites previously caused a 403 regression — keep it centralized.
 
 ## Pipeline flow
 
-`app/tasks/transcription.py` runs in this order:
+`app/services/pipeline.py` (orchestrated by the thin Celery task
+`app/tasks/transcription.py`) runs in this order:
 
 1. `registry.candidates(settings)` resolves the ordered chain of providers from
    settings: either the explicit `provider_chain` list
@@ -105,16 +114,40 @@ call sites previously caused a 403 regression — keep it centralized.
    — `DEFAULT_VIDEO_PROVIDER` first, then `yt-dlp` as the always-available
    fallback. Unknown or unconfigured providers are silently skipped; cloud
    providers are skipped when live calls are off.
-2. `_try_provider()` calls each candidate's `fetch()`, routing resumes by
+2. `try_provider()` calls each candidate's `fetch()`, routing resumes by
    provider `name`, and returns the first non-`None` result. `fetch()` accepts
    an optional keyword-only `webhook_url` (ignored by every strategy except
-   Assembly); the pipeline builds it per job via `_build_webhook_url()`.
-3. The result is submitted via `_build_result_submission()`.
+   Assembly); the pipeline builds it per job via
+   `build_assembly_webhook_url()` (`app/services/webhooks.py`) and forwards it
+   only to strategies declaring `supports_webhook`.
+3. The result is submitted via `build_result_submission()`
+   (`app/services/submissions.py`) through the backend `JobService`
+   (`app/services/jobs.py`).
 
 `_live_pipeline_enabled()` gates whether live external calls are allowed
 (`JUMPTO_LIVE_EXTERNAL_CALLS`); treat the gate as a runtime switch, not a
 provider-category property. When disabled, live data is never fabricated —
 jobs fail with `ExternalServiceError`.
+
+## Service layer
+
+`app/tasks/transcription.py` is a scheduling shell; the orchestration it used
+to own lives in `app/services/`, one concern per module:
+
+- `event_loop.py` — the process-wide asyncio event loop (`run_async`) and its
+  atexit teardown.
+- `webhooks.py` — `build_assembly_webhook_url()` (completion callback URLs).
+- `submissions.py` — `build_submission()` / `build_result_submission()`.
+- `jobs.py` — `JobService` (backend client lifecycle: load/advance, submit,
+  best-effort fail, close) plus `fail_job()` for out-of-pipeline failure
+  marking.
+- `pipeline.py` — `run_pipeline()`, `perform_transcription()`, `try_provider()`,
+  `user_safe_message()` and the user-safe message constants.
+
+The task owns Celery concerns only: retry semantics, the async-job wait budget
+(`_CLOUD_JOB_ATTEMPTS`, `_job_retry_countdown`), its own task-side failure
+message (`_CLOUD_JOB_TIMEOUT_SAFE_MESSAGE`), and webhook-driven clean exit.
+Nothing above it shares code with the task module.
 
 ## Completion webhooks (Assembly)
 
@@ -123,7 +156,7 @@ When `ASSEMBLY_WEBHOOK_BASE_URL` is set, the worker stops poller-retrying and
 lets Assembly deliver completion out-of-band:
 
 1. The pipeline builds a callback URL — ``<base>?job_id=<job_id>&provider=yt-dlp``
-   (`app/tasks/transcription.py:_build_webhook_url`) and passes it to
+   (`app/services/webhooks.py:_build_assembly_webhook_url`) and passes it to
    `AssemblyTranscriptService.fetch(..., webhook_url=...)`.
 2. Assembly submits the transcript with that `webhook_url`; a still-processing
    poll raises `TranscriptJobPending(..., webhook=True)`.
@@ -154,24 +187,42 @@ worker no longer holds a retry budget for them.
 jobs over the broker. Change it via `CELERY_APP_NAME` only in coordination
 with producers; the default must stay stable.
 
-## SOLID principles
+## SOLID compliance rules
 
-Every new feature and every new piece of code must follow SOLID:
+Every new feature and every new piece of code must follow SOLID. These are the
+concrete rules the pipeline already follows — keep them, and apply them to new
+code:
 
 - **S — Single Responsibility**: one module, one class, one function — one
-  reason to change. If a function mixes orchestration with mapping, split it.
+  reason to change. The Celery task is a scheduling shell; orchestration lives
+  in `app/services/`, one concern per module (pipeline, jobs, submissions,
+  webhooks, event loop). If a function mixes orchestration with mapping, split
+  it into the owning service module.
 - **O — Open/Closed**: extend via new modules/classes, not by editing existing
-  ones. Provider self-registration, env-driven chains, spec metadata — these
-  keep the pipeline open to new providers without code edits.
-- **L — Liskov Substitution**: subclasses must honour the base-class contract.
-  Providers return `VideoTranscriptResult | None`; a soft miss (`None`) is
-  never confused with a terminal failure (`ExternalServiceError`).
-- **I — Interface Segregation**: keep interfaces minimal. The strategy exposes
-  `name`, `supports_resume`, `fetch()`. Deployment metadata (`uses_cloud`) lives
-  on the registry spec, not the strategy.
-- **D — Dependency Inversion**: depend on abstractions, not concretions. High-level
-  pipeline code depends on the registry/spec, not concrete providers. Inject
-  collaborators (settings, services, factories) rather than importing concrete
-  classes at call time. `get_settings()` singletons are acceptable for
-  process-wide config but should not leak into leaf services that need
-  testability.
+  ones. The provider registry self-registers (a new provider = a new module via
+  `register_provider()` + one import line in `_ensure_registered()`); the
+  transcript cache stays closed because cache-affecting settings are declared
+  by each provider spec via `cache_config_fields`, read by
+  `app/storage/cache.py::_cache_namespace` — never a hard-coded list in the
+  cache module.
+- **L — Liskov Substitution**: subclasses must honour the base-class contract,
+  and error classes must not invert their base's meaning. `TranscriptJobPending`
+  and `PermanentExternalServiceError` are **siblings** of `ExternalServiceError`
+  (all derive from `DomainError`), never subclasses — `except
+  ExternalServiceError` means "soft miss, fall through" and must never swallow a
+  terminal or pending outcome.
+- **I — Interface Segregation**: keep interfaces minimal; declare capabilities,
+  don't sniff internals. The strategy exposes `name`, `supports_resume`,
+  `supports_webhook`, `fetch()`. Deployment metadata (`uses_cloud`) and
+  cache-affecting settings (`cache_config_fields`) live on `TranscriptProviderSpec`,
+  not the strategy. `try_provider()` forwards the `webhook_url` only to
+  strategies declaring `supports_webhook` — never a hard-coded name list.
+- **D — Dependency Inversion**: depend on abstractions, not concretions.
+  High-level pipeline code depends on the registry/spec and `JobService`, not
+  concrete providers or `BackendClient`. Inject collaborators (settings,
+  services, client factories): `YtDlpTranscriptProvider` accepts injected
+  `settings`, and leaf services (`media.py`, `build_ydlp_options`) accept an
+  optional `settings=` override instead of re-reading the singleton, so tests
+  inject fakes instead of monkeypatching module globals. `get_settings()`
+  singletons are acceptable for process-wide config but should not leak into
+  leaf services that need testability.

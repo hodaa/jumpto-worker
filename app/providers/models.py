@@ -7,10 +7,10 @@ These are pure data; provider and pipeline code depends on them.
 from dataclasses import dataclass
 from typing import Any
 
-from app.core.exceptions import ExternalServiceError
+from app.core.exceptions import DomainError
 
 
-class TranscriptJobPending(ExternalServiceError):
+class TranscriptJobPending(DomainError):
     """A cloud provider escalated transcription to an async job not yet done.
 
     Raised by providers that queue work on their side (e.g. Supadata AI
@@ -25,6 +25,11 @@ class TranscriptJobPending(ExternalServiceError):
     externally wired webhook (the submit already armed it); the pipeline must
     end the task cleanly instead of poller-retrying, since Assembly waits for
     the async transcription that outlasts the local retry budget.
+
+    Deliberately a *sibling* of :class:`ExternalServiceError` rather than a
+    subclass: ``except ExternalServiceError`` means "soft miss, move to the
+    next provider", and this signal must never be swallowed by it — it has to
+    bubble up so the caller retries or ends the job.
     """
 
     def __init__(
@@ -43,8 +48,12 @@ class TranscriptJobPending(ExternalServiceError):
         self.webhook = webhook
         super().__init__(
             message,
-            service=provider,
-            details={**(details or {}), "resume_token": resume_token},
+            code="TRANSCRIPT_JOB_PENDING",
+            details={
+                **({"service": provider} if provider else {}),
+                **(details or {}),
+                "resume_token": resume_token,
+            },
         )
 
 

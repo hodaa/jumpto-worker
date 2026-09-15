@@ -244,5 +244,6 @@ register_provider(
         build=_build,
         order=30,
         description="VidWords YouTube transcripts API.",
+        cache_config_fields=("vidwords_lang",),
     )
 )

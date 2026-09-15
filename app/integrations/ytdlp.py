@@ -95,16 +95,22 @@ def release_temp_cookie(options: dict) -> None:
         _temp_cookie_copies.remove(cookie)
 
 
-def build_ydlp_options(**overrides: object) -> dict:
+def build_ydlp_options(*, settings=None, **overrides: object) -> dict:
     """
     Build a base yt-dlp options dict wired with the shared cookie file.
+
+    ``settings`` is an optional injected instance; when ``None`` the process-wide
+    singleton is read. Accepting an explicit instance lets leaf callers that
+    already hold a reference pass it through instead of re-reading the global,
+    which makes the concrete call-site testable without monkeypatching.
 
     The cookie file is copied to a writable temp file first, so yt-dlp can
     read and refresh it even when the mounted source is read-only.
 
     Any ``overrides`` are merged on top of the base options.
     """
-    settings = get_settings()
+    if settings is None:
+        settings = get_settings()
     options: dict = {
         "quiet": True,
         "no_warnings": True,
