@@ -23,10 +23,11 @@ RUN apt-get update \
         curl \
         ca-certificates \
         ffmpeg \
-    && curl -fsSL https://deno.land/install.sh | sh \
-    && ln -s /root/.deno/bin/deno /usr/local/bin/deno \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deno.land/install.sh | sh \
+    && ln -s /root/.deno/bin/deno /usr/local/bin/deno
 
 # Copy only the installed Python packages from builder
 COPY --from=builder /install /usr/local
