@@ -64,6 +64,7 @@ jobs:
           key: ${{ secrets.ORACLE_SSH_KEY }}
           script: |
             cd ~/jumpto-worker
+            git pull origin main
             export IMAGE_NAME=ghcr.io/${{ github.repository }}
             export APP_VERSION=${{ github.sha }}
             docker compose -f docker-compose.prod.yml pull
