@@ -1,0 +1,52 @@
+  services:
+    bgutil-pot:
+      image: brainicism/bgutil-ytdlp-pot-provider
+      container_name: bgutil-pot
+      restart: unless-stopped
+
+
+    worker:
+      image: ${IMAGE_NAME}:${APP_VERSION}
+      container_name: jumpto-worker
+      restart: unless-stopped
+      env_file:
+        - .env
+      environment:
+        # Point yt-dlp at the bgutil PO-token provider container (service DNS).
+        YTDLP_BGUTIL_URL: http://bgutil-pot:4416
+      ports:
+        # debugpy remote attach (VSCode "Debugger: Attach" on localhost:5678).
+        # Nothing binds this port until the worker process calls
+        # debugpy.listen(); the default celery command does not.
+        - "127.0.0.1:5678:5678"
+      volumes:
+        # Host cookie file to mount: default /etc/jumpto/cookies.txt (VPS),
+        # override with COOKIE_FILE for local dev where /etc/jumpto may not exist.
+        - ${COOKIE_FILE:-/etc/jumpto/cookies.txt}:/etc/jumpto/cookies.txt:ro
+        # Writable marker that requests a host-side cookie refresh.
+        - /etc/jumpto/state:/var/lib/jumpto/state
+      depends_on:
+        - bgutil-pot
+      command:
+        - celery
+        - -A
+        - app.tasks.celery_app.celery_app
+        - worker
+        - --loglevel=info
+        - --hostname=jumpto-worker  
+    
+    chromium:
+      build:
+        context: ./scripts
+        dockerfile: chromium-cdp-Dockerfile
+      image: chromium-cdp
+      container_name: chromium
+      restart: unless-stopped
+      volumes:
+        - /etc/jumpto/chromium/profile:/config
+        - /etc/jumpto:/etc/jumpto
+        - /etc/localtime:/etc/localtime:ro
+      ports:
+        - "127.0.0.1:3001:3001"
+      expose:
+        - "9222"
