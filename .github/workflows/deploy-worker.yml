@@ -54,7 +54,6 @@ jobs:
         with:
           context: .
           push: true
-          platforms: linux/arm64
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
 
       - name: Deploy to Oracle
