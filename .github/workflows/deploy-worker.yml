@@ -64,8 +64,33 @@ jobs:
           key: ${{ secrets.ORACLE_SSH_KEY }}
           script: |
             cd ~/jumpto-worker
-            git pull origin main
             export IMAGE_NAME=ghcr.io/${{ github.repository }}
             export APP_VERSION=${{ github.sha }}
+
+            # 1. Remember currently running version
+            CURRENT_IMAGE=$(docker inspect jumpto-worker --format '{{.Config.Image}}')
+            PREVIOUS_VERSION="${CURRENT_IMAGE##*:}"
+
+            echo "Previous version: $PREVIOUS_VERSION"
+            echo "New version: $APP_VERSION"
+
+            # 2. Deploy new version
             docker compose -f docker-compose.prod.yml pull
             docker compose -f docker-compose.prod.yml up -d
+
+            # 3. Health check
+            sleep 10
+
+            if ! ./health-check.sh; then
+              echo "Deployment failed. Rolling back..."
+
+              # 4. Rollback
+              export APP_VERSION="$PREVIOUS_VERSION"
+
+              docker compose -f docker-compose.prod.yml pull
+              docker compose -f docker-compose.prod.yml up -d
+
+              exit 1
+            fi
+
+            echo "Deployment successful"
