@@ -14,6 +14,7 @@ from app.client import BackendClient
 from app.core.config import get_settings
 from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.core.logging import get_logger
+from app.core.timeouts import pipeline_timeout_seconds
 from app.models import TranscriptSubmission
 from app.providers import TranscriptJobPending
 from app.providers.registry import resolve_provider
@@ -47,7 +48,7 @@ async def run_pipeline(
             job = await jobs.load(job_id)
             submission = await asyncio.wait_for(
                 perform_transcription(job, resume_token, resume_provider),
-                timeout=settings.job_timeout_seconds,
+                timeout=pipeline_timeout_seconds(settings),
             )
             await jobs.submit(job_id, submission)
         except TranscriptJobPending:
@@ -74,9 +75,7 @@ async def perform_transcription(
     settings = get_settings()
     provider = resolve_provider(settings)
     webhook_url = build_assembly_webhook_url(settings, job.job_id, provider.name)
-    result = await try_provider(
-        provider, job, resume_token, resume_provider, webhook_url
-    )
+    result = await try_provider(provider, job, resume_token, resume_provider, webhook_url)
     if result is not None:
         logger.info(
             "Transcript provider used",

@@ -6,6 +6,7 @@ from celery import Celery
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging
+from app.core.timeouts import task_hard_time_limit_seconds, task_soft_time_limit_seconds
 
 settings = get_settings()
 configure_logging()
@@ -44,11 +45,11 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
-    task_track_started=None,
-    # Let the application timeout run its failure reporting and cleanup before
-    # Celery sends the hard-kill signal to the child process.
-    task_soft_time_limit=settings.job_timeout_seconds + 5,
-    task_time_limit=settings.job_timeout_seconds + settings.task_timeout_grace_seconds,
+    # Let the pipeline timeout run its failure reporting and cleanup before
+    # Celery sends the soft and then the hard-kill signal to the child process.
+    # Ordering guarantees live in app/core/timeouts.py.
+    task_soft_time_limit=task_soft_time_limit_seconds(settings),
+    task_time_limit=task_hard_time_limit_seconds(settings),
     worker_prefetch_multiplier=1,
     task_acks_late=True,
 )
