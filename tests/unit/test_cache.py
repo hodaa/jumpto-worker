@@ -73,9 +73,10 @@ class TestExtractYouTubeVideoId:
 
 class TestSerialization:
     def test_roundtrip_preserves_result(self) -> None:
-        restored = _deserialize_result(_serialize_result(_result()))
+        restored, provider = _deserialize_result(_serialize_result(_result()))
 
         assert restored is not None
+        assert provider == ""
         assert restored.title == "Example title"
         assert restored.author == "Channel"
         assert restored.duration_seconds == 300
@@ -92,6 +93,11 @@ class TestSerialization:
         assert _deserialize_result('{"title": 1}') is None
         assert _deserialize_result("[]") is None
 
+    def test_roundtrip_preserves_provider(self) -> None:
+        restored, provider = _deserialize_result(_serialize_result(_result(), provider="yt-dlp"))
+        assert restored is not None
+        assert provider == "yt-dlp"
+
 
 # ---------------------------------------------------------------------------
 # DiskBackedTranscriptCache
@@ -105,6 +111,16 @@ class TestDiskBackedTranscriptCache:
 
         cached = cache.get(VIDEO_ID)
         assert cached is not None and cached.transcript.text == "hello world"
+
+    def test_get_with_provider_roundtrips_provider(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        cache.set(VIDEO_ID, _result(), provider="yt-dlp")
+
+        entry = cache.get_with_provider(VIDEO_ID)
+        assert entry is not None
+        restored, provider = entry
+        assert provider == "yt-dlp"
+        assert restored.transcript.text == "hello world"
 
     def test_namespace_is_prefixed(self, tmp_path) -> None:
         cache = DiskBackedTranscriptCache(
@@ -135,12 +151,23 @@ class TestDiskBackedTranscriptCache:
     def test_disk_write_error_is_best_effort(self, tmp_path) -> None:
         cache = _disk_cache(tmp_path)
         # Force an error by replacing the backend with an object that raises on set.
-        cache._backend = type("Fake", (), {"set": staticmethod(lambda *a, **kw: (_ for _ in ()).throw(Exception("boom"))), "get": staticmethod(lambda *a, **kw: None)})()
+        cache._backend = type(
+            "Fake",
+            (),
+            {
+                "set": staticmethod(lambda *a, **kw: (_ for _ in ()).throw(Exception("boom"))),
+                "get": staticmethod(lambda *a, **kw: None),
+            },
+        )()
         cache.set(VIDEO_ID, _result())  # must not raise
 
     def test_disk_read_error_degrades_to_miss(self, tmp_path) -> None:
         cache = _disk_cache(tmp_path)
-        cache._backend = type("Fake", (), {"get": staticmethod(lambda *a, **kw: (_ for _ in ()).throw(Exception("boom")))})()
+        cache._backend = type(
+            "Fake",
+            (),
+            {"get": staticmethod(lambda *a, **kw: (_ for _ in ()).throw(Exception("boom")))},
+        )()
         assert cache.get(VIDEO_ID) is None
 
     def test_media_set_then_get_roundtrip(self, tmp_path) -> None:
@@ -267,7 +294,9 @@ class TestStrategyCaching:
 
         media = type("Media", (), {"title": "T", "duration_seconds": 120})()
         monkeypatch.setattr(
-            ytdlp_module, "get_media_info_with_raw", lambda video_id, url, settings=None: (media, {})
+            ytdlp_module,
+            "get_media_info_with_raw",
+            lambda video_id, url, settings=None: (media, {}),
         )
 
         async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
@@ -287,7 +316,9 @@ class TestStrategyCaching:
 
         media = type("Media", (), {"title": "T", "duration_seconds": 120})()
         monkeypatch.setattr(
-            ytdlp_module, "get_media_info_with_raw", lambda video_id, url, settings=None: (media, None)
+            ytdlp_module,
+            "get_media_info_with_raw",
+            lambda video_id, url, settings=None: (media, None),
         )
 
         async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
@@ -301,7 +332,9 @@ class TestStrategyCaching:
         assert cache.get(VIDEO_ID) is None  # cache never populated
 
     @pytest.mark.asyncio
-    async def test_resume_skips_metadata_fetch_when_media_cached(self, tmp_path, monkeypatch) -> None:
+    async def test_resume_skips_metadata_fetch_when_media_cached(
+        self, tmp_path, monkeypatch
+    ) -> None:
         """On resume with a metadata cache hit, get_media_info_with_raw must not run."""
         cache = _disk_cache(tmp_path)
         cache.set_media(VIDEO_ID, "Cached Title", 99)
@@ -330,13 +363,17 @@ class TestStrategyCaching:
         assert media_called["n"] == 0
 
     @pytest.mark.asyncio
-    async def test_resume_falls_back_to_metadata_fetch_on_cache_miss(self, tmp_path, monkeypatch) -> None:
+    async def test_resume_falls_back_to_metadata_fetch_on_cache_miss(
+        self, tmp_path, monkeypatch
+    ) -> None:
         """On resume with a metadata cache miss, get_media_info_with_raw runs."""
         cache = _disk_cache(tmp_path)
 
         media = type("Media", (), {"title": "Fresh Title", "duration_seconds": 60})()
         monkeypatch.setattr(
-            ytdlp_module, "get_media_info_with_raw", lambda video_id, url, settings=None: (media, {})
+            ytdlp_module,
+            "get_media_info_with_raw",
+            lambda video_id, url, settings=None: (media, {}),
         )
 
         async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):

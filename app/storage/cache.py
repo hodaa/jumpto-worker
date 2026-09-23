@@ -90,8 +90,12 @@ def _serialize_result(result: VideoTranscriptResult, provider: str = "") -> str:
     )
 
 
-def _deserialize_result(payload: str) -> VideoTranscriptResult | None:
-    """Rebuild a result from stored JSON, or None for a corrupt entry."""
+def _deserialize_result(payload: str) -> tuple[VideoTranscriptResult, str] | None:
+    """Rebuild a result and its stored provider from JSON, or None on a corrupt entry.
+
+    Returns:
+        ``(result, provider)`` on success, or ``None`` for a corrupt entry.
+    """
     try:
         data = json.loads(payload)
         raw_words = data["transcript"]["words"]
@@ -103,13 +107,14 @@ def _deserialize_result(payload: str) -> VideoTranscriptResult | None:
                 for word, start, end in raw_words
             ],
         )
-        return VideoTranscriptResult(
+        result = VideoTranscriptResult(
             title=data["title"],
             author=data.get("author", ""),
             duration_seconds=data.get("duration_seconds", 0),
             is_generated=data.get("is_generated", False),
             transcript=transcript,
         )
+        return result, str(data.get("provider") or "")
     except (KeyError, TypeError, ValueError, IndexError, json.JSONDecodeError) as exc:
         logger.warning("Discarding corrupt transcript cache entry", error=str(exc))
         return None
@@ -133,20 +138,16 @@ class TranscriptCache(ABC):
     namespace: str
 
     @abstractmethod
-    def get_with_provider(self, video_id: str) -> tuple[VideoTranscriptResult, str] | None:
-        ...
+    def get_with_provider(self, video_id: str) -> tuple[VideoTranscriptResult, str] | None: ...
 
     @abstractmethod
-    def set(self, video_id: str, result: VideoTranscriptResult, provider: str = "") -> None:
-        ...
+    def set(self, video_id: str, result: VideoTranscriptResult, provider: str = "") -> None: ...
 
     @abstractmethod
-    def acquire_lock(self, video_id: str, owner: str | None = None) -> tuple[bool, str]:
-        ...
+    def acquire_lock(self, video_id: str, owner: str | None = None) -> tuple[bool, str]: ...
 
     @abstractmethod
-    def release_lock(self, video_id: str, owner: str) -> None:
-        ...
+    def release_lock(self, video_id: str, owner: str) -> None: ...
 
     def get(self, video_id: str) -> VideoTranscriptResult | None:
         """Read a cached transcript, ignoring any stored provenance."""
@@ -253,14 +254,7 @@ class DiskBackedTranscriptCache(TranscriptCache):
             return None
         if payload is None:
             return None
-        result = _deserialize_result(payload)
-        if result is None:
-            return None
-        try:
-            provider = str(json.loads(payload).get("provider") or "")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            provider = ""
-        return result, provider
+        return _deserialize_result(payload)
 
     def set(self, video_id: str, result: VideoTranscriptResult, provider: str = "") -> None:
         """Store a finished transcript in the cache, best-effort."""
