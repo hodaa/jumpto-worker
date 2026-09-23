@@ -4,6 +4,8 @@ import asyncio
 import contextlib
 import os
 import tempfile
+import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
@@ -30,6 +32,8 @@ logger = get_logger(__name__)
 
 _ASSEMBLY_BASE_URL = "https://api.assemblyai.com/v2"
 _UPLOAD_TIMEOUT_SECONDS = 300
+_UPLOAD_CHUNK_BYTES = 1_048_576
+_UPLOAD_PROGRESS_LOG_BYTES = 10_485_760
 
 
 class AssemblyTranscriptService(TranscriptService):
@@ -73,21 +77,21 @@ class AssemblyTranscriptService(TranscriptService):
         path: str,
     ) -> str:
         """Upload an audio file and return its public upload_url."""
-        with Path(path).open("rb") as audio:
-            response = await client.post(
-                f"{self.base_url}/upload",
-                headers={**headers, "content-type": "application/octet-stream"},
-                content=audio.read(),
-                timeout=_UPLOAD_TIMEOUT_SECONDS,
-            )
-        if response.status_code != 200:
-            logger.error("Assembly upload failed", status_code=response.status_code)
-            raise ExternalServiceError("Audio upload failed", service="assemblyai")
-        upload_url = str(response.json().get("upload_url") or "")
-        if not upload_url:
-            logger.error("Assembly upload returned no url")
-            raise ExternalServiceError("Audio upload failed", service="assemblyai")
-        return upload_url
+        total_bytes = Path(path).stat().st_size
+        logger.info("Assembly upload started", path=path, size_mib=_to_mib(total_bytes))
+        started = time.monotonic()
+        response = await client.post(
+            f"{self.base_url}/upload",
+            headers={
+                **headers,
+                "content-type": "application/octet-stream",
+                "content-length": str(total_bytes),
+            },
+            content=_stream_audio_with_progress(path, total_bytes),
+            timeout=_UPLOAD_TIMEOUT_SECONDS,
+        )
+        _log_upload_finished(response.status_code, total_bytes, time.monotonic() - started)
+        return _parse_upload_response(response)
 
     async def _submit(
         self,
@@ -152,6 +156,21 @@ class AssemblyTranscriptService(TranscriptService):
         ) from None
 
 
+def _to_mib(byte_count: int) -> float:
+    """Convert a byte count to MiB with two decimal places."""
+    return round(byte_count / _UPLOAD_CHUNK_BYTES, 2)
+
+
+def _log_upload_finished(status_code: int, total_bytes: int, elapsed: float) -> None:
+    """Log the upload outcome with duration and throughput."""
+    logger.info(
+        "Assembly upload finished",
+        status_code=status_code,
+        duration_seconds=round(elapsed, 2),
+        throughput_mib_s=_to_mib(total_bytes) / elapsed,
+    )
+
+
 def _download_audio(youtube_url: str) -> str:
     """Download a YouTube audio stream to a temp file and return its path."""
     fd, path = tempfile.mkstemp(suffix=".webm")
@@ -194,6 +213,40 @@ def _run_download(options: dict, youtube_url: str) -> None:
         raise
     finally:
         release_temp_cookie(options)
+
+
+def _parse_upload_response(response: httpx.Response) -> str:
+    """Extract and validate an upload_url from an Assembly upload response."""
+    if response.status_code != 200:
+        logger.error("Assembly upload failed", status_code=response.status_code)
+        raise ExternalServiceError("Audio upload failed", service="assemblyai")
+    upload_url = str(response.json().get("upload_url") or "")
+    if not upload_url:
+        logger.error("Assembly upload returned no url")
+        raise ExternalServiceError("Audio upload failed", service="assemblyai")
+    return upload_url
+
+
+async def _stream_audio_with_progress(path: str, total_bytes: int) -> AsyncIterator[bytes]:
+    """Yield audio file chunks while logging upload progress.
+
+    httpx consumes this generator as the POST body; Content-Length is provided
+    by the caller so the transfer keeps explicit framing instead of chunked
+    encoding. Progress is logged when each 10 MiB boundary is crossed.
+    """
+    next_log_bytes = _UPLOAD_PROGRESS_LOG_BYTES
+    with Path(path).open("rb") as audio:
+        while chunk := audio.read(_UPLOAD_CHUNK_BYTES):
+            yield chunk
+            sent = audio.tell()
+            while sent >= next_log_bytes:
+                logger.info(
+                    "Assembly upload progress",
+                    sent_mib=round(sent / _UPLOAD_CHUNK_BYTES, 2),
+                    total_mib=round(total_bytes / _UPLOAD_CHUNK_BYTES, 2),
+                    percent=round(sent * 100 / total_bytes, 1),
+                )
+                next_log_bytes += _UPLOAD_PROGRESS_LOG_BYTES
 
 
 def _remove_file(path: str) -> None:

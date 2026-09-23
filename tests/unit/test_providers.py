@@ -12,9 +12,11 @@ import pytest
 from app.core.exceptions import ExternalServiceError
 from app.integrations.ytdlp import build_ydlp_options
 from app.providers.assembly import (
+    _UPLOAD_CHUNK_BYTES,
     AssemblyTranscriptService,
     _parse_assembly_transcript,
     _run_download,
+    _stream_audio_with_progress,
     get_transcript_provider,
 )
 from app.providers.media import get_media_info
@@ -118,9 +120,7 @@ class TestAssignmentFetcher:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"fake-audio")
 
-        monkeypatch.setattr(
-            "app.providers.assembly._download_audio", lambda url: str(audio_file)
-        )
+        monkeypatch.setattr("app.providers.assembly._download_audio", lambda url: str(audio_file))
 
         upload_response = Mock(status_code=200)
         upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/fake"}
@@ -174,6 +174,81 @@ class TestAssignmentFetcher:
         assert captured["content"] == b"fake-audio-bytes"
 
     @pytest.mark.asyncio
+    async def test_upload_streams_chunks_with_content_length(self, tmp_path) -> None:
+        """The upload body must stream from the file with an explicit size,
+        not buffer the whole file or fall back to chunked encoding."""
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["content"] = request.read()
+            captured["content_length"] = request.headers.get("content-length")
+            return httpx.Response(200, json={"upload_url": "https://cdn.assemblyai.com/x"})
+
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"A" * (3 * _UPLOAD_CHUNK_BYTES))
+
+        provider = AssemblyTranscriptService("key")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            upload_url = await provider._upload(client, {}, str(audio_file))
+
+        assert upload_url == "https://cdn.assemblyai.com/x"
+        assert captured["content"] == b"A" * (3 * _UPLOAD_CHUNK_BYTES)
+        assert captured["content_length"] == str(3 * _UPLOAD_CHUNK_BYTES)
+
+    @pytest.mark.asyncio
+    async def test_upload_raises_on_non_200(self, tmp_path) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="boom")
+
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+
+        provider = AssemblyTranscriptService("key")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(ExternalServiceError) as excinfo:
+                await provider._upload(client, {}, str(audio_file))
+
+        assert "Audio upload failed" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_upload_raises_when_no_upload_url(self, tmp_path) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={})
+
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+
+        provider = AssemblyTranscriptService("key")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(ExternalServiceError) as excinfo:
+                await provider._upload(client, {}, str(audio_file))
+
+        assert "Audio upload failed" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_stream_progress_logs_per_boundary(self, tmp_path, monkeypatch) -> None:
+        """Progress must be logged when each MiB boundary is crossed while
+        streaming, so a slow upload is not silent."""
+        boundary_bytes = 3
+        monkeypatch.setattr("app.providers.assembly._UPLOAD_PROGRESS_LOG_BYTES", boundary_bytes)
+        audit: list[str] = []
+        monkeypatch.setattr(
+            "app.providers.assembly.logger.info",
+            lambda event, **kwargs: audit.append(event),
+        )
+
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"x" * 10)
+
+        chunks = bytearray()
+        async for chunk in _stream_audio_with_progress(str(audio_file), 10):
+            chunks += chunk
+
+        assert bytes(chunks) == b"x" * 10
+        progress_events = [e for e in audit if e == "Assembly upload progress"]
+        assert len(progress_events) == 3
+
+    @pytest.mark.asyncio
     async def test_resume_checks_once_and_raises_pending(self, monkeypatch) -> None:
         poll_response = Mock(status_code=200)
         poll_response.json.return_value = {"status": "processing"}
@@ -183,9 +258,7 @@ class TestAssignmentFetcher:
 
         provider = AssemblyTranscriptService("key")
         with pytest.raises(TranscriptJobPending) as excinfo:
-            await provider.fetch(
-                "https://youtu.be/abcde12345", resume_token="transcript-1"
-            )
+            await provider.fetch("https://youtu.be/abcde12345", resume_token="transcript-1")
 
         assert excinfo.value.resume_token == "transcript-1"
         assert excinfo.value.resumable is True
@@ -233,9 +306,7 @@ class TestAssignmentFetcher:
     async def test_fetch_with_webhook_flags_pending(self, monkeypatch, tmp_path) -> None:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"fake-audio")
-        monkeypatch.setattr(
-            "app.providers.assembly._download_audio", lambda url: str(audio_file)
-        )
+        monkeypatch.setattr("app.providers.assembly._download_audio", lambda url: str(audio_file))
 
         upload_response = Mock(status_code=200)
         upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/fake"}
@@ -486,12 +557,12 @@ class TestYdlpOptions:
             ytdlp_socket_timeout=30,
         )
 
-    def test_sets_writable_cookie_copy_when_configured(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_sets_writable_cookie_copy_when_configured(self, monkeypatch, tmp_path) -> None:
         source = tmp_path / "cookies.txt"
         source.write_text("# Netscape HTTP Cookie File\n")
-        monkeypatch.setattr("app.integrations.ytdlp.get_settings", lambda: self._settings(str(source)))
+        monkeypatch.setattr(
+            "app.integrations.ytdlp.get_settings", lambda: self._settings(str(source))
+        )
 
         options = build_ydlp_options()
 
@@ -509,7 +580,9 @@ class TestYdlpOptions:
             "youtube.com\tTRUE\t/\tFALSE\t-1\tCONSENT\tYES\n"
             "accounts.google.com\tTRUE\t/\tTRUE\t1791297119\tOTZ\t8773352\n"
         )
-        monkeypatch.setattr("app.integrations.ytdlp.get_settings", lambda: self._settings(str(source)))
+        monkeypatch.setattr(
+            "app.integrations.ytdlp.get_settings", lambda: self._settings(str(source))
+        )
 
         options = build_ydlp_options()
 
@@ -519,12 +592,14 @@ class TestYdlpOptions:
         assert "youtube.com\tFALSE\t/\tFALSE\t0\tCONSENT\tYES\n" in body
         assert "accounts.google.com\tFALSE\t/\tTRUE\t1791297119\tOTZ\t8773352\n" in body
 
-    def test_cookie_copy_sanitizes_httponly_dotted_domain(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_cookie_copy_sanitizes_httponly_dotted_domain(self, monkeypatch, tmp_path) -> None:
         source = tmp_path / "cookies.txt"
-        source.write_text("# Netscape HTTP Cookie File\n#HttpOnly_.youtube.com\tFALSE\t/\tTRUE\t0\tSID\tv\n")
-        monkeypatch.setattr("app.integrations.ytdlp.get_settings", lambda: self._settings(str(source)))
+        source.write_text(
+            "# Netscape HTTP Cookie File\n#HttpOnly_.youtube.com\tFALSE\t/\tTRUE\t0\tSID\tv\n"
+        )
+        monkeypatch.setattr(
+            "app.integrations.ytdlp.get_settings", lambda: self._settings(str(source))
+        )
 
         options = build_ydlp_options()
 
@@ -563,7 +638,9 @@ class TestYdlpOptions:
     def test_overrides_win_over_base_options(self, monkeypatch, tmp_path) -> None:
         source = tmp_path / "cookies.txt"
         source.write_text("# Netscape HTTP Cookie File\n")
-        monkeypatch.setattr("app.integrations.ytdlp.get_settings", lambda: self._settings(str(source)))
+        monkeypatch.setattr(
+            "app.integrations.ytdlp.get_settings", lambda: self._settings(str(source))
+        )
 
         options = build_ydlp_options(format="best", noplaylist=False)
 
