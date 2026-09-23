@@ -53,4 +53,6 @@ Deploy on the VPS:
   YouTube session (see the Dockerfile header for the `docker run` line).
 - Add the cron line from the `scripts/cookies-refresh.sh` header.
 - `docker-compose.yml` already mounts `/etc/jumpto/state` (the marker dir)
-  writable into the worker and keeps the cookie file read-only.
+  writable into the worker and keeps the cookie file read-only. The worker
+  runs as an unprivileged user (uid/gid 10001), so the host state dir must be
+  owned by it: `mkdir -p /etc/jumpto/state && chown 10001:10001 /etc/jumpto/state`.

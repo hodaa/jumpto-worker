@@ -24,7 +24,11 @@
         # override with COOKIE_DIR for local dev where /etc/jumpto may not
         # exist. The canonical file is $COOKIE_DIR/cookies.txt.
         - ${COOKIE_DIR:-/etc/jumpto}/cookies.txt:/etc/jumpto/cookies.txt:ro
-        # Writable marker that requests a host-side cookie refresh.
+        # Writable marker that requests a host-side cookie refresh. The image
+        # chowns /var/lib/jumpto/state to the jumpto user, but this host bind
+        # mount shadows it — the host dir must be owned by uid/gid 10001
+        # (jumpto), e.g. `mkdir -p /etc/jumpto/state && chown 10001:10001
+        # /etc/jumpto/state`. Otherwise marker writes are skipped (warning).
         - /etc/jumpto/state:/var/lib/jumpto/state
       depends_on:
         - bgutil-pot
