@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from app.core.exceptions import ExternalServiceError
-from app.integrations.ytdlp import build_ydlp_options
+from app.integrations.ytdlp import build_ydlp_options, release_temp_cookie
 from app.providers.assembly import (
     _UPLOAD_CHUNK_BYTES,
     AssemblyTranscriptService,
@@ -605,6 +605,66 @@ class TestYdlpOptions:
 
         body = Path(options["cookiefile"]).read_text()
         assert "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tv\n" in body
+
+    def test_cookie_copy_is_cached_across_builds(self, monkeypatch, tmp_path) -> None:
+        source = tmp_path / "cookies.txt"
+        source.write_text("# Netscape HTTP Cookie File\nuser_token=abc\n")
+        monkeypatch.setattr(
+            "app.integrations.ytdlp.get_settings", lambda: self._settings(str(source))
+        )
+
+        first = build_ydlp_options()["cookiefile"]
+        second = build_ydlp_options()["cookiefile"]
+
+        assert first == second
+        assert Path(first).read_text() == "# Netscape HTTP Cookie File\nuser_token=abc\n"
+
+    def test_cookie_copy_is_refreshed_when_source_changes(self, monkeypatch, tmp_path) -> None:
+        source = tmp_path / "cookies.txt"
+        source.write_text("# Netscape HTTP Cookie File\nuser_token=abc\n")
+        monkeypatch.setattr(
+            "app.integrations.ytdlp.get_settings", lambda: self._settings(str(source))
+        )
+
+        first = build_ydlp_options()["cookiefile"]
+        source.write_text("# Netscape HTTP Cookie File\nuser_token=replacement\n")
+
+        second = build_ydlp_options()["cookiefile"]
+
+        assert first != second
+        assert Path(second).read_text() == "# Netscape HTTP Cookie File\nuser_token=replacement\n"
+        assert not Path(first).exists()
+
+    def test_cookie_copy_uncached_when_source_unreadable(self, monkeypatch, tmp_path) -> None:
+        source = tmp_path / "cookies.txt"
+        source.write_text("# Netscape HTTP Cookie File\nuser_token=abc\n")
+        monkeypatch.setattr(
+            "app.integrations.ytdlp.get_settings", lambda: self._settings(str(source))
+        )
+
+        import app.integrations.ytdlp as ytdlp_mod
+
+        monkeypatch.setattr(ytdlp_mod, "_cookie_copy_key", lambda cookie_file: None)
+
+        first = build_ydlp_options()["cookiefile"]
+        second = build_ydlp_options()["cookiefile"]
+
+        assert first != second
+        assert Path(first).read_text() == "# Netscape HTTP Cookie File\nuser_token=abc\n"
+        assert Path(second).read_text() == "# Netscape HTTP Cookie File\nuser_token=abc\n"
+
+    def test_release_temp_cookie_deletes_uncached_copy(self, monkeypatch, tmp_path) -> None:
+        source = tmp_path / "cookies.txt"
+        source.write_text("# Netscape HTTP Cookie File\nuser_token=abc\n")
+        monkeypatch.setattr(
+            "app.integrations.ytdlp.get_settings", lambda: self._settings(str(source))
+        )
+        orphaned = tmp_path / "orphaned.txt"
+        orphaned.write_text("# Netscape HTTP Cookie File\n")
+
+        release_temp_cookie({"cookiefile": str(orphaned)})
+
+        assert not orphaned.exists()
 
     def test_omits_cookiefile_when_unset(self, monkeypatch) -> None:
         settings = SimpleNamespace(
