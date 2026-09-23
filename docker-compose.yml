@@ -21,8 +21,9 @@
         - "127.0.0.1:5678:5678"
       volumes:
         # Host cookie file to mount: default /etc/jumpto/cookies.txt (VPS),
-        # override with COOKIE_FILE for local dev where /etc/jumpto may not exist.
-        - ${COOKIE_FILE:-/etc/jumpto/cookies.txt}:/etc/jumpto/cookies.txt:ro
+        # override with COOKIE_DIR for local dev where /etc/jumpto may not
+        # exist. The canonical file is $COOKIE_DIR/cookies.txt.
+        - ${COOKIE_DIR:-/etc/jumpto}/cookies.txt:/etc/jumpto/cookies.txt:ro
         # Writable marker that requests a host-side cookie refresh.
         - /etc/jumpto/state:/var/lib/jumpto/state
       depends_on:
@@ -45,6 +46,9 @@
       volumes:
         - /etc/jumpto/chromium/profile:/config
         - /etc/jumpto:/etc/jumpto
+        # Share the canonical host cookie dir so the exporter can write the
+        # same cookies.txt the worker mounts (local dev: ~/.jumpto-cookies).
+        - ${COOKIE_DIR:-/etc/jumpto}:/host-cookies
         - /etc/localtime:/etc/localtime:ro
       ports:
         - "127.0.0.1:3001:3001"

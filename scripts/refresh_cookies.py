@@ -6,10 +6,17 @@ Runs INSIDE the chromium container, where the loopback DevTools endpoint
 cookie in the browser, keeps only Google/YouTube domains, and writes them in
 the Netscape format yt-dlp expects.
 
+Usage: refresh_cookies.py [--out PATH]
+  --out  destination for the Netscape cookiejar; defaults to
+         /etc/jumpto/fresh-cookies.txt (the VPS layout). For local dev,
+         pass a path inside the container's mounted host-cookie dir
+         (e.g. /host-cookies/cookies.txt).
+
 Exit codes: 0 exported OK, 1 no DevTools endpoint, 2 not logged in / no auth
 cookies, 3 CDP call failed.
 """
 
+import argparse
 import json
 import sys
 import urllib.request
@@ -153,9 +160,17 @@ def write_cookies(cookies: list[dict], output: Path) -> int:
     return EXIT_OK
 
 
-def main() -> int:
-    """Run the export: fetch cookies and write them to the output file."""
-    output = Path("/etc/jumpto/fresh-cookies.txt")
+def main(out_path: str | None = None) -> int:
+    """Run the export and write cookies to ``out_path`` (or the default).
+
+    Args:
+        out_path: Optional destination path. When None the container default
+            ``/etc/jumpto/fresh-cookies.txt`` is used.
+
+    Returns:
+        An EXIT_* code (0 on success).
+    """
+    output = Path(out_path or "/etc/jumpto/fresh-cookies.txt")
     try:
         cookies = _fetch_all_cookies()
     except CdpError as exc:
@@ -168,4 +183,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    parser = argparse.ArgumentParser(description="Export YouTube cookies from Chromium.")
+    parser.add_argument("--out", default="/etc/jumpto/fresh-cookies.txt", help="Netscape cookiejar output path")
+    args = parser.parse_args()
+    sys.exit(main(args.out))

@@ -23,7 +23,9 @@ set -u
 
 SSH_TARGET="jumpto"
 STATE_FILE="/tmp/jumpto_cookie_health_state"
-COOKIE_EXPORT="$HOME/.jumpto-cookies/cookies.txt"
+# Canonical host-side cookie dir (same COOKIE_DIR the worker mounts).
+COOKIE_DIR="${COOKIE_DIR:-$HOME/.jumpto-cookies}"
+COOKIE_EXPORT="$COOKIE_DIR/cookies.txt"
 PYTHON="$HOME/.jumpto-cookies/.venv/bin/python"
 EXPORTER="$(cd "$(dirname "$0")" && pwd)/mac_export_cookies.py"
 DEPLOYER="$(cd "$(dirname "$0")" && pwd)/redeploy_cookies.sh"

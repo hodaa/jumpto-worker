@@ -18,8 +18,11 @@
 set -u
 
 MARKER="${JUMPTO_REFRESH_MARKER:-/etc/jumpto/state/refresh-requested}"
-FRESH="${JUMPTO_COOKIE_FRESH:-/etc/jumpto/fresh-cookies.txt}"
-COOKIES="${JUMPTO_COOKIE_FILE:-/etc/jumpto/cookies.txt}"
+# Canonical host-side cookie dir shared with the worker (COOKIE_DIR).
+COOKIE_DIR="${COOKIE_DIR:-/etc/jumpto}"
+# Container-side view of the same dir (chromium mounts it at /host-cookies).
+FRESH="/host-cookies/fresh-cookies.txt"
+COOKIES="${COOKIE_FILE:-$COOKIE_DIR/cookies.txt}"
 CHROMIUM_CONTAINER="${CHROMIUM_CONTAINER:-chromium}"
 CDP_SCRIPT="/opt/jumpto/refresh_cookies.py"
 
@@ -46,22 +49,24 @@ fi
 echo "$(date '+%F %T') cookie refresh requested; exporting from Chromium ..."
 
 # --- Export from the chromium container -------------------------------------
-# --user root: the export writes /etc/jumpto/fresh-cookies.txt, and the
-# container's default user (abc) cannot write into /etc/jumpto.
-if ! docker exec --user root "$CHROMIUM_CONTAINER" python3 "$CDP_SCRIPT"; then
+# --user root: the export writes the fresh cookiejar, and the container's
+# default user (abc) cannot write into the mounted cookie dir.
+# The exporter writes the CONTAINER-side view (/host-cookies/...); the
+# freshness check below reads the same file via the HOST-side view.
+if ! docker exec --user root "$CHROMIUM_CONTAINER" python3 "$CDP_SCRIPT" --out "$FRESH"; then
   notify "JumpTo: Chromium cookie export failed" \
     "The chromium container could not export cookies. Is it running and logged in?" warning
   exit 1
 fi
 
-if [ ! -s "$FRESH" ]; then
+if [ ! -s "$COOKIE_DIR/fresh-cookies.txt" ]; then
   notify "JumpTo: Chromium cookie export produced no cookies" \
     "The chromium container returned an empty export; check the container." exclamation
   exit 1
 fi
 
 # --- Atomic replace + marker cleanup ----------------------------------------
-mv "$FRESH" "$COOKIES"
+mv "$COOKIE_DIR/fresh-cookies.txt" "$COOKIES"
 rm -f "$MARKER"
 
 echo "$(date '+%F %T') refreshed $COOKIES and cleared marker"
