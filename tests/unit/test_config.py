@@ -23,6 +23,21 @@ class TestCeleryWorkerConcurrencySetting:
             Settings(_env_file=None, celery_worker_concurrency=0)
 
 
+class TestCeleryWorkerMaxTasksPerChildSetting:
+    """Tests for the Celery max-tasks-per-child setting."""
+
+    def test_default_is_one_hundred(self) -> None:
+        assert Settings(_env_file=None).celery_worker_max_tasks_per_child == 100
+
+    def test_reads_configured_value_from_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("CELERY_WORKER_MAX_TASKS_PER_CHILD", "25")
+        assert Settings(_env_file=None).celery_worker_max_tasks_per_child == 25
+
+    def test_rejects_non_positive_values(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, celery_worker_max_tasks_per_child=0)
+
+
 class TestTranscriptFetchApiKey:
     """Tests for TranscriptFetch key env-var name variants."""
 
@@ -127,3 +142,15 @@ class TestCookieRefreshMarkerPath:
     def test_empty_value_disables_marker(self, monkeypatch) -> None:
         monkeypatch.setenv("COOKIE_REFRESH_MARKER_PATH", "")
         assert Settings(_env_file=None).cookie_refresh_marker_path == ""
+
+
+class TestLiveExternalCallsSetting:
+    """Tests for the live external calls gate setting."""
+
+    def test_defaults_to_false(self, monkeypatch) -> None:
+        monkeypatch.delenv("LIVE_EXTERNAL_CALLS", raising=False)
+        assert Settings(_env_file=None).live_external_calls is False
+
+    def test_reads_env_var(self, monkeypatch) -> None:
+        monkeypatch.setenv("LIVE_EXTERNAL_CALLS", "true")
+        assert Settings(_env_file=None).live_external_calls is True

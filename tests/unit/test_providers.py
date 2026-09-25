@@ -1,4 +1,4 @@
-"""Unit tests for external service providers (selection, Assembly flow, captions)."""
+"""Unit tests for external service providers (selection, audio flow, captions)."""
 
 import json
 import os
@@ -9,18 +9,25 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
-from app.core.exceptions import ExternalServiceError
+from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.integrations.ytdlp import build_ydlp_options, release_temp_cookie
 from app.providers.assembly import (
     _UPLOAD_CHUNK_BYTES,
     AssemblyTranscriptService,
+    _log_upload_finished,
     _parse_assembly_transcript,
-    _run_download,
     _stream_audio_with_progress,
     get_transcript_provider,
 )
+from app.providers.audio import run_download
+from app.providers.deepgram import (
+    DeepgramTranscriptService,
+    _parse_deepgram_transcript,
+    get_deepgram_provider,
+)
 from app.providers.media import get_media_info
 from app.providers.models import TranscriptData, TranscriptJobPending
+from app.providers.speech_to_text import get_speech_to_text_provider
 from app.providers.transcript import (
     YouTubeCaptionTranscriptService,
     _caption_language,
@@ -29,13 +36,17 @@ from app.providers.transcript import (
     _parse_vtt,
     _preferred_vtt_file,
 )
+from app.utils.text import detect_language_from_title
 
 
 def _settings(*, live: bool, api_key: str) -> SimpleNamespace:
     """Build a minimal settings object for provider selection."""
     return SimpleNamespace(
-        jumpto_live_external_calls=live,
+        live_external_calls=live,
         assembly_api_key=api_key,
+        speech_to_text_provider="deepgram",
+        deepgram_api_key="",
+        deepgram_api_url="https://api.deepgram.com/v1",
     )
 
 
@@ -43,14 +54,14 @@ class TestMediaInfoProvider:
     """Tests for the media info provider."""
 
     def test_no_live_calls_raises(self, monkeypatch) -> None:
-        settings = SimpleNamespace(jumpto_live_external_calls=False)
+        settings = SimpleNamespace(live_external_calls=False)
         monkeypatch.setattr("app.providers.media.get_settings", lambda: settings)
 
         with pytest.raises(ExternalServiceError, match="disabled"):
             get_media_info("abcde12345", "https://youtu.be/abcde12345")
 
     def test_live_provider_error_is_wrapped(self, monkeypatch) -> None:
-        settings = SimpleNamespace(jumpto_live_external_calls=True)
+        settings = SimpleNamespace(live_external_calls=True)
         monkeypatch.setattr("app.providers.media.get_settings", lambda: settings)
 
         def boom(url: str):
@@ -120,7 +131,7 @@ class TestAssignmentFetcher:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"fake-audio")
 
-        monkeypatch.setattr("app.providers.assembly._download_audio", lambda url: str(audio_file))
+        monkeypatch.setattr("app.providers.assembly.download_audio", lambda url: str(audio_file))
 
         upload_response = Mock(status_code=200)
         upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/fake"}
@@ -248,6 +259,18 @@ class TestAssignmentFetcher:
         progress_events = [e for e in audit if e == "Assembly upload progress"]
         assert len(progress_events) == 3
 
+    def test_log_upload_finished_does_not_divide_by_zero(self, monkeypatch) -> None:
+        """A zero-duration upload must not crash the throughput logging line."""
+        audit: list[str] = []
+        monkeypatch.setattr(
+            "app.providers.assembly.logger.info",
+            lambda event, **kwargs: audit.append(event),
+        )
+
+        _log_upload_finished(200, 100, 0.0)
+
+        assert audit == ["Assembly upload finished"]
+
     @pytest.mark.asyncio
     async def test_resume_checks_once_and_raises_pending(self, monkeypatch) -> None:
         poll_response = Mock(status_code=200)
@@ -306,7 +329,7 @@ class TestAssignmentFetcher:
     async def test_fetch_with_webhook_flags_pending(self, monkeypatch, tmp_path) -> None:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"fake-audio")
-        monkeypatch.setattr("app.providers.assembly._download_audio", lambda url: str(audio_file))
+        monkeypatch.setattr("app.providers.assembly.download_audio", lambda url: str(audio_file))
 
         upload_response = Mock(status_code=200)
         upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/fake"}
@@ -332,6 +355,259 @@ class TestAssignmentFetcher:
         assert excinfo.value.webhook is True
         assert excinfo.value.resume_token == "transcript-1"
         assert not audio_file.exists()
+
+
+class TestDeepgramParser:
+    """Tests for Deepgram /listen response parsing."""
+
+    def test_parse_deepgram_transcript(self) -> None:
+        data = {
+            "metadata": {"duration": 2.0},
+            "results": {
+                "channels": [
+                    {
+                        "detected_language": "ar",
+                        "alternatives": [
+                            {
+                                "transcript": "مرحبا بالعالم",
+                                "words": [
+                                    {"word": "مرحبا", "start": 0.0, "end": 0.5},
+                                    {"word": "بالعالم", "start": 0.5, "end": 1.0},
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+
+        parsed = _parse_deepgram_transcript(data)
+
+        assert parsed.language == "ar"
+        assert parsed.text == "مرحبا بالعالم"
+        assert [w.word for w in parsed.words] == ["مرحبا", "بالعالم"]
+        assert parsed.words[0].start_time == 0.0
+        assert parsed.words[1].end_time == 1.0
+
+    def test_parse_falls_back_to_english_without_detected_language(self) -> None:
+        data = {
+            "results": {
+                "channels": [
+                    {
+                        "alternatives": [{"transcript": "hi there", "words": []}],
+                    }
+                ]
+            }
+        }
+
+        parsed = _parse_deepgram_transcript(data)
+
+        assert parsed.language == "en"
+        assert parsed.text == "hi there"
+
+    def test_parse_raises_without_channels(self) -> None:
+        with pytest.raises(ExternalServiceError):
+            _parse_deepgram_transcript({"results": {}})
+
+
+class TestDeepgramFetcher:
+    """Tests for the Deepgram HTTP flow."""
+
+    @staticmethod
+    def _body() -> dict:
+        return {
+            "results": {
+                "channels": [
+                    {
+                        "detected_language": "en",
+                        "alternatives": [
+                            {
+                                "transcript": "hello world",
+                                "words": [{"word": "hello", "start": 0.0, "end": 0.5}],
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_fetch_posts_audio_and_parses(self, monkeypatch, tmp_path) -> None:
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"fake-audio")
+        monkeypatch.setattr("app.providers.deepgram.download_audio", lambda url: str(audio_file))
+
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["path"] = str(request.url)
+            captured["authorization"] = request.headers.get("authorization")
+            captured["content"] = request.read()
+            return httpx.Response(200, json=self._body())
+
+        monkeypatch.setattr(
+            "app.providers.deepgram.get_shared_http_client",
+            lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        monkeypatch.setattr("app.providers.deepgram._TRANSCRIBE_TIMEOUT_SECONDS", 5)
+
+        provider = DeepgramTranscriptService("dg-key", base_url="https://api.deepgram.test/v1")
+        transcript = await provider.fetch("https://youtu.be/abcde12345", language="ar")
+
+        assert transcript.text == "hello world"
+        assert transcript.words[0].word == "hello"
+        assert "language=ar" in captured["path"]
+        assert captured["authorization"] == "Token dg-key"
+        assert captured["content"] == b"fake-audio"
+        assert not audio_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_fetch_omits_language_param_when_empty(self, monkeypatch, tmp_path) -> None:
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+        monkeypatch.setattr("app.providers.deepgram.download_audio", lambda url: str(audio_file))
+
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["path"] = str(request.url)
+            return httpx.Response(200, json=self._body())
+
+        monkeypatch.setattr(
+            "app.providers.deepgram.get_shared_http_client",
+            lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        provider = DeepgramTranscriptService("dg-key", base_url="https://api.deepgram.test/v1")
+        await provider.fetch("https://youtu.be/abcde12345", language="")
+
+        assert "language=" not in captured["path"]
+
+    @pytest.mark.asyncio
+    async def test_transcribe_raises_on_non_200(self, tmp_path) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="boom")
+
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+
+        provider = DeepgramTranscriptService("key", base_url="https://api.deepgram.test/v1")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(ExternalServiceError) as excinfo:
+                await provider._transcribe(client, str(audio_file), "en")
+
+        assert "rejected" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [401, 403])
+    async def test_auth_failure_raises_permanent_error(self, tmp_path, status_code: int) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code, json={"err_msg": "Invalid credentials."})
+
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+
+        provider = DeepgramTranscriptService("key", base_url="https://api.deepgram.test/v1")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(PermanentExternalServiceError) as excinfo:
+                await provider._transcribe(client, str(audio_file), "en")
+
+        assert excinfo.value.details["service"] == "deepgram"
+        assert excinfo.value.details["status_code"] == status_code
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504])
+    async def test_transient_status_codes_remain_soft_errors(
+        self, tmp_path, status_code: int
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code, text="try later")
+
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+
+        provider = DeepgramTranscriptService("key", base_url="https://api.deepgram.test/v1")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(ExternalServiceError):
+                await provider._transcribe(client, str(audio_file), "en")
+
+
+class TestSpeechToTextSelection:
+    """Tests for the speech-to-text provider selection."""
+
+    @staticmethod
+    def _settings(
+        *, live: bool, provider: str, deepgram_key: str = "", assembly_key: str = ""
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            live_external_calls=live,
+            speech_to_text_provider=provider,
+            deepgram_api_key=deepgram_key,
+            deepgram_api_url="https://api.deepgram.com/v1",
+            assembly_api_key=assembly_key,
+        )
+
+    def test_returns_none_when_live_not_configured(self, monkeypatch) -> None:
+        settings = self._settings(live=False, provider="deepgram", deepgram_key="k")
+        monkeypatch.setattr("app.providers.speech_to_text.get_settings", lambda: settings)
+
+        assert get_speech_to_text_provider() is None
+
+    def test_returns_none_when_deepgram_no_key(self, monkeypatch) -> None:
+        settings = self._settings(live=True, provider="deepgram")
+        monkeypatch.setattr("app.providers.speech_to_text.get_settings", lambda: settings)
+
+        assert get_speech_to_text_provider() is None
+
+    def test_returns_deepgram_when_configured(self, monkeypatch) -> None:
+        settings = self._settings(live=True, provider="deepgram", deepgram_key="dg-key")
+        monkeypatch.setattr("app.providers.speech_to_text.get_settings", lambda: settings)
+
+        provider = get_speech_to_text_provider()
+
+        assert isinstance(provider, DeepgramTranscriptService)
+        assert provider.api_key == "dg-key"
+
+    def test_returns_assembly_when_selected(self, monkeypatch) -> None:
+        settings = self._settings(live=True, provider="assembly", assembly_key="asm-key")
+        monkeypatch.setattr("app.providers.speech_to_text.get_settings", lambda: settings)
+
+        provider = get_speech_to_text_provider()
+
+        assert isinstance(provider, AssemblyTranscriptService)
+        assert provider.api_key == "asm-key"
+
+    def test_returns_none_for_unknown_provider(self, monkeypatch) -> None:
+        settings = self._settings(live=True, provider="bogus", deepgram_key="dg-key")
+        monkeypatch.setattr("app.providers.speech_to_text.get_settings", lambda: settings)
+
+        assert get_speech_to_text_provider() is None
+
+    def test_get_deepgram_provider_requires_live_and_key(self) -> None:
+        assert (
+            get_deepgram_provider(self._settings(live=False, provider="deepgram", deepgram_key="k"))
+            is None
+        )
+        assert get_deepgram_provider(self._settings(live=True, provider="deepgram")) is None
+
+
+class TestLanguageFromTitle:
+    """Tests for script-based speech-to-text language detection."""
+
+    def test_arabic_title_is_arabic(self) -> None:
+        assert detect_language_from_title("درس البرمجة التجريبي") == "ar"
+
+    def test_english_title_is_english(self) -> None:
+        assert detect_language_from_title("Build a Python API from scratch") == "en"
+
+    def test_mixed_title_with_arabic_script_is_arabic(self) -> None:
+        assert detect_language_from_title("How to code 2024 | دليل كامل") == "ar"
+
+    def test_empty_title_is_english(self) -> None:
+        assert detect_language_from_title("") == "en"
+
+    def test_arabic_supplement_block_is_arabic(self) -> None:
+        assert detect_language_from_title("\u0777\u0777") == "ar"
 
 
 class TestCaptionSelection:
@@ -415,6 +691,33 @@ class TestCaptionLanguageSelection:
         info = {"automatic_captions": {"ar": [], "en": []}, "subtitles": {}}
 
         assert _caption_targets(info) == ["ar"] or _caption_targets(info) == ["en"]
+
+    def test_uses_language_metadata_when_original_language_missing(self) -> None:
+        info = {
+            "automatic_captions": {"ar": [], "ar-orig": [], "en": [], "en-orig": []},
+            "subtitles": {},
+            "language": "en-US",
+        }
+
+        assert _caption_targets(info) == ["en-orig", "en"]
+
+    def test_language_hint_prefers_manual_track_for_that_language(self) -> None:
+        info = {
+            "automatic_captions": {"ar-orig": [], "en-orig": []},
+            "subtitles": {"en": []},
+            "language": "en",
+        }
+
+        assert _caption_targets(info) == ["en"]
+
+    def test_language_hint_with_no_matching_track_uses_best_available(self) -> None:
+        info = {
+            "automatic_captions": {"ar": [], "fr": []},
+            "subtitles": {},
+            "language": "en-US",
+        }
+
+        assert _caption_targets(info) == ["ar"]
 
     def test_no_captions_returns_empty_targets(self) -> None:
         info = {"automatic_captions": {}, "subtitles": {}}
@@ -531,7 +834,7 @@ class TestDownloadCaptionMetadataReuse:
 
 
 class TestRunDownload:
-    """_run_download always re-extracts and downloads fresh URLs."""
+    """run_download always re-extracts and downloads fresh URLs."""
 
     def test_never_replays_stale_info_dict(self, monkeypatch) -> None:
         """Regression: replaying a pre-extracted info dict reuses YouTube
@@ -541,7 +844,7 @@ class TestRunDownload:
         fake = _ReplayYoutubeDL({})
         monkeypatch.setattr("yt_dlp.YoutubeDL", lambda options: fake)
 
-        _run_download({}, "https://youtu.be/abc")
+        run_download({}, "https://youtu.be/abc")
 
         assert fake.replayed is None
         assert fake.downloaded == ["https://youtu.be/abc"]

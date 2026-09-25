@@ -1,26 +1,17 @@
 """Assembly.ai transcription provider (audio upload -> transcript)."""
 
 import asyncio
-import contextlib
-import os
-import tempfile
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
-import yt_dlp
 
 from app.client.http import get_shared_http_client
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
-from app.integrations.ytdlp import (
-    build_ydlp_options,
-    is_youtube_bot_check,
-    release_temp_cookie,
-    request_cookie_refresh,
-)
+from app.providers.audio import download_audio, remove_file
 from app.providers.base import TranscriptService
 from app.providers.models import (
     TranscriptData,
@@ -34,6 +25,7 @@ _ASSEMBLY_BASE_URL = "https://api.assemblyai.com/v2"
 _UPLOAD_TIMEOUT_SECONDS = 300
 _UPLOAD_CHUNK_BYTES = 1_048_576
 _UPLOAD_PROGRESS_LOG_BYTES = 10_485_760
+_MIB = 1 << 20
 
 
 class AssemblyTranscriptService(TranscriptService):
@@ -48,6 +40,7 @@ class AssemblyTranscriptService(TranscriptService):
         youtube_url: str,
         resume_token: str = "",
         webhook_url: str = "",
+        language: str = "",
     ) -> TranscriptData:
         """Submit or resume an Assembly.ai transcription without blocking a slot.
 
@@ -56,19 +49,22 @@ class AssemblyTranscriptService(TranscriptService):
         out-of-band; a ``TranscriptJobPending`` raised for that job is flagged
         ``webhook=True`` so the task ends instead of poller-retrying. Resume
         polls never arm webhooks (Assembly fires the callback once, on submit).
+
+        ``language`` is accepted for interface parity with the other audio leaf
+        (Deepgram) but ignored here: Assembly detects language itself.
         """
         headers = {"authorization": self.api_key}
         client = get_shared_http_client()
         if resume_token:
             return await self._poll(client, headers, resume_token)
 
-        audio_path = await asyncio.to_thread(_download_audio, youtube_url)
+        audio_path = await asyncio.to_thread(download_audio, youtube_url)
         try:
             upload_url = await self._upload(client, headers, audio_path)
             transcript_id = await self._submit(client, headers, upload_url, webhook_url)
             return await self._poll(client, headers, transcript_id, webhook=bool(webhook_url))
         finally:
-            _remove_file(audio_path)
+            remove_file(audio_path)
 
     async def _upload(
         self,
@@ -78,7 +74,7 @@ class AssemblyTranscriptService(TranscriptService):
     ) -> str:
         """Upload an audio file and return its public upload_url."""
         total_bytes = Path(path).stat().st_size
-        logger.info("Assembly upload started", path=path, size_mib=_to_mib(total_bytes))
+        logger.info("Assembly upload started", path=Path(path).name, size_mib=_to_mib(total_bytes))
         started = time.monotonic()
         response = await client.post(
             f"{self.base_url}/upload",
@@ -158,7 +154,7 @@ class AssemblyTranscriptService(TranscriptService):
 
 def _to_mib(byte_count: int) -> float:
     """Convert a byte count to MiB with two decimal places."""
-    return round(byte_count / _UPLOAD_CHUNK_BYTES, 2)
+    return round(byte_count / _MIB, 2)
 
 
 def _log_upload_finished(status_code: int, total_bytes: int, elapsed: float) -> None:
@@ -167,52 +163,8 @@ def _log_upload_finished(status_code: int, total_bytes: int, elapsed: float) -> 
         "Assembly upload finished",
         status_code=status_code,
         duration_seconds=round(elapsed, 2),
-        throughput_mib_s=_to_mib(total_bytes) / elapsed,
+        throughput_mib_s=_to_mib(total_bytes) / max(elapsed, 0.001),
     )
-
-
-def _download_audio(youtube_url: str) -> str:
-    """Download a YouTube audio stream to a temp file and return its path."""
-    fd, path = tempfile.mkstemp(suffix=".webm")
-    os.close(fd)
-    destination = Path(path)
-    destination.unlink(missing_ok=True)
-    options = build_ydlp_options(
-        format="bestaudio/best",
-        outtmpl=path,
-    )
-    try:
-        _run_download(options, youtube_url)
-        if not destination.exists() or destination.stat().st_size == 0:
-            logger.error("Audio download produced no file", path=path)
-            raise ExternalServiceError("Audio download produced no file", service="yt-dlp")
-        return path
-    except ExternalServiceError:
-        _remove_file(path)
-        raise
-    except Exception as exc:
-        _remove_file(path)
-        logger.error("Audio download failed", error=str(exc))
-        raise ExternalServiceError("Could not download audio", service="yt-dlp") from exc
-
-
-def _run_download(options: dict, youtube_url: str) -> None:
-    """Run a fresh yt-dlp audio download for a URL.
-
-    Always extract and download the URL rather than replaying a previously
-    extracted ``info`` dict through ``process_ie_result``: YouTube expires the
-    video-serving URLs inside a stored ``info`` within seconds, so replays fail
-    with HTTP 403 when the caption fast path missed and we fall back to audio.
-    """
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.download([youtube_url])
-    except yt_dlp.utils.DownloadError as exc:
-        if is_youtube_bot_check(exc):
-            request_cookie_refresh()
-        raise
-    finally:
-        release_temp_cookie(options)
 
 
 def _parse_upload_response(response: httpx.Response) -> str:
@@ -249,12 +201,6 @@ async def _stream_audio_with_progress(path: str, total_bytes: int) -> AsyncItera
                 next_log_bytes += _UPLOAD_PROGRESS_LOG_BYTES
 
 
-def _remove_file(path: str) -> None:
-    """Best-effort removal of a temp audio file."""
-    with contextlib.suppress(OSError):
-        Path(path).unlink()
-
-
 def _parse_assembly_transcript(data: dict) -> TranscriptData:
     """Convert an Assembly.ai response into TranscriptData."""
     words = [
@@ -285,11 +231,11 @@ def get_transcript_provider(
     when ``None`` the global settings are fetched.
     """
     settings = settings or get_settings()
-    if settings.jumpto_live_external_calls and settings.assembly_api_key:
+    if settings.live_external_calls and settings.assembly_api_key:
         return AssemblyTranscriptService(settings.assembly_api_key)
     logger.warning(
         "Audio transcription not configured",
-        live_external_calls=settings.jumpto_live_external_calls,
+        live_external_calls=settings.live_external_calls,
         has_api_key=bool(settings.assembly_api_key),
     )
     return None

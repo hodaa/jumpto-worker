@@ -124,7 +124,7 @@ call sites previously caused a 403 regression — keep it centralized.
    (`app/services/jobs.py`).
 
 `_live_pipeline_enabled()` gates whether live external calls are allowed
-(`JUMPTO_LIVE_EXTERNAL_CALLS`); treat the gate as a runtime switch, not a
+(`LIVE_EXTERNAL_CALLS`); treat the gate as a runtime switch, not a
 provider-category property. When disabled, live data is never fabricated —
 jobs fail with `ExternalServiceError`.
 

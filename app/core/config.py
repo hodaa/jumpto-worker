@@ -70,6 +70,15 @@ class Settings(BaseSettings):
         ge=1,
         description="How many worker processes Celery should spawn for this service",
     )
+    celery_worker_max_tasks_per_child: int = Field(
+        default=100,
+        ge=1,
+        description=(
+            "How many tasks a prefork child may execute before it is replaced; "
+            "recycles RSS growth from heavy leaves (yt-dlp/Deno/ffmpeg) "
+            "(CELERY_WORKER_MAX_TASKS_PER_CHILD)"
+        ),
+    )
 
     # Job / transcription timeout
     job_timeout_seconds: int = Field(
@@ -96,6 +105,25 @@ class Settings(BaseSettings):
             "job context appended and ends the task instead of poller-retrying; "
             "empty keeps the legacy in-worker retry (ASSEMBLY_WEBHOOK_BASE_URL)"
         ),
+    )
+
+    # Audio transcription fallback selection (yt-dlp provider)
+    speech_to_text_provider: str = Field(
+        default="deepgram",
+        description=(
+            "Audio transcript provider used when captions are missing "
+            "(SPEECH_TO_TEXT_PROVIDER env var): deepgram (default) or assembly"
+        ),
+    )
+
+    # Deepgram
+    deepgram_api_key: str = Field(
+        default="",
+        description="Deepgram API key for audio transcription (DEEPGRAM_API_KEY env var)",
+    )
+    deepgram_api_url: str = Field(
+        default="https://api.deepgram.com/v1",
+        description="Deepgram API base URL (DEEPGRAM_API_URL env var)",
     )
 
     # VidWords (YouTube transcripts API)
@@ -165,7 +193,7 @@ class Settings(BaseSettings):
     )
 
     # External calls
-    jumpto_live_external_calls: Annotated[bool, BeforeValidator(_coerce_bool)] = Field(
+    live_external_calls: Annotated[bool, BeforeValidator(_coerce_bool)] = Field(
         default=False,
         description="Enable live external API calls (yt-dlp, Assembly.ai)",
     )
@@ -267,4 +295,4 @@ def get_settings() -> Settings:
 def _live_pipeline_enabled(settings: Settings | None = None) -> bool:
     """Return whether live external transcription calls are active."""
     settings = settings or get_settings()
-    return bool(getattr(settings, "jumpto_live_external_calls", False))
+    return bool(getattr(settings, "live_external_calls", False))

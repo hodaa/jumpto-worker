@@ -1,7 +1,8 @@
-"""Local transcript strategy: yt-dlp captions, then Assembly.ai audio.
+"""Local transcript strategy: yt-dlp captions, then audio transcription.
 
 Unlike the cloud providers, this strategy runs on the worker itself: yt-dlp
-downloads the caption track (fast path) or the audio stream, which Assembly.ai
+downloads the caption track (fast path) or the audio stream, which the
+configured audio-transcription leaf (Deepgram by default, or Assembly)
 transcribes. It is the terminal fallback — it either produces a transcript or
 raises, so a job that reaches it with no result is failed, not completed empty.
 """
@@ -12,13 +13,14 @@ from collections.abc import Callable
 from app.core.config import Settings, _live_pipeline_enabled, get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
-from app.providers.assembly import get_transcript_provider
 from app.providers.base import TranscriptProviderStrategy, TranscriptService, VideoTranscriptResult
 from app.providers.media import MediaInfo, get_media_info_with_raw
 from app.providers.models import TranscriptData, TranscriptJobPending
 from app.providers.registry import TranscriptProviderSpec, provider_spec, register_provider
+from app.providers.speech_to_text import get_speech_to_text_provider
 from app.providers.transcript import YouTubeCaptionTranscriptService
 from app.storage.cache import TranscriptCache, extract_youtube_video_id, get_transcript_cache
+from app.utils.text import detect_language_from_title
 
 logger = get_logger(__name__)
 
@@ -34,8 +36,9 @@ def register_self() -> None:
             name=YtDlpTranscriptProvider.name,
             build=lambda settings: YtDlpTranscriptProvider(settings=settings),
             order=_ORDER,
-            description="Local yt-dlp captions with Assembly.ai audio fallback (free, first provider).",
+            description="Local yt-dlp captions with audio transcription fallback (free, first provider).",
             uses_cloud=False,
+            cache_config_fields=("speech_to_text_provider",),
         )
     )
 
@@ -45,7 +48,7 @@ _RETRY_DELAY_SECONDS = 2
 
 
 class YtDlpTranscriptProvider(TranscriptProviderStrategy):
-    """Downloads the transcript directly (yt-dlp captions, then Assembly audio)."""
+    """Downloads the transcript directly (yt-dlp captions, then audio transcription)."""
 
     name = "yt-dlp"
     supports_resume = True
@@ -56,7 +59,7 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         *,
         settings: Settings | None = None,
         captions_service: YouTubeCaptionTranscriptService | None = None,
-        assembly_provider: Callable[..., TranscriptService | None] | None = None,
+        speech_to_text_provider: Callable[..., TranscriptService | None] | None = None,
         cache: TranscriptCache | None = None,
     ) -> None:
         """Build the strategy, optionally wiring collaborators explicitly.
@@ -64,15 +67,16 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         ``settings`` is injected by the registry spec builder; when ``None`` the
         global settings resolve lazily per call so a plain
         ``YtDlpTranscriptProvider()`` keeps working. ``captions_service``,
-        ``assembly_provider``, and ``cache`` abstract the leaf collaborators
-        (caption fast path, Assembly audio, and the transcript cache); when
-        omitted they fall back to the concrete service, the Assembly factory,
-        and the shared cache built by :func:`~app.storage.cache.get_transcript_cache`,
-        preserving current behavior.
+        ``speech_to_text_provider``, and ``cache`` abstract the leaf
+        collaborators (caption fast path, audio transcription, and the
+        transcript cache); when omitted they fall back to the concrete service,
+        the audio-transcription factory, and the shared cache built by
+        :func:`~app.storage.cache.get_transcript_cache`, preserving current
+        behavior.
         """
         self._settings = settings
         self._captions_service = captions_service
-        self._assembly_provider = assembly_provider or get_transcript_provider
+        self._speech_to_text_provider = speech_to_text_provider or get_speech_to_text_provider
         self._cache = cache
 
     def _resolve_settings(self) -> Settings:
@@ -92,11 +96,11 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         """Fetch media metadata and the best available transcript.
 
         The caption fast path is tried first; captionless or failing videos
-        fall back to audio transcription via Assembly.ai. ``resume_token``
-        resumes a previously queued Assembly job so a retry re-polls it instead
-        of re-downloading the audio. ``webhook_url`` is a public callback URL for
-        the pending Assembly job (built by the pipeline); it arms a completion
-        webhook instead of in-worker polling.
+        fall back to audio transcription. ``resume_token`` resumes a previously
+        queued Assembly job so a retry re-polls it instead of re-downloading
+        the audio. ``webhook_url`` is a public callback URL for the pending
+        Assembly job (built by the pipeline); it arms a completion webhook
+        instead of in-worker polling.
 
         When the live pipeline is on, finished transcripts are cached on disk
         keyed by the video id, so a later job for the same video skips yt-dlp
@@ -107,6 +111,10 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         cache (written when the job was first submitted) instead of re-running
         the yt-dlp metadata extract — the only work left is a single Assembly
         poll. A cache miss falls back to a fresh metadata fetch.
+
+        The video title is used to derive a language tag (Arabic-script titles
+        transcribe as Arabic, else English) that is forwarded to the audio
+        leaf, which Deepgram consumes for the transcription request.
         """
         video_id = youtube_video_id or extract_youtube_video_id(youtube_url)
         cached = await self._read_cache(video_id)
@@ -121,12 +129,15 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
             info = None  # resume skips the caption fast path entirely
         else:
             media, info = await asyncio.to_thread(
-                get_media_info_with_raw, youtube_video_id, youtube_url,
+                get_media_info_with_raw,
+                youtube_video_id,
+                youtube_url,
                 settings=self._resolve_settings(),
             )
 
+        language = detect_language_from_title(media.title)
         transcript = await self._fetch_transcript_with_retry(
-            youtube_url, info, resume_token=resume_token, webhook_url=webhook_url
+            youtube_url, info, resume_token=resume_token, webhook_url=webhook_url, language=language
         )
         result = _build_video_result(media, transcript)
 
@@ -183,26 +194,33 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         info: dict | None = None,
         resume_token: str = "",
         webhook_url: str = "",
+        language: str = "",
     ) -> TranscriptData:
         """Fetch a transcript, prioritizing captions and falling back to audio.
 
         A ``resume_token`` skips the caption fast path and directly resumes the
         pending Assembly job. Otherwise captions are tried first; when they are
-        missing or fail, audio transcription via Assembly.ai runs with retry.
-        ``webhook_url`` is forwarded to Assembly only on the initial submit.
-        ``None`` from the assembly provider means audio transcription is not
-        configured, so captionless videos fail cleanly instead of fabricating
-        data.
+        missing or fail, audio transcription runs with retry. ``webhook_url``
+        is forwarded to Assembly only on the initial submit. ``language`` is
+        forwarded to the audio leaf so asynchronous transcribers (Deepgram) can
+        pick the right language from the video title. ``None`` from the audio
+        provider means audio transcription is not configured, so captionless
+        videos fail cleanly instead of fabricating data.
         """
         if resume_token:
             return await self._fetch_audio_with_retry(
-                youtube_url, resume_token=resume_token, webhook_url=webhook_url
+                youtube_url,
+                resume_token=resume_token,
+                webhook_url=webhook_url,
+                language=language,
             )
 
         captions = await self._try_captions(youtube_url, info)
         if captions is not None:
             return captions
-        return await self._fetch_audio_with_retry(youtube_url, webhook_url=webhook_url)
+        return await self._fetch_audio_with_retry(
+            youtube_url, webhook_url=webhook_url, language=language
+        )
 
     async def _try_captions(
         self, youtube_url: str, info: dict | None = None
@@ -237,16 +255,19 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         youtube_url: str,
         resume_token: str = "",
         webhook_url: str = "",
+        language: str = "",
     ) -> TranscriptData:
-        """Transcribe audio via Assembly.ai, retrying transient failures.
+        """Transcribe audio via the configured leaf, retrying transient failures.
 
         A pending Assembly job bubbles up as ``TranscriptJobPending`` re-routed
         to the ``yt-dlp`` strategy name so the task resumes it (or ends cleanly
         when a completion webhook was armed). ``webhook_url`` is forwarded to
-        Assembly on the initial submit. Uses the provider only when audio
-        transcription is configured; otherwise the job fails cleanly.
+        Assembly on the initial submit. ``language`` is forwarded to the audio
+        leaf when the caller derived one from the video title. Uses the
+        provider only when audio transcription is configured; otherwise the job
+        fails cleanly.
         """
-        provider = self._assembly_provider(self._settings)
+        provider = self._speech_to_text_provider(self._settings)
         if provider is None:
             message = (
                 "Audio transcription is not configured; cannot resume the job"
@@ -263,6 +284,8 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
                     kwargs["resume_token"] = resume_token
                 if webhook_url:
                     kwargs["webhook_url"] = webhook_url
+                if language:
+                    kwargs["language"] = language
                 return await provider.fetch(youtube_url, **kwargs)
             except TranscriptJobPending as exc:
                 raise _strategy_pending(exc) from exc

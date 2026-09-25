@@ -120,46 +120,68 @@ def _extract_video_info(youtube_url: str) -> dict:
 
 def _caption_targets(info: dict) -> list[str]:
     """
-    Pick caption tracks to download, restricted to the video's original language.
+    Pick caption tracks to download, preferring the video's own language.
 
-    Only tracks whose base language matches the video's ``original_language``
-    are downloaded, so translated subtitles never pollute the search index.
-    Manual subtitles beat auto-captions (human-curated words), and within the
-    same language original-audio tracks (``xx-orig``) beat translated ones. A
-    video whose original-language tracks are missing yields no caption targets
-    (a soft miss that falls back to audio transcription). When
-    ``original_language`` is unknown in the metadata, the best available track
-    is used rather than dropping captions entirely.
+    Tracks are first restricted to the video's ``original_language`` when the
+    metadata reports it: translated subtitles must never pollute the search
+    index, and a video whose original-language tracks are missing yields no
+    caption targets (a soft miss that falls back to audio transcription). When
+    ``original_language`` is absent, the reported ``language`` metadata (e.g.
+    ``en-US``) is used as a hint so an English video does not silently pick a
+    translated Arabic caption. If neither signal exists -- or the hinted
+    language has no track -- the best available track is used rather than
+    dropping captions entirely. Manual subtitles beat auto-captions, and
+    ``xx-orig`` beats plain ``xx`` within the same language.
     """
     manual = list((info.get("subtitles") or {}).keys())
     auto = list((info.get("automatic_captions") or {}).keys())
-    original = str(info.get("original_language") or "").lower().strip()
+    original = _caption_primary_language(info)
     if original:
-        manual = [track for track in manual if _language_base(track) == original]
-        auto = [track for track in auto if _language_base(track) == original]
+        manual = _matching_tracks(manual, original)
+        auto = _matching_tracks(auto, original)
+        if not manual and not auto:
+            return []
+    elif info.get("language"):
+        hint = _language_base(str(info.get("language")))
+        preferred_manual = _matching_tracks(manual, hint)
+        preferred_auto = _matching_tracks(auto, hint)
+        if preferred_manual or preferred_auto:
+            manual, auto = preferred_manual, preferred_auto
+            original = hint
     if not manual and not auto:
         return []
-
-    original = str(info.get("original_language") or "").lower().strip()
-
-    def rank(track: str) -> tuple[int, int, int, str]:
-        base_matches = 0 if (original and _language_base(track) == original) else 1
-        orig = 0 if track.endswith("-orig") else (1 if "-" not in track else 2)
-        group = 0 if track in manual else 1
-        return (group, orig, base_matches, track)
-
-    def reduce(tracks: list[str]) -> str:
-        return min(tracks, key=rank)
-
-    best = reduce(manual) if manual else reduce(auto)
-    # Prefer the best of each group, then the best of the merge.
-    if manual and auto:
-        best = min([reduce(manual), reduce(auto)], key=rank)
-    candidates = [best]
+    best = _best_track(manual, auto, original)
+    targets = [best]
     base = _language_base(best)
     if base != best and base in (manual + auto):
-        candidates.append(base)
-    return candidates
+        targets.append(base)
+    return targets
+
+
+def _caption_primary_language(info: dict) -> str:
+    """Return the base language of the video's reported original language."""
+    raw = str(info.get("original_language") or "").strip()
+    return _language_base(raw) if raw else ""
+
+
+def _matching_tracks(tracks: list[str], language: str) -> list[str]:
+    """Return only caption tracks whose base language matches ``language``."""
+    return [track for track in tracks if _language_base(track) == language]
+
+
+def _best_track(manual: list[str], auto: list[str], primary: str) -> str:
+    """Pick the best track: primary language, manual, ``-orig``, then name."""
+
+    def rank(track: str) -> tuple[int, int, int, str]:
+        base_matches = 0 if (primary and _language_base(track) == primary) else 1
+        group = 0 if track in manual else 1
+        orig = 0 if track.endswith("-orig") else (1 if "-" not in track else 2)
+        return (base_matches, group, orig, track)
+
+    if manual and auto:
+        return min([min(manual, key=rank), min(auto, key=rank)], key=rank)
+    tracks = manual if manual else auto
+    return min(tracks, key=rank)
 
 
 def _preferred_vtt_file(files: list[Path]) -> Path:
