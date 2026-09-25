@@ -181,6 +181,18 @@ class Settings(BaseSettings):
         description="Application environment (development/production)",
     )
 
+    # Sentry error tracking
+    sentry_dsn: str = Field(
+        default="",
+        description="Sentry DSN; empty disables error reporting (SENTRY_DSN env var)",
+    )
+    sentry_traces_sample_rate: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Sentry performance traces sample rate 0..1 (SENTRY_TRACES_SAMPLE_RATE)",
+    )
+
     # The single transcript provider strategy. Exactly one provider runs per
     # job; unknown, unconfigured, or cloud providers while live calls are
     # disabled raise instead of silently falling through.

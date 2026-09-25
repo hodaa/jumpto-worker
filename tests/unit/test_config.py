@@ -154,3 +154,25 @@ class TestLiveExternalCallsSetting:
     def test_reads_env_var(self, monkeypatch) -> None:
         monkeypatch.setenv("LIVE_EXTERNAL_CALLS", "true")
         assert Settings(_env_file=None).live_external_calls is True
+
+
+class TestSentrySettings:
+    """Tests for the Sentry error tracking settings."""
+
+    def test_defaults_to_disabled(self, monkeypatch) -> None:
+        monkeypatch.delenv("SENTRY_DSN", raising=False)
+        settings = Settings(_env_file=None)
+        assert settings.sentry_dsn == ""
+        assert settings.sentry_traces_sample_rate == 0.0
+
+    def test_reads_configured_dsn_from_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("SENTRY_DSN", "https://abc@o1.ingest.sentry.io/123")
+        assert Settings(_env_file=None).sentry_dsn == "https://abc@o1.ingest.sentry.io/123"
+
+    def test_reads_traces_sample_rate_from_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("SENTRY_TRACES_SAMPLE_RATE", "0.5")
+        assert Settings(_env_file=None).sentry_traces_sample_rate == 0.5
+
+    def test_rejects_out_of_range_sample_rate(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, sentry_traces_sample_rate=1.5)

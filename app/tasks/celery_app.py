@@ -6,10 +6,12 @@ from celery import Celery
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging
+from app.core.sentry import init_sentry
 from app.core.timeouts import task_hard_time_limit_seconds, task_soft_time_limit_seconds
 
 settings = get_settings()
 configure_logging()
+init_sentry()
 
 broker_url = settings.broker_url
 
