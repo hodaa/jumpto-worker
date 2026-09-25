@@ -11,7 +11,7 @@ from app.integrations.ytdlp import (
     is_youtube_bot_check,
     request_cookie_refresh,
 )
-from app.providers import assembly, media, transcript
+from app.providers import audio, media, transcript
 from scripts.refresh_cookies import EXIT_NOT_LOGGED_IN, EXIT_OK, to_netscape_rows, write_cookies
 
 _BOT_CHECK_ERROR = "ERROR: [youtube] xxx: Sign in to confirm you're not a bot"
@@ -43,7 +43,7 @@ class _BoomYoutubeDL:
 def _media_settings(tmp_path) -> SimpleNamespace:
     """Settings that enable live media calls with a refresh marker."""
     return SimpleNamespace(
-        jumpto_live_external_calls=True,
+        live_external_calls=True,
         cookie_refresh_marker_path=str(tmp_path / "refresh-requested"),
     )
 
@@ -145,10 +145,10 @@ class TestBotCheckWiredIntoTranscript:
     def test_run_download_requests_refresh_and_re_raises(self, monkeypatch, tmp_path) -> None:
         monkeypatch.setattr("yt_dlp.YoutubeDL", _BoomYoutubeDL)
         refresh = Mock()
-        monkeypatch.setattr("app.providers.assembly.request_cookie_refresh", refresh)
+        monkeypatch.setattr("app.providers.audio.request_cookie_refresh", refresh)
 
         with pytest.raises(yt_dlp.utils.DownloadError):
-            assembly._run_download({}, "https://youtu.be/abc")
+            audio.run_download({}, "https://youtu.be/abc")
 
         refresh.assert_called_once()
 

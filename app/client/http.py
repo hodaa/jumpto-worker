@@ -33,7 +33,11 @@ def get_shared_http_client(
     key = (timeout, id(transport), id(httpx.AsyncClient))
     if key not in clients:
         if timeout is None:
-            client = httpx.AsyncClient(transport=transport) if transport is not None else httpx.AsyncClient()
+            client = (
+                httpx.AsyncClient(transport=transport)
+                if transport is not None
+                else httpx.AsyncClient()
+            )
         else:
             client = httpx.AsyncClient(timeout=timeout, transport=transport)
         clients[key] = client

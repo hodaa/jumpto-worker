@@ -55,3 +55,4 @@ celery_app.conf.update(
 )
 
 celery_app.conf.worker_concurrency = settings.celery_worker_concurrency
+celery_app.conf.worker_max_tasks_per_child = settings.celery_worker_max_tasks_per_child

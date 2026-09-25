@@ -23,6 +23,11 @@ _RETRY_BACKOFF_BASE_SECONDS = 0.25
 _RETRY_BACKOFF_MAX_SECONDS = 4.0
 _INTERNAL_API_KEY_HEADER = "X-Internal-API-Key"
 
+# Statuses worth retrying: transient server errors plus 429, which the backend
+# may return when rate-limiting the worker under load. Every other 4xx is a
+# client error and fails immediately, never retried.
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
 # Payloads at or above this size are gzipped before sending. Transcript bodies
 # (full text + per-word timings) compress ~5-10x, which keeps them under Vercel's
 # wire-size request-body cap (413 Request Entity Too Large) and cuts transfer
@@ -46,18 +51,17 @@ def _retry_delay(attempt: int, response: httpx.Response | None = None) -> float:
 
 
 class BackendClient:
-    """HTTP client for the backend's internal worker API."""
+    """HTTP client for the backend's internal worker API.
+
+    The underlying httpx client is shared by all tasks in the worker process
+    (``get_shared_http_client``) and owned by the process event loop, which
+    closes it at shutdown — this class never closes or owns it.
+    """
 
     def __init__(self, base_url: str, api_key: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self._client = get_shared_http_client(timeout=_REQUEST_TIMEOUT_SECONDS)
-
-    async def close(self) -> None:
-        """Keep the process-level connection pool alive for later tasks."""
-        # The client belongs to the worker-process pool, not this task. It is
-        # closed when the persistent worker event loop shuts down.
-        return None
 
     async def get_job(self, job_id: str) -> JobData:
         """Fetch job and video data for a job id."""
@@ -104,14 +108,14 @@ class BackendClient:
 
     async def fail_job(self, job_id: str, error: str) -> None:
         """Mark a job as failed with a user-safe error message."""
-        await self._request("POST", f"/internal/jobs/{job_id}/fail", json={"error": error})
+        await self._request("POST", f"/internal/jobs/{job_id}/fail", json_body={"error": error})
 
     async def _request(
         self,
         method: str,
         path: str,
         *,
-        json: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
         data: bytes | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
@@ -124,9 +128,13 @@ class BackendClient:
                 if data is not None:
                     if "Content-Type" not in headers:
                         headers["Content-Type"] = _GZIP_CONTENT_TYPE
-                    response = await self._client.request(method, url, headers=headers, content=data)
+                    response = await self._client.request(
+                        method, url, headers=headers, content=data
+                    )
                 else:
-                    response = await self._client.request(method, url, headers=headers, json=json)
+                    response = await self._client.request(
+                        method, url, headers=headers, json=json_body
+                    )
             except httpx.HTTPError as exc:
                 last_error = exc
                 logger.warning(
@@ -142,7 +150,7 @@ class BackendClient:
                 raise BackendCommunicationError(
                     f"Failed to reach backend at {path}"
                 ) from last_error
-            if response.status_code >= 500:
+            if response.status_code in _RETRYABLE_STATUS_CODES:
                 last_error = BackendCommunicationError(
                     f"Backend returned {response.status_code} for {path}"
                 )

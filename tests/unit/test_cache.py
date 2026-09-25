@@ -257,7 +257,7 @@ class TestStrategyCaching:
     @staticmethod
     def _provider(cache, *, live_calls: bool) -> ytdlp_module.YtDlpTranscriptProvider:
         return ytdlp_module.YtDlpTranscriptProvider(
-            settings=SimpleNamespace(jumpto_live_external_calls=live_calls),
+            settings=SimpleNamespace(live_external_calls=live_calls),
             cache=cache,
         )
 
@@ -275,7 +275,7 @@ class TestStrategyCaching:
         monkeypatch.setattr(ytdlp_module, "get_media_info_with_raw", media_info)
         transcript_called = {"n": 0}
 
-        async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
+        async def fetch_transcript(url, info=None, resume_token="", webhook_url="", language=""):
             transcript_called["n"] += 1
             raise AssertionError("transcript fetch must not run on cache hit")
 
@@ -299,7 +299,7 @@ class TestStrategyCaching:
             lambda video_id, url, settings=None: (media, {}),
         )
 
-        async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
+        async def fetch_transcript(url, info=None, resume_token="", webhook_url="", language=""):
             return TranscriptData(language="en", text="cached me", words=[])
 
         provider = self._provider(cache, live_calls=True)
@@ -321,7 +321,7 @@ class TestStrategyCaching:
             lambda video_id, url, settings=None: (media, None),
         )
 
-        async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
+        async def fetch_transcript(url, info=None, resume_token="", webhook_url="", language=""):
             return TranscriptData(language="en", text="fake", words=[])
 
         provider = self._provider(cache, live_calls=False)
@@ -347,7 +347,7 @@ class TestStrategyCaching:
 
         monkeypatch.setattr(ytdlp_module, "get_media_info_with_raw", media_info)
 
-        async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
+        async def fetch_transcript(url, info=None, resume_token="", webhook_url="", language=""):
             assert resume_token == "asm-123"
             assert info is None  # info not needed — captions are skipped on resume
             return TranscriptData(language="en", text="resumed transcript", words=[])
@@ -376,7 +376,7 @@ class TestStrategyCaching:
             lambda video_id, url, settings=None: (media, {}),
         )
 
-        async def fetch_transcript(url, info=None, resume_token="", webhook_url=""):
+        async def fetch_transcript(url, info=None, resume_token="", webhook_url="", language=""):
             assert resume_token == "asm-456"
             return TranscriptData(language="en", text="fresh transcript", words=[])
 

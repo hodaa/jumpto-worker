@@ -1,9 +1,11 @@
 """Backend job lifecycle for the transcription pipeline.
 
-``JobService`` owns the backend client for a single job: connect, load
+``JobService`` holds the backend client for a single job: connect, load
 (advancing pending jobs to ``processing``), submit (store transcript +
-complete), best-effort fail, and close. The pipeline and the Celery task depend
-on this abstraction rather than reaching for ``BackendClient`` directly.
+complete), best-effort fail, and release. The pipeline and the Celery task
+depend on this abstraction rather than reaching for ``BackendClient``
+directly. The underlying httpx connection is shared process-wide and closed by
+the worker event-loop teardown, not by the per-job service.
 """
 
 from collections.abc import Callable
@@ -68,12 +70,11 @@ class JobService:
             logger.exception("Failed to mark job as failed", job_id=job_id)
 
     async def close(self) -> None:
-        """Best-effort close the backend client."""
-        if self._client is None:
-            return
-        close = getattr(self._client, "close", None)
-        if close is not None:
-            await close()
+        """Release this service's handle on the pooled backend client.
+
+        The httpx client is owned by the process event loop
+        (``get_shared_http_client``) and closed at worker shutdown, not here.
+        """
         self._client = None
 
     def _require_client(self) -> BackendClient:

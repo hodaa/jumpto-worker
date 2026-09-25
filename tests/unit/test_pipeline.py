@@ -177,11 +177,11 @@ class TestFetchTranscriptWithRetry:
     """Tests for the local transcript fetch with retry behaviour."""
 
     @staticmethod
-    def _provider(captions_service=None, assembly_provider=None, *, live_calls=True):
+    def _provider(captions_service=None, speech_to_text_provider=None, *, live_calls=True):
         return ytdlp_module.YtDlpTranscriptProvider(
             settings=_settings(live_calls=live_calls),
             captions_service=captions_service,
-            assembly_provider=assembly_provider,
+            speech_to_text_provider=speech_to_text_provider,
         )
 
     @pytest.mark.asyncio
@@ -222,7 +222,7 @@ class TestFetchTranscriptWithRetry:
 
         provider = self._provider(
             captions_service=youtube_provider,
-            assembly_provider=lambda settings: fallback,
+            speech_to_text_provider=lambda settings: fallback,
         )
 
         result = await provider._fetch_transcript_with_retry("https://youtu.be/abcde12345")
@@ -239,7 +239,7 @@ class TestFetchTranscriptWithRetry:
         fallback = AsyncMock()
         fallback.fetch.return_value = _transcript()
 
-        provider = self._provider(assembly_provider=lambda settings: fallback)
+        provider = self._provider(speech_to_text_provider=lambda settings: fallback)
 
         result = await provider._fetch_transcript_with_retry("https://youtu.be/abcde12345", info)
 
@@ -268,7 +268,7 @@ class TestFetchTranscriptWithRetry:
 
         provider = self._provider(
             captions_service=captions,
-            assembly_provider=lambda settings: audio,
+            speech_to_text_provider=lambda settings: audio,
         )
 
         with pytest.raises(TranscriptJobPending) as excinfo:
@@ -301,7 +301,7 @@ class TestFetchTranscriptWithRetry:
 
         provider = self._provider(
             captions_service=captions,
-            assembly_provider=lambda settings: audio,
+            speech_to_text_provider=lambda settings: audio,
         )
 
         with pytest.raises(TranscriptJobPending) as excinfo:
@@ -327,7 +327,7 @@ class TestFetchTranscriptWithRetry:
 
         provider = self._provider(
             captions_service=captions,
-            assembly_provider=lambda settings: fallback,
+            speech_to_text_provider=lambda settings: fallback,
         )
 
         webhook = "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=yt-dlp"
@@ -351,7 +351,7 @@ class TestFetchTranscriptWithRetry:
         fallback.fetch.side_effect = fail
 
         provider = self._provider(
-            assembly_provider=lambda settings: fallback,
+            speech_to_text_provider=lambda settings: fallback,
             live_calls=False,
         )
 
@@ -503,7 +503,7 @@ class TestResolveProvider:
         assert provider_resolve(_full_settings(video_provider="yt-dlp")).name == "yt-dlp"
 
     def test_cloud_provider_raises_when_not_live(self) -> None:
-        settings = _full_settings(video_provider="vidwords", jumpto_live_external_calls=False)
+        settings = _full_settings(video_provider="vidwords", live_external_calls=False)
         with pytest.raises(ValueError):
             provider_resolve(settings)
 
@@ -851,7 +851,7 @@ def _settings(*, live_calls: bool) -> SimpleNamespace:
         backend_url="http://backend.test:8000",
         internal_api_key="key",
         job_timeout_seconds=600,
-        jumpto_live_external_calls=live_calls,
+        live_external_calls=live_calls,
         vidwords_api_key="",
     )
 
@@ -859,7 +859,7 @@ def _settings(*, live_calls: bool) -> SimpleNamespace:
 def _full_settings(**overrides) -> Settings:
     """Build real worker settings with every cloud provider configured."""
     values = {
-        "jumpto_live_external_calls": True,
+        "live_external_calls": True,
         "transcriptfetch_api_key": "tf-key",
         "transcriptfetch_lang": "en",
         "transcriptfetch_mode": "auto",

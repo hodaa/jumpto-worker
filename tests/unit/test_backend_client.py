@@ -4,6 +4,7 @@ import gzip
 import json
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from app.client.backend import BackendClient
@@ -101,7 +102,9 @@ async def test_store_transcript_gzips_large_payload(monkeypatch) -> None:
     monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
 
     words = [
-        TranscriptWordData(word_index=i, word="keyword", start_time=i * 0.4, end_time=i * 0.4 + 0.35)
+        TranscriptWordData(
+            word_index=i, word="keyword", start_time=i * 0.4, end_time=i * 0.4 + 0.35
+        )
         for i in range(60_000)
     ]
     submission = TranscriptSubmission(
@@ -164,8 +167,51 @@ async def test_get_job_raises_on_non_2xx(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_request_retries_on_5xx(monkeypatch) -> None:
-    first = _json_response(500)
+async def test_request_retries_on_network_error(monkeypatch) -> None:
+    success = _json_response(
+        200,
+        {
+            "job_id": "job-1",
+            "video_id": "video-1",
+            "youtube_video_id": "abcde12345",
+            "youtube_url": "https://www.youtube.com/watch?v=abcde12345",
+            "status": "pending",
+        },
+    )
+    client_context = _client_context(success)
+    client_context.request.side_effect = [httpx.ConnectError("boom"), success]
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+    monkeypatch.setattr("app.client.backend.asyncio.sleep", AsyncMock())
+
+    client = BackendClient(_BASE, _API_KEY)
+    job = await client.get_job("job-1")
+
+    assert client_context.request.await_count == 2
+    assert job.job_id == "job-1"
+
+
+@pytest.mark.asyncio
+async def test_request_raises_after_exhausting_network_retries(monkeypatch) -> None:
+    client_context = _client_context(Mock())
+    client_context.request.side_effect = [
+        httpx.ConnectError("boom"),
+        httpx.ConnectError("boom"),
+        httpx.ConnectError("boom"),
+    ]
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+    monkeypatch.setattr("app.client.backend.asyncio.sleep", AsyncMock())
+
+    client = BackendClient(_BASE, _API_KEY)
+    with pytest.raises(BackendCommunicationError):
+        await client.get_job("job-1")
+
+    assert client_context.request.await_count == 3
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504])
+@pytest.mark.asyncio
+async def test_request_retries_on_retryable_status(monkeypatch, status_code) -> None:
+    first = _json_response(status_code)
     second = _json_response(
         200,
         {
@@ -179,8 +225,51 @@ async def test_request_retries_on_5xx(monkeypatch) -> None:
     client_context = _client_context(first)
     client_context.request.side_effect = [first, second]
     monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+    monkeypatch.setattr("app.client.backend.asyncio.sleep", AsyncMock())
 
     client = BackendClient(_BASE, _API_KEY)
     await client.get_job("job-1")
 
     assert client_context.request.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_request_honours_retry_after_on_429(monkeypatch) -> None:
+    first = _json_response(429)
+    first.headers = {"Retry-After": "2"}
+    second = _json_response(
+        200,
+        {
+            "job_id": "job-1",
+            "video_id": "video-1",
+            "youtube_video_id": "abcde12345",
+            "youtube_url": "https://www.youtube.com/watch?v=abcde12345",
+            "status": "pending",
+        },
+    )
+    client_context = _client_context(first)
+    client_context.request.side_effect = [first, second]
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+    sleep = AsyncMock()
+    monkeypatch.setattr("app.client.backend.asyncio.sleep", sleep)
+
+    client = BackendClient(_BASE, _API_KEY)
+    await client.get_job("job-1")
+
+    assert client_context.request.await_count == 2
+    assert sleep.await_count == 1
+    assert sleep.await_args.args[0] == 2.0
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
+@pytest.mark.asyncio
+async def test_request_does_not_retry_client_errors(monkeypatch, status_code) -> None:
+    response = _json_response(status_code)
+    client_context = _client_context(response)
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+
+    client = BackendClient(_BASE, _API_KEY)
+    with pytest.raises(BackendCommunicationError):
+        await client.get_job("job-1")
+
+    assert client_context.request.await_count == 1

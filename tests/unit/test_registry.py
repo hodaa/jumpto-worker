@@ -19,7 +19,7 @@ from app.providers.ytdlp import YtDlpTranscriptProvider
 def _settings(**overrides) -> Settings:
     """Build settings with every cloud provider configured."""
     values = {
-        "jumpto_live_external_calls": True,
+        "live_external_calls": True,
         "transcriptfetch_api_key": "tf-key",
         "transcriptfetch_lang": "en",
         "transcriptfetch_mode": "auto",
