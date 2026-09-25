@@ -143,6 +143,21 @@ async def test_complete_job(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_complete_job_sends_note(monkeypatch) -> None:
+    response = _json_response(200, {"status": "completed"})
+    client_context = _client_context(response)
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+
+    client = BackendClient(_BASE, _API_KEY)
+    await client.complete_job("job-1", "No speech detected in this video.")
+
+    assert client_context.request.await_args.args[1].endswith("/complete")
+    assert client_context.request.await_args.kwargs["json"] == {
+        "message": "No speech detected in this video."
+    }
+
+
+@pytest.mark.asyncio
 async def test_fail_job_sends_error(monkeypatch) -> None:
     response = _json_response(200, {"status": "failed"})
     client_context = _client_context(response)
@@ -273,3 +288,48 @@ async def test_request_does_not_retry_client_errors(monkeypatch, status_code) ->
         await client.get_job("job-1")
 
     assert client_context.request.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_client_error_includes_validation_detail(monkeypatch) -> None:
+    response = _json_response(
+        422,
+        {
+            "detail": [
+                {
+                    "loc": ["body", "language"],
+                    "msg": "String should have at least 1 character",
+                    "type": "string_too_short",
+                }
+            ]
+        },
+    )
+    client_context = _client_context(response)
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+
+    client = BackendClient(_BASE, _API_KEY)
+    with pytest.raises(BackendCommunicationError) as exc_info:
+        await client.get_job("job-1")
+
+    message = str(exc_info.value)
+    assert "422" in message
+    assert "body.language: String should have at least 1 character" in message
+
+
+@pytest.mark.asyncio
+async def test_client_error_truncates_many_validation_errors(monkeypatch) -> None:
+    detail = [
+        {"loc": ["body", "words", i, "word"], "msg": "String should have at least 1 character"}
+        for i in range(50)
+    ]
+    response = _json_response(422, {"detail": detail})
+    client_context = _client_context(response)
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+
+    client = BackendClient(_BASE, _API_KEY)
+    with pytest.raises(BackendCommunicationError) as exc_info:
+        await client.get_job("job-1")
+
+    message = str(exc_info.value)
+    assert "body.words.0.word: String should have at least 1 character" in message
+    assert "(+49 more)" in message

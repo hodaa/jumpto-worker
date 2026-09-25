@@ -12,7 +12,11 @@ from collections.abc import Callable
 
 from app.client import BackendClient
 from app.core.config import get_settings
-from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
+from app.core.exceptions import (
+    ExternalServiceError,
+    NoSpeechDetectedError,
+    PermanentExternalServiceError,
+)
 from app.core.logging import get_logger
 from app.core.timeouts import pipeline_timeout_seconds
 from app.models import TranscriptSubmission
@@ -27,6 +31,7 @@ logger = get_logger(__name__)
 _USER_SAFE_FAILURE = "Transcription failed. Please try again later."
 EXTERNAL_FAILURE = "Could not fetch the transcript for this video. Please try again later."
 _TIMEOUT_SAFE_MESSAGE = "Transcription timed out. Please try again later."
+NO_SPEECH_SAFE_MESSAGE = "No speech detected in this video."
 
 
 async def run_pipeline(
@@ -73,6 +78,14 @@ async def run_pipeline(
                 resume_provider=resume_provider,
             )
             raise
+        except NoSpeechDetectedError:
+            logger.info(
+                "Job completed without transcript (no speech detected)",
+                job_id=job_id,
+                **video_context,
+            )
+            await jobs.complete(job_id, NO_SPEECH_SAFE_MESSAGE)
+            return {"status": "completed", "video_id": job.video_id}
         except Exception as exc:
             error = user_safe_message(exc)
             logger.exception(
@@ -105,6 +118,13 @@ async def perform_transcription(
             provider=provider.name,
             youtube_url=job.youtube_url,
         )
+        if not result.transcript.text.strip():
+            logger.warning(
+                "Transcript contained no speech",
+                provider=provider.name,
+                youtube_url=job.youtube_url,
+            )
+            raise NoSpeechDetectedError("Transcript contained no speech")
         return build_result_submission(result, provider.name)
 
     raise ExternalServiceError(
@@ -162,6 +182,8 @@ async def try_provider(
 
 def user_safe_message(exc: Exception) -> str:
     """Map an exception to a user-safe failure message."""
+    if isinstance(exc, NoSpeechDetectedError):
+        return NO_SPEECH_SAFE_MESSAGE
     if isinstance(exc, ExternalServiceError | PermanentExternalServiceError):
         return EXTERNAL_FAILURE
     if isinstance(exc, TimeoutError):

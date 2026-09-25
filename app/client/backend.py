@@ -50,6 +50,22 @@ def _retry_delay(attempt: int, response: httpx.Response | None = None) -> float:
     return random.uniform(cap / 2, cap)
 
 
+def _summarize_error_body(response: httpx.Response) -> str:
+    """Return a compact summary of a non-2xx response body for error messages."""
+    try:
+        body = response.json()
+    except ValueError:
+        return response.content.decode("utf-8", errors="replace")[:500]
+    if isinstance(body, dict) and isinstance(body.get("detail"), list) and body["detail"]:
+        first = body["detail"][0]
+        loc = ".".join(str(part) for part in first.get("loc") or [])
+        message = f"{loc}: {first.get('msg', '')}" if loc else str(first.get("msg", ""))
+        extra = len(body["detail"]) - 1
+        return message if extra <= 0 else f"{message} (+{extra} more)"
+    text = body if isinstance(body, str) else json.dumps(body, separators=(",", ":"))
+    return text[:500]
+
+
 class BackendClient:
     """HTTP client for the backend's internal worker API.
 
@@ -102,9 +118,14 @@ class BackendClient:
             extra_headers=extra_headers,
         )
 
-    async def complete_job(self, job_id: str) -> None:
-        """Mark a job as completed."""
-        await self._request("POST", f"/internal/jobs/{job_id}/complete")
+    async def complete_job(self, job_id: str, message: str = "") -> None:
+        """Mark a job as completed, optionally carrying an outcome note."""
+        body = {"message": message} if message else None
+        await self._request(
+            "POST",
+            f"/internal/jobs/{job_id}/complete",
+            json_body=body,
+        )
 
     async def fail_job(self, job_id: str, error: str) -> None:
         """Mark a job as failed with a user-safe error message."""
@@ -167,7 +188,8 @@ class BackendClient:
                 raise last_error
             if response.status_code >= 400:
                 raise BackendCommunicationError(
-                    f"Backend rejected request {method} {path}: {response.status_code}"
+                    f"Backend rejected request {method} {path}: {response.status_code} — "
+                    f"{_summarize_error_body(response)}"
                 )
             data = response.content
             if not data:

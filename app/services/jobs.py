@@ -61,6 +61,11 @@ class JobService:
         await client.store_transcript(job_id, submission)
         await client.complete_job(job_id)
 
+    async def complete(self, job_id: str, message: str = "") -> None:
+        """Mark a job completed, optionally attaching an outcome note."""
+        client = self._require_client()
+        await client.complete_job(job_id, message)
+
     async def fail(self, job_id: str, message: str) -> None:
         """Best-effort mark a job as failed through an existing client."""
         client = self._require_client()

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, call
 import pytest
 
 from app.core.config import Settings, _live_pipeline_enabled
-from app.core.exceptions import ExternalServiceError
+from app.core.exceptions import ExternalServiceError, NoSpeechDetectedError
 from app.models import JobData, TranscriptSubmission
 from app.providers import (
     TranscriptData,
@@ -135,6 +135,25 @@ class TestRunPipeline:
         assert client.calls[-1] == "fail"
 
     @pytest.mark.asyncio
+    async def test_no_speech_completes_job_with_note(self, monkeypatch) -> None:
+        client = _FakeClient()
+        monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
+        settings = _settings(live_calls=False)
+        monkeypatch.setattr(pipeline_module, "get_settings", lambda: settings)
+
+        def no_speech(job, resume_token="", resume_provider=""):
+            raise NoSpeechDetectedError("Transcript contained no speech")
+
+        monkeypatch.setattr(pipeline_module, "perform_transcription", no_speech)
+
+        result = await run_pipeline("job-1")
+
+        assert result["status"] == "completed"
+        assert client.failed is False
+        assert client.calls[-1] == "complete"
+        assert client.last_complete_message == "No speech detected in this video."
+
+    @pytest.mark.asyncio
     async def test_first_attempt_advances_then_raises_pending(self, monkeypatch) -> None:
         client = _FakeClient()
         monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
@@ -171,6 +190,10 @@ class TestRunPipeline:
             user_safe_message(RuntimeError("x")) == "Transcription failed. Please try again later."
         )
         assert "timed out" in user_safe_message(TimeoutError())
+        assert (
+            user_safe_message(NoSpeechDetectedError("no speech"))
+            == "No speech detected in this video."
+        )
 
 
 class TestFetchTranscriptWithRetry:
@@ -527,6 +550,18 @@ class TestPerformTranscription:
             await perform_transcription(_job())
 
     @pytest.mark.asyncio
+    async def test_empty_transcript_raises_no_speech_error(self, monkeypatch) -> None:
+        provider = SimpleNamespace(
+            name="yt-dlp",
+            supports_resume=True,
+            fetch=AsyncMock(return_value=_no_speech_result()),
+        )
+        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings: provider)
+
+        with pytest.raises(NoSpeechDetectedError):
+            await perform_transcription(_job())
+
+    @pytest.mark.asyncio
     async def test_default_ytdlp_provider_used(self, monkeypatch) -> None:
         ytdlp = self._ytdlp()
         monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings: ytdlp)
@@ -846,6 +881,8 @@ class _FakeClient:
         self.status = status
         self.calls: list[str] = []
         self.failed = False
+        self.last_error: str | None = None
+        self.last_complete_message = ""
 
     async def get_job(self, job_id: str) -> JobData:
         self.calls.append("get_job")
@@ -864,12 +901,14 @@ class _FakeClient:
     async def store_transcript(self, job_id: str, submission) -> None:
         self.calls.append("store")
 
-    async def complete_job(self, job_id: str) -> None:
+    async def complete_job(self, job_id: str, message: str = "") -> None:
         self.calls.append("complete")
+        self.last_complete_message = message
 
     async def fail_job(self, job_id: str, error: str) -> None:
         self.calls.append("fail")
         self.failed = True
+        self.last_error = error
 
 
 def _media():
@@ -912,6 +951,17 @@ def _ytdlp_result() -> VideoTranscriptResult:
         duration_seconds=240,
         is_generated=False,
         transcript=_transcript(),
+    )
+
+
+def _no_speech_result() -> VideoTranscriptResult:
+    """Build a provider result whose transcript contains no speech."""
+    return VideoTranscriptResult(
+        title="Silent Video",
+        author="",
+        duration_seconds=60,
+        is_generated=False,
+        transcript=TranscriptData(language="en", text="", words=[]),
     )
 
 

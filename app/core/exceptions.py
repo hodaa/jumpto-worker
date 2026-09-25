@@ -71,6 +71,29 @@ class PermanentExternalServiceError(DomainError):
         )
 
 
+class NoSpeechDetectedError(DomainError):
+    """Per-video outcome: a provider produced a transcript with no speech.
+
+    Raised when a provider returns an empty transcript (silent video,
+    music-only audio, no ASR output). Deliberately a *sibling* of
+    :class:`ExternalServiceError` rather than a subclass: it is a terminal
+    per-video outcome, not a soft miss, and the job must fail with a specific
+    user-safe message instead of "could not fetch the transcript".
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            code="NO_SPEECH_DETECTED",
+            details=details or {},
+        )
+
+
 class BackendCommunicationError(DomainError):
     """Exception for failures while communicating with the backend API."""
 
