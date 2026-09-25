@@ -96,3 +96,8 @@ jobs:
             fi
 
             echo "Deployment successful"
+
+            # 5. Reclaim disk: drop images not in use (the running container
+            #    keeps its image), so the boot volume doesn't fill with one
+            #    per-commit image after every deploy.
+            docker image prune -a -f
