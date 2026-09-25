@@ -165,6 +165,55 @@ class TestAssignmentFetcher:
         assert not audio_file.exists()
 
     @pytest.mark.asyncio
+    async def test_fetch_reuses_caller_provided_audio_path(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """An injected audio_path must be uploaded in place: no download, no
+        removal (the caller owns the file and reuses it across retries)."""
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"fake-audio")
+        downloads = []
+
+        def must_not_download(url):
+            downloads.append(url)
+            raise AssertionError("must not download when audio_path is injected")
+
+        monkeypatch.setattr("app.providers.assembly.download_audio", must_not_download)
+
+        upload_response = Mock(status_code=200)
+        upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/fake"}
+
+        submit_response = Mock(status_code=200)
+        submit_response.json.return_value = {"id": "transcript-1"}
+
+        completed_body = {
+            "status": "completed",
+            "language_code": "en",
+            "text": "hello world",
+            "words": [{"text": "hello", "start": 0, "end": 100}],
+        }
+        poll_response = Mock(status_code=200)
+        poll_response.json.return_value = completed_body
+
+        client = AsyncMock()
+        client.post.side_effect = [upload_response, submit_response]
+        client.get.return_value = poll_response
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        monkeypatch.setattr("app.providers.assembly.httpx.AsyncClient", lambda: client)
+
+        provider = AssemblyTranscriptService("key")
+        transcript = await provider.fetch(
+            "https://youtu.be/abcde12345", audio_path=str(audio_file)
+        )
+
+        assert transcript.text == "hello world"
+        assert not downloads
+        assert client.post.call_count == 2
+        assert audio_file.exists()
+
+    @pytest.mark.asyncio
     async def test_upload_sends_bytes_not_file_object(self, tmp_path) -> None:
         """Regression: AsyncClient rejects sync file objects as content, so the
         audio body must be read to bytes before upload."""
@@ -516,7 +565,24 @@ class TestDeepgramFetcher:
         assert excinfo.value.details["status_code"] == status_code
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504])
+    @pytest.mark.parametrize("status_code", [400, 404, 405, 409, 422])
+    async def test_config_4xx_raises_permanent_error(self, tmp_path, status_code: int) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code, json={"err_msg": "Bad request."})
+
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+
+        provider = DeepgramTranscriptService("key", base_url="https://api.deepgram.test/v1")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(PermanentExternalServiceError) as excinfo:
+                await provider._transcribe(client, str(audio_file), "en")
+
+        assert excinfo.value.details["service"] == "deepgram"
+        assert excinfo.value.details["status_code"] == status_code
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [408, 429, 500, 502, 503, 504])
     async def test_transient_status_codes_remain_soft_errors(
         self, tmp_path, status_code: int
     ) -> None:
@@ -530,6 +596,43 @@ class TestDeepgramFetcher:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             with pytest.raises(ExternalServiceError):
                 await provider._transcribe(client, str(audio_file), "en")
+
+    @pytest.mark.asyncio
+    async def test_fetch_reuses_caller_provided_audio_path(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """An injected audio_path must be transcribed in place: no download, no
+        removal (the caller owns the file and reuses it across retries)."""
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+        downloads = []
+
+        def must_not_download(url):
+            downloads.append(url)
+            raise AssertionError("must not download when audio_path is injected")
+
+        monkeypatch.setattr("app.providers.deepgram.download_audio", must_not_download)
+
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["content"] = request.read()
+            return httpx.Response(200, json=self._body())
+
+        monkeypatch.setattr(
+            "app.providers.deepgram.get_shared_http_client",
+            lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        provider = DeepgramTranscriptService("dg-key", base_url="https://api.deepgram.test/v1")
+        transcript = await provider.fetch(
+            "https://youtu.be/abcde12345", language="ar", audio_path=str(audio_file)
+        )
+
+        assert transcript.text == "hello world"
+        assert not downloads
+        assert captured["content"] == b"data"
+        assert audio_file.exists()
 
 
 class TestSpeechToTextSelection:

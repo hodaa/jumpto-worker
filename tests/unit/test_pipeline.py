@@ -1,7 +1,7 @@
 """Unit tests for the worker transcription pipeline."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -184,6 +184,19 @@ class TestFetchTranscriptWithRetry:
             speech_to_text_provider=speech_to_text_provider,
         )
 
+    @staticmethod
+    def _patch_audio(monkeypatch, tmp_path):
+        """Stub the composite's audio download/cleanup with a fake file.
+
+        The composite owns the audio download now, so tests must never reach
+        the real yt-dlp downloader.
+        """
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+        monkeypatch.setattr(ytdlp_module, "download_audio", lambda url: str(audio_file))
+        monkeypatch.setattr(ytdlp_module, "remove_file", lambda path: None)
+        return audio_file
+
     @pytest.mark.asyncio
     async def test_uses_captions_fast_path_when_live(self) -> None:
         youtube_provider = AsyncMock()
@@ -210,7 +223,9 @@ class TestFetchTranscriptWithRetry:
         youtube_provider.fetch.assert_awaited_once_with("https://youtu.be/abcde12345", info=None)
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_audio_provider_after_captions_fail(self) -> None:
+    async def test_falls_back_to_audio_provider_after_captions_fail(
+        self, monkeypatch, tmp_path
+    ) -> None:
         def fail(url, info=None):
             raise ExternalServiceError("No captions", service="youtube-captions")
 
@@ -224,14 +239,19 @@ class TestFetchTranscriptWithRetry:
             captions_service=youtube_provider,
             speech_to_text_provider=lambda settings: fallback,
         )
+        audio_file = self._patch_audio(monkeypatch, tmp_path)
 
         result = await provider._fetch_transcript_with_retry("https://youtu.be/abcde12345")
 
         assert result.text == "Hello, world!"
-        fallback.fetch.assert_awaited_once()
+        fallback.fetch.assert_awaited_once_with(
+            "https://youtu.be/abcde12345", audio_path=str(audio_file)
+        )
 
     @pytest.mark.asyncio
-    async def test_captionless_video_falls_back_to_audio(self) -> None:
+    async def test_captionless_video_falls_back_to_audio(
+        self, monkeypatch, tmp_path
+    ) -> None:
         """A fully caption-less video yields no captions from the real caption
         provider, then falls back to the audio (Assembly) transcript path."""
         info = {"id": "abcde12345", "automatic_captions": {}, "subtitles": {}}
@@ -240,15 +260,20 @@ class TestFetchTranscriptWithRetry:
         fallback.fetch.return_value = _transcript()
 
         provider = self._provider(speech_to_text_provider=lambda settings: fallback)
+        audio_file = self._patch_audio(monkeypatch, tmp_path)
 
         result = await provider._fetch_transcript_with_retry("https://youtu.be/abcde12345", info)
 
         assert result.text == "Hello, world!"
         fallback.fetch.assert_awaited_once()
-        fallback.fetch.assert_awaited_with("https://youtu.be/abcde12345")
+        fallback.fetch.assert_awaited_with(
+            "https://youtu.be/abcde12345", audio_path=str(audio_file)
+        )
 
     @pytest.mark.asyncio
-    async def test_pending_audio_job_bubbles_as_strategy_provider(self) -> None:
+    async def test_pending_audio_job_bubbles_as_strategy_provider(
+        self, monkeypatch, tmp_path
+    ) -> None:
         """A pending Assembly job from the first attempt must route as yt-dlp
         so the retry resumes the same transcript instead of re-downloading."""
 
@@ -270,6 +295,7 @@ class TestFetchTranscriptWithRetry:
             captions_service=captions,
             speech_to_text_provider=lambda settings: audio,
         )
+        self._patch_audio(monkeypatch, tmp_path)
 
         with pytest.raises(TranscriptJobPending) as excinfo:
             await provider._fetch_transcript_with_retry("https://youtu.be/abcde12345")
@@ -280,7 +306,9 @@ class TestFetchTranscriptWithRetry:
         assert audio.fetch.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_pending_webhook_flag_survives_strategy_remap(self) -> None:
+    async def test_pending_webhook_flag_survives_strategy_remap(
+        self, monkeypatch, tmp_path
+    ) -> None:
         """A webhook-armed Assembly pending must reach the task still flagged,
         so it ends cleanly instead of consuming the in-worker retry budget."""
 
@@ -303,6 +331,7 @@ class TestFetchTranscriptWithRetry:
             captions_service=captions,
             speech_to_text_provider=lambda settings: audio,
         )
+        self._patch_audio(monkeypatch, tmp_path)
 
         with pytest.raises(TranscriptJobPending) as excinfo:
             await provider._fetch_transcript_with_retry(
@@ -315,7 +344,9 @@ class TestFetchTranscriptWithRetry:
         assert excinfo.value.resume_token == "asm-1"
 
     @pytest.mark.asyncio
-    async def test_webhook_url_forwarded_to_audio_provider_on_submit(self) -> None:
+    async def test_webhook_url_forwarded_to_audio_provider_on_submit(
+        self, monkeypatch, tmp_path
+    ) -> None:
         def fail(url, info=None):
             raise ExternalServiceError("No captions", service="youtube-captions")
 
@@ -329,6 +360,7 @@ class TestFetchTranscriptWithRetry:
             captions_service=captions,
             speech_to_text_provider=lambda settings: fallback,
         )
+        audio_file = self._patch_audio(monkeypatch, tmp_path)
 
         webhook = "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=yt-dlp"
         result = await provider._fetch_transcript_with_retry(
@@ -337,14 +369,16 @@ class TestFetchTranscriptWithRetry:
 
         assert result.text == "Hello, world!"
         fallback.fetch.assert_awaited_once()
-        fallback.fetch.assert_awaited_with("https://youtu.be/abcde12345", webhook_url=webhook)
+        fallback.fetch.assert_awaited_with(
+            "https://youtu.be/abcde12345", webhook_url=webhook, audio_path=str(audio_file)
+        )
 
     @pytest.mark.asyncio
-    async def test_raises_after_retries_exhausted(self, monkeypatch) -> None:
+    async def test_raises_after_retries_exhausted(self, monkeypatch, tmp_path) -> None:
         monkeypatch.setattr(ytdlp_module, "_RETRY_ATTEMPTS", 2)
         monkeypatch.setattr(ytdlp_module, "_RETRY_DELAY_SECONDS", 0)
 
-        def fail(url):
+        def fail(url, audio_path=""):
             raise ExternalServiceError("boom", service="assemblyai")
 
         fallback = AsyncMock()
@@ -355,10 +389,55 @@ class TestFetchTranscriptWithRetry:
             live_calls=False,
         )
 
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+        removed = []
+        monkeypatch.setattr(ytdlp_module, "download_audio", lambda url: str(audio_file))
+        monkeypatch.setattr(ytdlp_module, "remove_file", lambda path: removed.append(path))
+
         with pytest.raises(ExternalServiceError):
             await provider._fetch_transcript_with_retry("https://youtu.be/abcde12345")
 
         assert fallback.fetch.await_count == 2
+        assert fallback.fetch.await_args_list == [
+            call("https://youtu.be/abcde12345", audio_path=str(audio_file)),
+            call("https://youtu.be/abcde12345", audio_path=str(audio_file)),
+        ]
+        assert removed == [str(audio_file)]
+
+    @pytest.mark.asyncio
+    async def test_reuses_same_audio_file_across_retries(self, monkeypatch, tmp_path) -> None:
+        """A speech-to-text failure must re-submit the same file, not re-download."""
+        monkeypatch.setattr(ytdlp_module, "_RETRY_ATTEMPTS", 3)
+        monkeypatch.setattr(ytdlp_module, "_RETRY_DELAY_SECONDS", 0)
+
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+        downloads = []
+        removed = []
+        monkeypatch.setattr(ytdlp_module, "download_audio", lambda url: downloads.append(url) or str(audio_file))
+        monkeypatch.setattr(ytdlp_module, "remove_file", lambda path: removed.append(path))
+
+        seen: list[str] = []
+
+        async def fetch(url, **kwargs):
+            seen.append(kwargs.get("audio_path", ""))
+            raise ExternalServiceError("boom", service="deepgram")
+
+        fallback = AsyncMock()
+        fallback.fetch.side_effect = fetch
+        provider = self._provider(
+            speech_to_text_provider=lambda settings: fallback,
+            live_calls=False,
+        )
+
+        with pytest.raises(ExternalServiceError):
+            await provider._fetch_transcript_with_retry("https://youtu.be/abcde12345")
+
+        assert downloads == ["https://youtu.be/abcde12345"]
+        assert len(seen) == 3
+        assert set(seen) == {str(audio_file)}
+        assert removed == [str(audio_file)]
 
 
 class TestLivePipelineEnabled:

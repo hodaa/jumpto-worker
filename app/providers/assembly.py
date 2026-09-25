@@ -41,6 +41,7 @@ class AssemblyTranscriptService(TranscriptService):
         resume_token: str = "",
         webhook_url: str = "",
         language: str = "",
+        audio_path: str = "",
     ) -> TranscriptData:
         """Submit or resume an Assembly.ai transcription without blocking a slot.
 
@@ -52,19 +53,25 @@ class AssemblyTranscriptService(TranscriptService):
 
         ``language`` is accepted for interface parity with the other audio leaf
         (Deepgram) but ignored here: Assembly detects language itself.
+        ``audio_path`` is a caller-owned audio file to upload (download and
+        cleanup are then the caller's job, so retries reuse the same file);
+        when empty the leaf downloads its own temp file and removes it.
         """
         headers = {"authorization": self.api_key}
         client = get_shared_http_client()
         if resume_token:
             return await self._poll(client, headers, resume_token)
 
-        audio_path = await asyncio.to_thread(download_audio, youtube_url)
+        owns_audio = not audio_path
+        if owns_audio:
+            audio_path = await asyncio.to_thread(download_audio, youtube_url)
         try:
             upload_url = await self._upload(client, headers, audio_path)
             transcript_id = await self._submit(client, headers, upload_url, webhook_url)
             return await self._poll(client, headers, transcript_id, webhook=bool(webhook_url))
         finally:
-            remove_file(audio_path)
+            if owns_audio:
+                remove_file(audio_path)
 
     async def _upload(
         self,

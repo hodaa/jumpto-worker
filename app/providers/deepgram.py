@@ -28,6 +28,7 @@ _DEEPGRAM_BASE_URL = "https://api.deepgram.com/v1"
 _TRANSCRIBE_TIMEOUT_SECONDS = 600
 _TRANSCRIBE_CHUNK_BYTES = 1_048_576
 _PERMANENT_AUTH_STATUS_CODES = {401, 403}
+_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
 class DeepgramTranscriptService(TranscriptService):
@@ -43,6 +44,7 @@ class DeepgramTranscriptService(TranscriptService):
         resume_token: str = "",
         webhook_url: str = "",
         language: str = "",
+        audio_path: str = "",
     ) -> TranscriptData:
         """Transcribe a video's audio synchronously and return the transcript.
 
@@ -50,14 +52,20 @@ class DeepgramTranscriptService(TranscriptService):
         with the Assembly leaf but never used: Deepgram completes in a single
         request, so nothing is resumable and no callback is armed. ``language``
         is a Deepgram language tag (derived from the video title by the caller)
-        threaded into the transcription request when non-empty.
+        threaded into the transcription request when non-empty. ``audio_path``
+        is a caller-owned audio file to transcribe in place (download and
+        cleanup are then the caller's job, so retries reuse the same file);
+        when empty the leaf downloads its own temp file and removes it.
         """
-        audio_path = await asyncio.to_thread(download_audio, youtube_url)
+        owns_audio = not audio_path
+        if owns_audio:
+            audio_path = await asyncio.to_thread(download_audio, youtube_url)
         try:
             client = get_shared_http_client()
             return await self._transcribe(client, audio_path, language)
         finally:
-            remove_file(audio_path)
+            if owns_audio:
+                remove_file(audio_path)
 
     async def _transcribe(
         self,
@@ -68,7 +76,7 @@ class DeepgramTranscriptService(TranscriptService):
         """POST an audio file to the Deepgram pre-recorded endpoint and parse it."""
         total_bytes = Path(path).stat().st_size
         params: dict[str, str] = {
-            "model": "nova-2",
+            "model": "nova-3",
             "punctuate": "true",
             "words": "true",
             "timestamps": "true",
@@ -98,8 +106,14 @@ class DeepgramTranscriptService(TranscriptService):
                     service="deepgram",
                     details={"status_code": response.status_code},
                 )
-            raise ExternalServiceError(
-                "Transcription service rejected the request", service="deepgram"
+            if response.status_code in _RETRYABLE_STATUS_CODES:
+                raise ExternalServiceError(
+                    "Transcription service rejected the request", service="deepgram"
+                )
+            raise PermanentExternalServiceError(
+                "Transcription service rejected the request (unsupported configuration)",
+                service="deepgram",
+                details={"status_code": response.status_code},
             )
         return _parse_deepgram_transcript(response.json())
 

@@ -13,6 +13,7 @@ from collections.abc import Callable
 from app.core.config import Settings, _live_pipeline_enabled, get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
+from app.providers.audio import download_audio, remove_file
 from app.providers.base import TranscriptProviderStrategy, TranscriptService, VideoTranscriptResult
 from app.providers.media import MediaInfo, get_media_info_with_raw
 from app.providers.models import TranscriptData, TranscriptJobPending
@@ -259,6 +260,10 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
     ) -> TranscriptData:
         """Transcribe audio via the configured leaf, retrying transient failures.
 
+        The audio stream is downloaded once and reused across attempts: a
+        transcription failure never re-downloads it, it is re-submitted as-is.
+        Only a failed download is retried (the next attempt downloads again).
+        The download is owned by this method and removed when the job settles.
         A pending Assembly job bubbles up as ``TranscriptJobPending`` re-routed
         to the ``yt-dlp`` strategy name so the task resumes it (or ends cleanly
         when a completion webhook was armed). ``webhook_url`` is forwarded to
@@ -277,25 +282,34 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
             raise ExternalServiceError(message, service="yt-dlp")
 
         last_error: Exception | None = None
-        for attempt in range(_RETRY_ATTEMPTS):
-            try:
-                kwargs: dict = {}
-                if resume_token:
-                    kwargs["resume_token"] = resume_token
-                if webhook_url:
-                    kwargs["webhook_url"] = webhook_url
-                if language:
-                    kwargs["language"] = language
-                return await provider.fetch(youtube_url, **kwargs)
-            except TranscriptJobPending as exc:
-                raise _strategy_pending(exc) from exc
-            except ExternalServiceError as exc:
-                last_error = exc
-                logger.warning("Transcript fetch attempt failed", attempt=attempt + 1)
-                if attempt + 1 < _RETRY_ATTEMPTS:
-                    await asyncio.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
-        assert last_error is not None
-        raise last_error
+        audio_path = ""
+        try:
+            for attempt in range(_RETRY_ATTEMPTS):
+                try:
+                    kwargs: dict = {}
+                    if resume_token:
+                        kwargs["resume_token"] = resume_token
+                    if webhook_url:
+                        kwargs["webhook_url"] = webhook_url
+                    if language:
+                        kwargs["language"] = language
+                    if not audio_path:
+                        audio_path = await asyncio.to_thread(download_audio, youtube_url)
+                    if audio_path:
+                        kwargs["audio_path"] = audio_path
+                    return await provider.fetch(youtube_url, **kwargs)
+                except TranscriptJobPending as exc:
+                    raise _strategy_pending(exc) from exc
+                except ExternalServiceError as exc:
+                    last_error = exc
+                    logger.warning("Transcript fetch attempt failed", attempt=attempt + 1)
+                    if attempt + 1 < _RETRY_ATTEMPTS:
+                        await asyncio.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
+            assert last_error is not None
+            raise last_error
+        finally:
+            if audio_path:
+                await asyncio.to_thread(remove_file, audio_path)
 
 
 def _build_video_result(media: MediaInfo, transcript: TranscriptData) -> VideoTranscriptResult:
