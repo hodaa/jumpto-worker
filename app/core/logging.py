@@ -1,5 +1,7 @@
 """Structured logging configuration for the JumpTo worker."""
 
+import logging
+
 import structlog
 from structlog.stdlib import LoggerFactory
 
@@ -37,6 +39,13 @@ def configure_logging() -> None:
         logger_factory=LoggerFactory(),
         cache_logger_on_first_use=True,
     )
+
+    # structlog's stdlib backend honours the stdlib logger level, which
+    # defaults to WARNING — that would silently drop INFO job records (e.g.
+    # which video is being processed) before the Sentry logs integration can
+    # capture them. Raise the app loggers and add a root handler at INFO.
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger("app").setLevel(logging.INFO)
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:

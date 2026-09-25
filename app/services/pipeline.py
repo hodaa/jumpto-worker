@@ -44,8 +44,22 @@ async def run_pipeline(
     """
     settings = get_settings()
     async with JobService(settings, client_factory=client_factory) as jobs:
+        # Video context is populated once the job loads; the failure handler
+        # includes it even when transcription itself raises. If the load fails
+        # there is no video to report and the dict stays empty.
+        video_context: dict[str, str] = {}
         try:
             job = await jobs.load(job_id)
+            video_context = {
+                "video_id": job.video_id,
+                "youtube_video_id": job.youtube_video_id,
+                "youtube_url": job.youtube_url,
+            }
+            logger.info(
+                "Transcription job started",
+                job_id=job_id,
+                **video_context,
+            )
             submission = await asyncio.wait_for(
                 perform_transcription(job, resume_token, resume_provider),
                 timeout=pipeline_timeout_seconds(settings),
@@ -61,11 +75,20 @@ async def run_pipeline(
             raise
         except Exception as exc:
             error = user_safe_message(exc)
-            logger.exception("Transcription pipeline failed", job_id=job_id, error=error)
+            logger.exception(
+                "Transcription pipeline failed",
+                job_id=job_id,
+                error=error,
+                **video_context,
+            )
             await jobs.fail(job_id, error)
             raise
 
-    logger.info("Pipeline completed", job_id=job_id)
+    logger.info(
+        "Pipeline completed",
+        job_id=job_id,
+        **video_context,
+    )
     return {"status": "completed", "video_id": job.video_id}
 
 
