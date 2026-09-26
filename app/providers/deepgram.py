@@ -31,12 +31,32 @@ _PERMANENT_AUTH_STATUS_CODES = {401, 403}
 _RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
+_MODEL_LANGUAGE_MISMATCH_HINT = "No such model/language/tier combination"
+
+
 class DeepgramTranscriptService(TranscriptService):
     """Deepgram audio transcription client (synchronous, word-level timestamps)."""
 
-    def __init__(self, api_key: str, base_url: str = _DEEPGRAM_BASE_URL) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = _DEEPGRAM_BASE_URL,
+        model: str = "nova-3",
+    ) -> None:
         self.api_key = api_key
         self.base_url = base_url
+        self.model = model
+
+    @staticmethod
+    def _is_model_language_mismatch(response: httpx.Response) -> bool:
+        """True when Deepgram rejects the requested model/language combination.
+
+        Some deployments do not ship every language on every model tier. When
+        that happens Deepgram answers 400 with an explicit hint naming the
+        ''general'' model as the working combination, and it is safe to retry
+        that combo before failing the job.
+        """
+        return response.status_code == 400 and _MODEL_LANGUAGE_MISMATCH_HINT in response.text
 
     async def fetch(
         self,
@@ -76,24 +96,65 @@ class DeepgramTranscriptService(TranscriptService):
         """POST an audio file to the Deepgram pre-recorded endpoint and parse it."""
         total_bytes = Path(path).stat().st_size
         params: dict[str, str] = {
-            "model": "nova-3",
+            "model": self.model,
             "punctuate": "true",
             "words": "true",
             "timestamps": "true",
         }
         if language:
             params["language"] = language
-        response = await client.post(
-            f"{self.base_url}/listen",
-            headers={
-                "authorization": f"Token {self.api_key}",
-                "content-type": "audio/webm",
-                "content-length": str(total_bytes),
-            },
-            params=params,
-            content=_stream_file(path),
-            timeout=_TRANSCRIBE_TIMEOUT_SECONDS,
+        # When the requested model/language pair is unavailable (Arabic on
+        # nova-3 for some deployments), Deepgram 400s with a hint to use the
+        # ''general'' model. Honoring it keeps the language working before the
+        # job fails; each attempt gets a fresh stream so the audio is not
+        # consumed by the first request.
+        if self.model.startswith("nova"):
+            fallback_params = {**params, "model": "general", "tier": self.model}
+        else:
+            fallback_params = None
+        logger.info(
+            "Submitting audio to Deepgram; waiting on synchronous transcription",
+            size_mib=round(total_bytes / (1024 * 1024), 1),
+            language=language or "auto",
+            model=self.model,
         )
+        try:
+            response = await client.post(
+                f"{self.base_url}/listen",
+                headers={
+                    "authorization": f"Token {self.api_key}",
+                    "content-type": "audio/webm",
+                    "content-length": str(total_bytes),
+                },
+                params=params,
+                content=_stream_file(path),
+                timeout=_TRANSCRIBE_TIMEOUT_SECONDS,
+            )
+            if self._is_model_language_mismatch(response) and fallback_params:
+                logger.warning(
+                    "Deepgram rejected the configured model/language combination; "
+                    "retrying with the general model",
+                    model=self.model,
+                    fallback_model=fallback_params["model"],
+                    tier=fallback_params.get("tier", ""),
+                    status_code=response.status_code,
+                )
+                response = await client.post(
+                    f"{self.base_url}/listen",
+                    headers={
+                        "authorization": f"Token {self.api_key}",
+                        "content-type": "audio/webm",
+                        "content-length": str(total_bytes),
+                    },
+                    params=fallback_params,
+                    content=_stream_file(path),
+                    timeout=_TRANSCRIBE_TIMEOUT_SECONDS,
+                )
+        except httpx.HTTPError as exc:
+            logger.error("Deepgram request failed", error=str(exc))
+            raise ExternalServiceError(
+                "Transcription service was unreachable", service="deepgram"
+            ) from exc
         if response.status_code != 200:
             logger.error(
                 "Deepgram transcription failed",
@@ -115,7 +176,14 @@ class DeepgramTranscriptService(TranscriptService):
                 service="deepgram",
                 details={"status_code": response.status_code},
             )
-        return _parse_deepgram_transcript(response.json())
+        transcript = _parse_deepgram_transcript(response.json())
+        logger.info(
+            "Deepgram transcription completed",
+            size_mib=round(total_bytes / (1024 * 1024), 1),
+            language=transcript.language,
+            n_words=len(transcript.words),
+        )
+        return transcript
 
 
 async def _stream_file(path: str) -> AsyncIterator[bytes]:
@@ -171,7 +239,11 @@ def get_deepgram_provider(settings: Settings | None = None) -> TranscriptService
     """
     settings = settings or get_settings()
     if settings.live_external_calls and settings.deepgram_api_key:
-        return DeepgramTranscriptService(settings.deepgram_api_key, settings.deepgram_api_url)
+        return DeepgramTranscriptService(
+            settings.deepgram_api_key,
+            settings.deepgram_api_url,
+            settings.deepgram_model,
+        )
     logger.warning(
         "Audio transcription not configured",
         live_external_calls=settings.live_external_calls,

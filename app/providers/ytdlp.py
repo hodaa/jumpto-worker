@@ -13,7 +13,12 @@ from collections.abc import Callable
 from app.core.config import Settings, _live_pipeline_enabled, get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
-from app.providers.audio import download_audio, remove_file
+from app.providers.audio import (
+    audio_cache_path,
+    download_audio,
+    remove_audio_cache,
+    remove_file,
+)
 from app.providers.base import TranscriptProviderStrategy, TranscriptService, VideoTranscriptResult
 from app.providers.media import MediaInfo, get_media_info_with_raw
 from app.providers.models import TranscriptData, TranscriptJobPending
@@ -138,7 +143,12 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
 
         language = detect_language_from_title(media.title)
         transcript = await self._fetch_transcript_with_retry(
-            youtube_url, info, resume_token=resume_token, webhook_url=webhook_url, language=language
+            youtube_url,
+            info,
+            resume_token=resume_token,
+            webhook_url=webhook_url,
+            language=language,
+            video_id=video_id,
         )
         result = _build_video_result(media, transcript)
 
@@ -196,6 +206,7 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         resume_token: str = "",
         webhook_url: str = "",
         language: str = "",
+        video_id: str = "",
     ) -> TranscriptData:
         """Fetch a transcript, prioritizing captions and falling back to audio.
 
@@ -204,9 +215,11 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         missing or fail, audio transcription runs with retry. ``webhook_url``
         is forwarded to Assembly only on the initial submit. ``language`` is
         forwarded to the audio leaf so asynchronous transcribers (Deepgram) can
-        pick the right language from the video title. ``None`` from the audio
-        provider means audio transcription is not configured, so captionless
-        videos fail cleanly instead of fabricating data.
+        pick the right language from the video title. ``video_id`` keys the
+        persisted audio file so attempts and jobs for the same video share one
+        download. ``None`` from the audio provider means audio transcription is
+        not configured, so captionless videos fail cleanly instead of
+        fabricating data.
         """
         if resume_token:
             return await self._fetch_audio_with_retry(
@@ -214,13 +227,17 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
                 resume_token=resume_token,
                 webhook_url=webhook_url,
                 language=language,
+                video_id=video_id,
             )
 
         captions = await self._try_captions(youtube_url, info)
         if captions is not None:
             return captions
         return await self._fetch_audio_with_retry(
-            youtube_url, webhook_url=webhook_url, language=language
+            youtube_url,
+            webhook_url=webhook_url,
+            language=language,
+            video_id=video_id,
         )
 
     async def _try_captions(
@@ -257,16 +274,24 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         resume_token: str = "",
         webhook_url: str = "",
         language: str = "",
+        video_id: str = "",
     ) -> TranscriptData:
         """Transcribe audio via the configured leaf, retrying transient failures.
 
         The audio stream is downloaded once and reused across attempts: a
         transcription failure never re-downloads it, it is re-submitted as-is.
-        Only a failed download is retried (the next attempt downloads again).
-        The download is owned by this method and removed when the job settles.
-        A pending Assembly job bubbles up as ``TranscriptJobPending`` re-routed
-        to the ``yt-dlp`` strategy name so the task resumes it (or ends cleanly
-        when a completion webhook was armed). ``webhook_url`` is forwarded to
+        With a keyable ``video_id`` the file is persisted on disk and shared
+        across attempts *and* across jobs for the same video, so a failed job
+        followed by a new search reuses the download; the file is deleted when
+        the job settles (a transcript is obtained and cached, or the retry
+        budget is exhausted), and stale stragglers are swept by the audio
+        layer. Without a keyable video id the audio is a per-attempt temp file,
+        removed when this call settles. A ``resume_token`` polls a pending
+        cloud job (Assembly) and never touches the audio file. Only a failed
+        download is retried (the next attempt downloads again). A pending
+        Assembly job bubbles up as ``TranscriptJobPending`` re-routed to the
+        ``yt-dlp`` strategy name so the task resumes it (or ends cleanly when
+        a completion webhook was armed). ``webhook_url`` is forwarded to
         Assembly on the initial submit. ``language`` is forwarded to the audio
         leaf when the caller derived one from the video title. Uses the
         provider only when audio transcription is configured; otherwise the job
@@ -281,23 +306,42 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
             )
             raise ExternalServiceError(message, service="yt-dlp")
 
+        keyed = bool(video_id) and _live_pipeline_enabled(self._resolve_settings())
+        settings = self._resolve_settings()
         last_error: Exception | None = None
         audio_path = ""
+        owned_temp = ""
         try:
             for attempt in range(_RETRY_ATTEMPTS):
                 try:
                     kwargs: dict = {}
                     if resume_token:
                         kwargs["resume_token"] = resume_token
+                        # Resume is a poll; the initial submit's file may still
+                        # be on disk, so remember it for settlement cleanup.
+                        if keyed:
+                            audio_path = str(audio_cache_path(video_id, settings))
+                    elif not audio_path:
+                        audio_path = await asyncio.to_thread(
+                            download_audio,
+                            youtube_url,
+                            video_id=video_id if keyed else "",
+                            settings=settings,
+                        )
+                        if not keyed:
+                            owned_temp = audio_path
                     if webhook_url:
                         kwargs["webhook_url"] = webhook_url
                     if language:
                         kwargs["language"] = language
-                    if not audio_path:
-                        audio_path = await asyncio.to_thread(download_audio, youtube_url)
                     if audio_path:
                         kwargs["audio_path"] = audio_path
-                    return await provider.fetch(youtube_url, **kwargs)
+                    transcript = await provider.fetch(youtube_url, **kwargs)
+                    if keyed:
+                        # Job settled successfully; the transcript cache now
+                        # serves future jobs for this video.
+                        await asyncio.to_thread(remove_audio_cache, video_id, settings)
+                    return transcript
                 except TranscriptJobPending as exc:
                     raise _strategy_pending(exc) from exc
                 except ExternalServiceError as exc:
@@ -306,10 +350,13 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
                     if attempt + 1 < _RETRY_ATTEMPTS:
                         await asyncio.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
             assert last_error is not None
+            if keyed:
+                # Retry budget exhausted; release the audio for this video.
+                await asyncio.to_thread(remove_audio_cache, video_id, settings)
             raise last_error
         finally:
-            if audio_path:
-                await asyncio.to_thread(remove_file, audio_path)
+            if owned_temp:
+                await asyncio.to_thread(remove_file, owned_temp)
 
 
 def _build_video_result(media: MediaInfo, transcript: TranscriptData) -> VideoTranscriptResult:

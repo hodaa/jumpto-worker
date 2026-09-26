@@ -125,6 +125,10 @@ class Settings(BaseSettings):
         default="https://api.deepgram.com/v1",
         description="Deepgram API base URL (DEEPGRAM_API_URL env var)",
     )
+    deepgram_model: str = Field(
+        default="nova-3",
+        description="Deepgram batch transcription model (DEEPGRAM_MODEL env var)",
+    )
 
     # VidWords (YouTube transcripts API)
     vidwords_api_key: str = Field(
@@ -268,6 +272,13 @@ class Settings(BaseSettings):
         default=900,
         ge=1,
         description="How long a transcript cache single-flight lock is held",
+    )
+    audio_cache_directory: str = Field(
+        default="/var/tmp/jumpto-audio-cache",
+        description=(
+            "Directory for persisted per-video audio files reused across "
+            "transcription attempts and jobs (AUDIO_CACHE_DIRECTORY)"
+        ),
     )
 
     @property

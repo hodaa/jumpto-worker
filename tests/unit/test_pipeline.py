@@ -1,12 +1,13 @@
 """Unit tests for the worker transcription pipeline."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
 
 from app.core.config import Settings, _live_pipeline_enabled
-from app.core.exceptions import ExternalServiceError, NoSpeechDetectedError
+from app.core.exceptions import ExternalServiceError
 from app.models import JobData, TranscriptSubmission
 from app.providers import (
     TranscriptData,
@@ -135,14 +136,21 @@ class TestRunPipeline:
         assert client.calls[-1] == "fail"
 
     @pytest.mark.asyncio
-    async def test_no_speech_completes_job_with_note(self, monkeypatch) -> None:
+    async def test_no_speech_submitted_as_normal_completion(self, monkeypatch) -> None:
+        """An empty (no-speech) transcript goes through the normal submit path,
+        so the backend stores a null transcript row instead of a note on a
+        special-cased completion."""
         client = _FakeClient()
         monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
         settings = _settings(live_calls=False)
         monkeypatch.setattr(pipeline_module, "get_settings", lambda: settings)
 
-        def no_speech(job, resume_token="", resume_provider=""):
-            raise NoSpeechDetectedError("Transcript contained no speech")
+        async def no_speech(job, resume_token="", resume_provider=""):
+            return build_submission(
+                title="Silent Video",
+                duration_seconds=60,
+                transcript=TranscriptData(language="en", text="", words=[]),
+            )
 
         monkeypatch.setattr(pipeline_module, "perform_transcription", no_speech)
 
@@ -150,8 +158,8 @@ class TestRunPipeline:
 
         assert result["status"] == "completed"
         assert client.failed is False
-        assert client.calls[-1] == "complete"
-        assert client.last_complete_message == "No speech detected in this video."
+        assert client.calls == ["get_job", "advance", "store", "complete"]
+        assert client.last_complete_message == ""
 
     @pytest.mark.asyncio
     async def test_first_attempt_advances_then_raises_pending(self, monkeypatch) -> None:
@@ -190,10 +198,6 @@ class TestRunPipeline:
             user_safe_message(RuntimeError("x")) == "Transcription failed. Please try again later."
         )
         assert "timed out" in user_safe_message(TimeoutError())
-        assert (
-            user_safe_message(NoSpeechDetectedError("no speech"))
-            == "No speech detected in this video."
-        )
 
 
 class TestFetchTranscriptWithRetry:
@@ -216,7 +220,9 @@ class TestFetchTranscriptWithRetry:
         """
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"data")
-        monkeypatch.setattr(ytdlp_module, "download_audio", lambda url: str(audio_file))
+        monkeypatch.setattr(
+            ytdlp_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
+        )
         monkeypatch.setattr(ytdlp_module, "remove_file", lambda path: None)
         return audio_file
 
@@ -272,9 +278,7 @@ class TestFetchTranscriptWithRetry:
         )
 
     @pytest.mark.asyncio
-    async def test_captionless_video_falls_back_to_audio(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    async def test_captionless_video_falls_back_to_audio(self, monkeypatch, tmp_path) -> None:
         """A fully caption-less video yields no captions from the real caption
         provider, then falls back to the audio (Assembly) transcript path."""
         info = {"id": "abcde12345", "automatic_captions": {}, "subtitles": {}}
@@ -415,7 +419,9 @@ class TestFetchTranscriptWithRetry:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"data")
         removed = []
-        monkeypatch.setattr(ytdlp_module, "download_audio", lambda url: str(audio_file))
+        monkeypatch.setattr(
+            ytdlp_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
+        )
         monkeypatch.setattr(ytdlp_module, "remove_file", lambda path: removed.append(path))
 
         with pytest.raises(ExternalServiceError):
@@ -438,7 +444,11 @@ class TestFetchTranscriptWithRetry:
         audio_file.write_bytes(b"data")
         downloads = []
         removed = []
-        monkeypatch.setattr(ytdlp_module, "download_audio", lambda url: downloads.append(url) or str(audio_file))
+        monkeypatch.setattr(
+            ytdlp_module,
+            "download_audio",
+            lambda url, video_id="", settings=None: downloads.append(url) or str(audio_file),
+        )
         monkeypatch.setattr(ytdlp_module, "remove_file", lambda path: removed.append(path))
 
         seen: list[str] = []
@@ -461,6 +471,120 @@ class TestFetchTranscriptWithRetry:
         assert len(seen) == 3
         assert set(seen) == {str(audio_file)}
         assert removed == [str(audio_file)]
+
+    @pytest.mark.asyncio
+    async def test_keyed_success_releases_persisted_audio(self, monkeypatch, tmp_path) -> None:
+        """A settled (successful) job releases the persisted per-video audio."""
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+        removed = []
+        monkeypatch.setattr(
+            ytdlp_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
+        )
+        monkeypatch.setattr(
+            ytdlp_module,
+            "remove_audio_cache",
+            lambda video_id, settings=None: removed.append(video_id),
+        )
+
+        fallback = AsyncMock()
+        fallback.fetch.return_value = _transcript()
+        captions = AsyncMock()
+        captions.fetch.side_effect = ExternalServiceError("No captions", service="youtube-captions")
+        provider = self._provider(
+            captions_service=captions,
+            speech_to_text_provider=lambda settings: fallback,
+            live_calls=True,
+        )
+
+        result = await provider._fetch_transcript_with_retry(
+            "https://youtu.be/abcde12345", video_id="abcde12345"
+        )
+
+        assert result.text == "Hello, world!"
+        assert removed == ["abcde12345"]
+
+    @pytest.mark.asyncio
+    async def test_keyed_final_failure_releases_persisted_audio(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Exhausting the retry budget also releases the persisted audio."""
+        monkeypatch.setattr(ytdlp_module, "_RETRY_ATTEMPTS", 2)
+        monkeypatch.setattr(ytdlp_module, "_RETRY_DELAY_SECONDS", 0)
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+        removed = []
+        monkeypatch.setattr(
+            ytdlp_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
+        )
+        monkeypatch.setattr(
+            ytdlp_module,
+            "remove_audio_cache",
+            lambda video_id, settings=None: removed.append(video_id),
+        )
+
+        def fail(url, audio_path=""):
+            raise ExternalServiceError("boom", service="deepgram")
+
+        fallback = AsyncMock()
+        fallback.fetch.side_effect = fail
+        captions = AsyncMock()
+        captions.fetch.side_effect = ExternalServiceError("No captions", service="youtube-captions")
+        provider = self._provider(
+            captions_service=captions,
+            speech_to_text_provider=lambda settings: fallback,
+            live_calls=True,
+        )
+
+        with pytest.raises(ExternalServiceError):
+            await provider._fetch_transcript_with_retry(
+                "https://youtu.be/abcde12345", video_id="abcde12345"
+            )
+
+        assert fallback.fetch.await_count == 2
+        assert removed == ["abcde12345"]
+
+    @pytest.mark.asyncio
+    async def test_resume_skips_audio_download(self, monkeypatch, tmp_path) -> None:
+        """A resume polls the pending cloud job; the audio is never downloaded."""
+        monkeypatch.setattr(ytdlp_module, "_RETRY_ATTEMPTS", 2)
+        monkeypatch.setattr(ytdlp_module, "_RETRY_DELAY_SECONDS", 0)
+        downloads = []
+        removed = []
+        monkeypatch.setattr(
+            ytdlp_module,
+            "download_audio",
+            lambda url, video_id="", settings=None: downloads.append(url)
+            or str(tmp_path / "x.webm"),
+        )
+        monkeypatch.setattr(
+            ytdlp_module,
+            "remove_audio_cache",
+            lambda video_id, settings=None: removed.append(video_id),
+        )
+        cached_path = str(tmp_path / "cached.webm")
+        monkeypatch.setattr(
+            ytdlp_module, "audio_cache_path", lambda video_id, settings=None: Path(cached_path)
+        )
+
+        audio = AsyncMock()
+        audio.fetch.return_value = _transcript()
+        provider = self._provider(
+            speech_to_text_provider=lambda settings: audio,
+            live_calls=True,
+        )
+
+        result = await provider._fetch_transcript_with_retry(
+            "https://youtu.be/abcde12345", resume_token="asm-1", video_id="abcde12345"
+        )
+
+        assert result.text == "Hello, world!"
+        assert downloads == []
+        audio.fetch.assert_awaited_once_with(
+            "https://youtu.be/abcde12345", resume_token="asm-1", audio_path=cached_path
+        )
+        # Success on resume settles the job and releases the initial submit's file.
+        assert removed == ["abcde12345"]
 
 
 class TestLivePipelineEnabled:
@@ -550,7 +674,8 @@ class TestPerformTranscription:
             await perform_transcription(_job())
 
     @pytest.mark.asyncio
-    async def test_empty_transcript_raises_no_speech_error(self, monkeypatch) -> None:
+    async def test_empty_transcript_submitted_normally(self, monkeypatch) -> None:
+        """An empty (no-speech) transcript yields a normal empty submission."""
         provider = SimpleNamespace(
             name="yt-dlp",
             supports_resume=True,
@@ -558,8 +683,11 @@ class TestPerformTranscription:
         )
         monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings: provider)
 
-        with pytest.raises(NoSpeechDetectedError):
-            await perform_transcription(_job())
+        submission = await perform_transcription(_job())
+
+        assert submission.provider == "yt-dlp"
+        assert submission.transcript_text == ""
+        assert submission.words == []
 
     @pytest.mark.asyncio
     async def test_default_ytdlp_provider_used(self, monkeypatch) -> None:

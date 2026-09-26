@@ -165,9 +165,7 @@ class TestAssignmentFetcher:
         assert not audio_file.exists()
 
     @pytest.mark.asyncio
-    async def test_fetch_reuses_caller_provided_audio_path(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    async def test_fetch_reuses_caller_provided_audio_path(self, monkeypatch, tmp_path) -> None:
         """An injected audio_path must be uploaded in place: no download, no
         removal (the caller owns the file and reuses it across retries)."""
         audio_file = tmp_path / "audio.webm"
@@ -204,9 +202,7 @@ class TestAssignmentFetcher:
         monkeypatch.setattr("app.providers.assembly.httpx.AsyncClient", lambda: client)
 
         provider = AssemblyTranscriptService("key")
-        transcript = await provider.fetch(
-            "https://youtu.be/abcde12345", audio_path=str(audio_file)
-        )
+        transcript = await provider.fetch("https://youtu.be/abcde12345", audio_path=str(audio_file))
 
         assert transcript.text == "hello world"
         assert not downloads
@@ -548,6 +544,98 @@ class TestDeepgramFetcher:
         assert "rejected" in str(excinfo.value)
 
     @pytest.mark.asyncio
+    async def test_transcribe_retries_general_model_on_model_language_mismatch(
+        self, tmp_path
+    ) -> None:
+        """When Deepgram 400s an unsupported model/language pair, the leaf
+        honors the API's hint and retries with the ''general'' model on the
+        same tier before failing."""
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"fake-audio")
+
+        captured = {"paths": []}
+        mismatch_body = {
+            "err_code": "Bad Request",
+            "err_msg": (
+                "Bad Request: No such model/language/tier combination found "
+                'You could try the "general" model (language: ar, Nova-3 tier).'
+            ),
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["paths"].append(str(request.url))
+            if request.url.params.get("model") == "nova-3":
+                return httpx.Response(400, json=mismatch_body)
+            return httpx.Response(200, json=self._body())
+
+        provider = DeepgramTranscriptService("key", base_url="https://api.deepgram.test/v1")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            transcript = await provider._transcribe(client, str(audio_file), "ar")
+
+        assert transcript.text == "hello world"
+        assert len(captured["paths"]) == 2
+        assert "model=nova-3" in captured["paths"][0]
+        assert "language=ar" in captured["paths"][0]
+        assert "model=general" in captured["paths"][1]
+        assert "tier=nova-3" in captured["paths"][1]
+        assert "language=ar" in captured["paths"][1]
+
+    @pytest.mark.asyncio
+    async def test_model_language_mismatch_retry_still_failing_is_permanent(self, tmp_path) -> None:
+        """If even the general-model retry is rejected, the leaf fails the job
+        loudly instead of guessing further."""
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"fake-audio")
+        mismatch_body = {"err_msg": "Bad Request: No such model/language/tier combination found"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json=mismatch_body)
+
+        provider = DeepgramTranscriptService("key", base_url="https://api.deepgram.test/v1")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(PermanentExternalServiceError) as excinfo:
+                await provider._transcribe(client, str(audio_file), "ar")
+
+        assert excinfo.value.details["service"] == "deepgram"
+        assert excinfo.value.details["status_code"] == 400
+
+    @pytest.mark.asyncio
+    async def test_non_model_mismatch_4xx_does_not_retry(self, tmp_path) -> None:
+        """Ordinary 400s (bad audio, malformed request) never trigger the
+        general-model retry."""
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"fake-audio")
+        captured = {"count": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["count"] += 1
+            return httpx.Response(400, json={"err_msg": "Bad request."})
+
+        provider = DeepgramTranscriptService("key", base_url="https://api.deepgram.test/v1")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(PermanentExternalServiceError):
+                await provider._transcribe(client, str(audio_file), "ar")
+
+        assert captured["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_network_error_maps_to_soft_error(self, tmp_path) -> None:
+        """A dropped connection mid-upload (httpx.ReadError) must be retried as
+        a soft miss, not escape the pipeline unclassified."""
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"fake-audio")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadError("connection lost mid-read") from None
+
+        provider = DeepgramTranscriptService("key", base_url="https://api.deepgram.test/v1")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(ExternalServiceError) as excinfo:
+                await provider._transcribe(client, str(audio_file), "ar")
+
+        assert excinfo.value.details["service"] == "deepgram"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("status_code", [401, 403])
     async def test_auth_failure_raises_permanent_error(self, tmp_path, status_code: int) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -598,9 +686,7 @@ class TestDeepgramFetcher:
                 await provider._transcribe(client, str(audio_file), "en")
 
     @pytest.mark.asyncio
-    async def test_fetch_reuses_caller_provided_audio_path(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    async def test_fetch_reuses_caller_provided_audio_path(self, monkeypatch, tmp_path) -> None:
         """An injected audio_path must be transcribed in place: no download, no
         removal (the caller owns the file and reuses it across retries)."""
         audio_file = tmp_path / "audio.webm"
@@ -647,6 +733,7 @@ class TestSpeechToTextSelection:
             speech_to_text_provider=provider,
             deepgram_api_key=deepgram_key,
             deepgram_api_url="https://api.deepgram.com/v1",
+            deepgram_model="nova-3",
             assembly_api_key=assembly_key,
         )
 
