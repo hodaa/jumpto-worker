@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from abc import ABC, abstractmethod
 from functools import lru_cache
 
@@ -30,7 +29,6 @@ from app.providers.models import TranscriptData, TranscriptWordData
 logger = get_logger(__name__)
 
 _NAMESPACE = "jumpto:transcript"
-_DEFAULT_LOCK_TTL_SECONDS = 900
 
 # YouTube video id extraction from common URL shapes (watch, youtu.be, shorts,
 # embed). The id is 11 chars of [A-Za-z0-9_-].
@@ -71,7 +69,7 @@ def _cache_namespace(settings) -> str:
     return f"{_NAMESPACE}:v3:{suffix}"
 
 
-def _serialize_result(result: VideoTranscriptResult, provider: str = "") -> str:
+def _serialize_result(result: VideoTranscriptResult) -> str:
     """Flatten a result to compact JSON (word/float tuples survive losslessly)."""
     return json.dumps(
         {
@@ -79,7 +77,6 @@ def _serialize_result(result: VideoTranscriptResult, provider: str = "") -> str:
             "author": result.author,
             "duration_seconds": result.duration_seconds,
             "is_generated": result.is_generated,
-            "provider": provider,
             "transcript": {
                 "language": result.transcript.language,
                 "text": result.transcript.text,
@@ -90,12 +87,8 @@ def _serialize_result(result: VideoTranscriptResult, provider: str = "") -> str:
     )
 
 
-def _deserialize_result(payload: str) -> tuple[VideoTranscriptResult, str] | None:
-    """Rebuild a result and its stored provider from JSON, or None on a corrupt entry.
-
-    Returns:
-        ``(result, provider)`` on success, or ``None`` for a corrupt entry.
-    """
+def _deserialize_result(payload: str) -> VideoTranscriptResult | None:
+    """Rebuild a result from JSON, or None on a corrupt entry."""
     try:
         data = json.loads(payload)
         raw_words = data["transcript"]["words"]
@@ -107,14 +100,13 @@ def _deserialize_result(payload: str) -> tuple[VideoTranscriptResult, str] | Non
                 for word, start, end in raw_words
             ],
         )
-        result = VideoTranscriptResult(
+        return VideoTranscriptResult(
             title=data["title"],
             author=data.get("author", ""),
             duration_seconds=data.get("duration_seconds", 0),
             is_generated=data.get("is_generated", False),
             transcript=transcript,
         )
-        return result, str(data.get("provider") or "")
     except (KeyError, TypeError, ValueError, IndexError, json.JSONDecodeError) as exc:
         logger.warning("Discarding corrupt transcript cache entry", error=str(exc))
         return None
@@ -131,28 +123,21 @@ class TranscriptCache(ABC):
     Concrete implementations (:class:`DiskBackedTranscriptCache`,
     :class:`NoOpTranscriptCache`) are selected by :func:`get_transcript_cache`
     based on configuration.
+
+    The interface is exactly what the one client — the yt-dlp composite — calls:
+    :meth:`get`, :meth:`set`, and the optional metadata pair
+    (:meth:`get_media` / :meth:`set_media`, which default to a quiet no-op so a
+    cache that cannot store metadata still satisfies the interface).
     """
 
     ttl_seconds: int
-    lock_ttl_seconds: int
     namespace: str
 
     @abstractmethod
-    def get_with_provider(self, video_id: str) -> tuple[VideoTranscriptResult, str] | None: ...
+    def get(self, video_id: str) -> VideoTranscriptResult | None: ...
 
     @abstractmethod
-    def set(self, video_id: str, result: VideoTranscriptResult, provider: str = "") -> None: ...
-
-    @abstractmethod
-    def acquire_lock(self, video_id: str, owner: str | None = None) -> tuple[bool, str]: ...
-
-    @abstractmethod
-    def release_lock(self, video_id: str, owner: str) -> None: ...
-
-    def get(self, video_id: str) -> VideoTranscriptResult | None:
-        """Read a cached transcript, ignoring any stored provenance."""
-        entry = self.get_with_provider(video_id)
-        return entry[0] if entry is not None else None
+    def set(self, video_id: str, result: VideoTranscriptResult) -> None: ...
 
     def get_media(self, video_id: str) -> MediaInfo | None:
         """Read cached media metadata (title/duration), or ``None`` on a miss.
@@ -183,23 +168,15 @@ class NoOpTranscriptCache(TranscriptCache):
     def __init__(
         self,
         ttl_seconds: int = 0,
-        lock_ttl_seconds: int = _DEFAULT_LOCK_TTL_SECONDS,
         namespace: str = _NAMESPACE,
     ) -> None:
         self.ttl_seconds = ttl_seconds
-        self.lock_ttl_seconds = lock_ttl_seconds
         self.namespace = namespace
 
-    def get_with_provider(self, video_id: str) -> tuple[VideoTranscriptResult, str] | None:
+    def get(self, video_id: str) -> VideoTranscriptResult | None:
         return None
 
-    def set(self, video_id: str, result: VideoTranscriptResult, provider: str = "") -> None:
-        return
-
-    def acquire_lock(self, video_id: str, owner: str | None = None) -> tuple[bool, str]:
-        return True, (owner or uuid.uuid4().hex)
-
-    def release_lock(self, video_id: str, owner: str) -> None:
+    def set(self, video_id: str, result: VideoTranscriptResult) -> None:
         return
 
 
@@ -220,11 +197,9 @@ class DiskBackedTranscriptCache(TranscriptCache):
         self,
         directory: str,
         ttl_seconds: int,
-        lock_ttl_seconds: int = _DEFAULT_LOCK_TTL_SECONDS,
         namespace: str = _NAMESPACE,
     ) -> None:
         self.ttl_seconds = ttl_seconds
-        self.lock_ttl_seconds = lock_ttl_seconds
         self.namespace = namespace
         # Short timeout so a locked database never stalls a transcription job.
         self._backend = _DiskCache(directory, timeout=0.1)
@@ -234,16 +209,13 @@ class DiskBackedTranscriptCache(TranscriptCache):
     def _key(self, video_id: str) -> str:
         return f"{self.namespace}:{video_id}"
 
-    def _lock_key(self, video_id: str) -> str:
-        return f"{self.namespace}:lock:{video_id}"
-
     def _media_key(self, video_id: str) -> str:
         return f"{self.namespace}:media:{video_id}"
 
     # -- public API ---------------------------------------------------------
 
-    def get_with_provider(self, video_id: str) -> tuple[VideoTranscriptResult, str] | None:
-        """Read a cached transcript and the provider that produced it."""
+    def get(self, video_id: str) -> VideoTranscriptResult | None:
+        """Read a cached transcript, or ``None`` on a miss or a corrupt entry."""
         if not video_id:
             return None
         key = self._key(video_id)
@@ -256,13 +228,13 @@ class DiskBackedTranscriptCache(TranscriptCache):
             return None
         return _deserialize_result(payload)
 
-    def set(self, video_id: str, result: VideoTranscriptResult, provider: str = "") -> None:
+    def set(self, video_id: str, result: VideoTranscriptResult) -> None:
         """Store a finished transcript in the cache, best-effort."""
         if not video_id:
             return
         key = self._key(video_id)
         try:
-            self._backend.set(key, _serialize_result(result, provider), expire=self.ttl_seconds)
+            self._backend.set(key, _serialize_result(result), expire=self.ttl_seconds)
         except Exception as exc:  # noqa: BLE001 – fail-open
             logger.warning("Transcript cache write failed", key=key, error=str(exc))
 
@@ -306,35 +278,6 @@ class DiskBackedTranscriptCache(TranscriptCache):
         except Exception as exc:  # noqa: BLE001 – fail-open
             logger.warning("Media metadata cache write failed", key=key, error=str(exc))
 
-    def acquire_lock(self, video_id: str, owner: str | None = None) -> tuple[bool, str]:
-        """Acquire a short-lived lock for a video cache miss.
-
-        DiskCache failures fail open: duplicate work is preferable to blocking
-        every transcription when the cache is unavailable.
-        """
-        owner = owner or uuid.uuid4().hex
-        if not video_id:
-            return True, owner
-        key = self._lock_key(video_id)
-        try:
-            acquired = self._backend.add(key, owner, expire=self.lock_ttl_seconds)
-            return bool(acquired), owner
-        except Exception as exc:  # noqa: BLE001 – fail-open
-            logger.warning("Transcript cache lock failed open", key=key, error=str(exc))
-            return True, owner
-
-    def release_lock(self, video_id: str, owner: str) -> None:
-        """Release a lock only when it is still owned by this worker."""
-        if not video_id or not owner:
-            return
-        key = self._lock_key(video_id)
-        try:
-            with self._backend.transact():
-                if self._backend.get(key) == owner:
-                    self._backend.delete(key)
-        except Exception as exc:  # noqa: BLE001 – fail-open
-            logger.warning("Transcript cache lock release failed", key=key, error=str(exc))
-
 
 # ---------------------------------------------------------------------------
 # Factory — single enforcement point for the feature-flag seam
@@ -352,18 +295,10 @@ def get_transcript_cache() -> TranscriptCache:
     if not settings.transcript_cache_enabled:
         return NoOpTranscriptCache(
             ttl_seconds=settings.transcript_cache_ttl_seconds,
-            lock_ttl_seconds=max(
-                getattr(settings, "transcript_cache_lock_ttl_seconds", 900),
-                getattr(settings, "job_timeout_seconds", 600) + 60,
-            ),
             namespace=_cache_namespace(settings),
         )
     return DiskBackedTranscriptCache(
         directory=settings.transcript_cache_directory,
         ttl_seconds=settings.transcript_cache_ttl_seconds,
-        lock_ttl_seconds=max(
-            getattr(settings, "transcript_cache_lock_ttl_seconds", 900),
-            getattr(settings, "job_timeout_seconds", 600) + 60,
-        ),
         namespace=_cache_namespace(settings),
     )

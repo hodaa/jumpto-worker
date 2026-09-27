@@ -1,5 +1,6 @@
 """Unit tests for the worker-side disk-backed transcript cache."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -73,10 +74,9 @@ class TestExtractYouTubeVideoId:
 
 class TestSerialization:
     def test_roundtrip_preserves_result(self) -> None:
-        restored, provider = _deserialize_result(_serialize_result(_result()))
+        restored = _deserialize_result(_serialize_result(_result()))
 
         assert restored is not None
-        assert provider == ""
         assert restored.title == "Example title"
         assert restored.author == "Channel"
         assert restored.duration_seconds == 300
@@ -93,10 +93,24 @@ class TestSerialization:
         assert _deserialize_result('{"title": 1}') is None
         assert _deserialize_result("[]") is None
 
-    def test_roundtrip_preserves_provider(self) -> None:
-        restored, provider = _deserialize_result(_serialize_result(_result(), provider="yt-dlp"))
+    def test_deserialize_ignores_legacy_provider_field(self) -> None:
+        """Entries written before the provider field was removed must still load."""
+        legacy = json.dumps(
+            {
+                "title": "Old title",
+                "author": "Channel",
+                "duration_seconds": 12,
+                "is_generated": True,
+                "provider": "yt-dlp",
+                "transcript": {"language": "en", "text": "legacy", "words": []},
+            }
+        )
+
+        restored = _deserialize_result(legacy)
+
         assert restored is not None
-        assert provider == "yt-dlp"
+        assert restored.title == "Old title"
+        assert restored.transcript.text == "legacy"
 
 
 # ---------------------------------------------------------------------------
@@ -111,16 +125,6 @@ class TestDiskBackedTranscriptCache:
 
         cached = cache.get(VIDEO_ID)
         assert cached is not None and cached.transcript.text == "hello world"
-
-    def test_get_with_provider_roundtrips_provider(self, tmp_path) -> None:
-        cache = _disk_cache(tmp_path)
-        cache.set(VIDEO_ID, _result(), provider="yt-dlp")
-
-        entry = cache.get_with_provider(VIDEO_ID)
-        assert entry is not None
-        restored, provider = entry
-        assert provider == "yt-dlp"
-        assert restored.transcript.text == "hello world"
 
     def test_namespace_is_prefixed(self, tmp_path) -> None:
         cache = DiskBackedTranscriptCache(
@@ -200,20 +204,6 @@ class TestDiskBackedTranscriptCache:
         assert cache.get(VIDEO_ID) is not None
         assert cache.get_media(VIDEO_ID) is not None
 
-    def test_acquire_lock_is_single_flight(self, tmp_path) -> None:
-        cache = _disk_cache(tmp_path)
-        acquired, owner_a = cache.acquire_lock(VIDEO_ID, "owner-a")
-        assert acquired is True
-
-        acquired_b, owner_b = cache.acquire_lock(VIDEO_ID, "owner-b")
-        assert acquired_b is False
-        assert owner_b == "owner-b"
-
-        cache.release_lock(VIDEO_ID, owner_a)
-        # After release, a new acquisition should succeed.
-        acquired_c, _ = cache.acquire_lock(VIDEO_ID, "owner-c")
-        assert acquired_c is True
-
 
 # ---------------------------------------------------------------------------
 # NoOpTranscriptCache
@@ -224,7 +214,6 @@ class TestNoOpTranscriptCache:
     def test_get_always_misses(self) -> None:
         cache = NoOpTranscriptCache()
         assert cache.get(VIDEO_ID) is None
-        assert cache.get_with_provider(VIDEO_ID) is None
 
     def test_get_media_always_misses(self) -> None:
         cache = NoOpTranscriptCache()
@@ -237,13 +226,6 @@ class TestNoOpTranscriptCache:
     def test_set_media_does_not_raise(self) -> None:
         cache = NoOpTranscriptCache()
         cache.set_media(VIDEO_ID, "X", 1)
-
-    def test_acquire_and_release_do_not_raise(self) -> None:
-        cache = NoOpTranscriptCache()
-        acquired, owner = cache.acquire_lock(VIDEO_ID, "test-owner")
-        assert acquired is True
-        assert owner == "test-owner"
-        cache.release_lock(VIDEO_ID, "owner")
 
 
 # ---------------------------------------------------------------------------

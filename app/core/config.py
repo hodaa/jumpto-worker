@@ -268,11 +268,6 @@ class Settings(BaseSettings):
         ge=0,
         description="How long a cached transcript stays valid (TRANSCRIPT_CACHE_TTL_SECONDS)",
     )
-    transcript_cache_lock_ttl_seconds: int = Field(
-        default=900,
-        ge=1,
-        description="How long a transcript cache single-flight lock is held",
-    )
     audio_cache_directory: str = Field(
         default="/var/tmp/jumpto-audio-cache",
         description=(
