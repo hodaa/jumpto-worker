@@ -90,6 +90,18 @@ Provider modules are split by concern:
 - `app/providers/transcript.py` — the YouTube caption service + VTT parsing.
 - `app/providers/assembly.py` — the Assembly audio service plus the
   `get_transcript_provider()` factory that builds it from settings.
+- `app/providers/audio.py` — the audio file itself: download, persisted
+  per-video cache paths, stale sweeping, and `AudioFileLease`, the object that
+  owns one job's hold on the file (download once, reuse across attempts, release
+  when the job settles). The composite holds a lease; it never manages paths or
+  temp files itself.
+- `app/providers/deepgram.py` — the Deepgram audio service plus
+  `get_deepgram_provider()`. Both audio leaves share the composite's
+  `fetch(youtube_url, resume_token, webhook_url, language, audio_path)`
+  signature, and the composite passes all five **explicitly** — every parameter
+  defaults to `""` and each leaf treats `""` as "not provided". Never reassemble
+  that call with a `**kwargs` dict: it hides the leaves' signatures, so renaming
+  a leaf parameter would silently drop the value instead of failing.
 
 Internal leaf fetchers (captions, Assembly) are `*TranscriptService` subclasses
 of `TranscriptService` (`app/providers/base.py`); registry strategies are

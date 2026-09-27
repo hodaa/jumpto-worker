@@ -13,6 +13,7 @@ obtained and cached, or the retry budget exhausted); the TTL sweep in
 jobs that never settled.
 """
 
+import asyncio
 import contextlib
 import os
 import tempfile
@@ -145,3 +146,64 @@ def remove_file(path: str) -> None:
     """Best-effort removal of a temp audio file."""
     with contextlib.suppress(OSError):
         Path(path).unlink()
+
+
+class AudioFileLease:
+    """One job's hold on the audio file for a video.
+
+    The owner asks for the file on every transcription attempt
+    (:meth:`acquire`) but downloads it at most once: a failed *transcription*
+    re-submits the same file, and only a failed *download* is retried. The
+    shared file is handed back when the job settles (:meth:`release`); an
+    unkeyed lease additionally owns a per-attempt temp file, which
+    :meth:`aclose` deletes — so it belongs in the ``finally`` of the attempt
+    loop.
+
+    A keyed lease (a live job with a keyable ``video_id``) reads and releases
+    the shared per-video file, so a failed job's download survives into the next
+    job for the same video. A resume never downloads: it hands the leaf the
+    shared path so the leaf does not fetch one of its own, and a job that ends
+    pending leaves the file in place for whatever resumes it.
+    """
+
+    def __init__(self, video_id: str = "", settings=None, *, keyed: bool = False) -> None:
+        self._video_id = video_id
+        self._settings = settings
+        self._keyed = keyed
+        self._path = ""
+        self._owned_temp = ""
+
+    async def acquire(self, youtube_url: str, *, resume: bool = False) -> str:
+        """The path to hand the audio leaf, downloading it on first use.
+
+        Returns ``""`` for a resume with no keyable video id, which tells the
+        leaf to fetch (and clean up) its own temp audio.
+        """
+        if resume:
+            # A resume polls an already-submitted job, so it never downloads;
+            # it still hands over the shared path so the leaf treats the file as
+            # caller-owned instead of fetching its own.
+            if self._keyed:
+                self._path = str(audio_cache_path(self._video_id, self._settings))
+            return self._path
+        if not self._path:
+            self._path = await asyncio.to_thread(
+                download_audio,
+                youtube_url,
+                video_id=self._video_id if self._keyed else "",
+                settings=self._settings,
+            )
+            if not self._keyed:
+                self._owned_temp = self._path
+        return self._path
+
+    async def release(self) -> None:
+        """Release the shared per-video audio file: the job has settled."""
+        if not self._keyed:
+            return
+        await asyncio.to_thread(remove_audio_cache, self._video_id, self._settings)
+
+    async def aclose(self) -> None:
+        """Delete the temp file this lease owns, if it downloaded one."""
+        if self._owned_temp:
+            await asyncio.to_thread(remove_file, self._owned_temp)

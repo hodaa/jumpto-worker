@@ -16,6 +16,7 @@ from app.providers import (
     VideoTranscriptResult,
     VidWordsResult,
 )
+from app.providers import audio as audio_module
 from app.providers import ytdlp as ytdlp_module
 from app.providers.registry import resolve_provider as provider_resolve
 from app.providers.vidwords import VidWordsPermanentError
@@ -221,9 +222,9 @@ class TestFetchTranscriptWithRetry:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"data")
         monkeypatch.setattr(
-            ytdlp_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
+            audio_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
         )
-        monkeypatch.setattr(ytdlp_module, "remove_file", lambda path: None)
+        monkeypatch.setattr(audio_module, "remove_file", lambda path: None)
         return audio_file
 
     @pytest.mark.asyncio
@@ -274,7 +275,11 @@ class TestFetchTranscriptWithRetry:
 
         assert result.text == "Hello, world!"
         fallback.fetch.assert_awaited_once_with(
-            "https://youtu.be/abcde12345", audio_path=str(audio_file)
+            "https://youtu.be/abcde12345",
+            resume_token="",
+            webhook_url="",
+            language="",
+            audio_path=str(audio_file),
         )
 
     @pytest.mark.asyncio
@@ -294,8 +299,41 @@ class TestFetchTranscriptWithRetry:
         assert result.text == "Hello, world!"
         fallback.fetch.assert_awaited_once()
         fallback.fetch.assert_awaited_with(
-            "https://youtu.be/abcde12345", audio_path=str(audio_file)
+            "https://youtu.be/abcde12345",
+            resume_token="",
+            webhook_url="",
+            language="",
+            audio_path=str(audio_file),
         )
+
+    @pytest.mark.asyncio
+    async def test_audio_not_configured_fails_captionless_video_cleanly(self) -> None:
+        """No captions and no audio leaf must fail, never fabricate a transcript."""
+        info = {"id": "abcde12345", "automatic_captions": {}, "subtitles": {}}
+        captions = AsyncMock()
+        captions.fetch.return_value = None
+
+        provider = self._provider(
+            captions_service=captions,
+            speech_to_text_provider=lambda settings: None,
+        )
+
+        with pytest.raises(ExternalServiceError) as excinfo:
+            await provider._fetch_transcript_with_retry("https://youtu.be/abcde12345", info)
+
+        assert "No usable captions" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_audio_not_configured_fails_resume_distinctly(self) -> None:
+        """A resume has nothing to transcribe, so it reports the resume reason."""
+        provider = self._provider(speech_to_text_provider=lambda settings: None)
+
+        with pytest.raises(ExternalServiceError) as excinfo:
+            await provider._fetch_transcript_with_retry(
+                "https://youtu.be/abcde12345", resume_token="asm-1"
+            )
+
+        assert "cannot resume" in str(excinfo.value)
 
     @pytest.mark.asyncio
     async def test_pending_audio_job_bubbles_as_strategy_provider(
@@ -397,7 +435,11 @@ class TestFetchTranscriptWithRetry:
         assert result.text == "Hello, world!"
         fallback.fetch.assert_awaited_once()
         fallback.fetch.assert_awaited_with(
-            "https://youtu.be/abcde12345", webhook_url=webhook, audio_path=str(audio_file)
+            "https://youtu.be/abcde12345",
+            resume_token="",
+            webhook_url=webhook,
+            language="",
+            audio_path=str(audio_file),
         )
 
     @pytest.mark.asyncio
@@ -405,7 +447,7 @@ class TestFetchTranscriptWithRetry:
         monkeypatch.setattr(ytdlp_module, "_RETRY_ATTEMPTS", 2)
         monkeypatch.setattr(ytdlp_module, "_RETRY_DELAY_SECONDS", 0)
 
-        def fail(url, audio_path=""):
+        def fail(url, resume_token="", webhook_url="", language="", audio_path=""):
             raise ExternalServiceError("boom", service="assemblyai")
 
         fallback = AsyncMock()
@@ -420,17 +462,29 @@ class TestFetchTranscriptWithRetry:
         audio_file.write_bytes(b"data")
         removed = []
         monkeypatch.setattr(
-            ytdlp_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
+            audio_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
         )
-        monkeypatch.setattr(ytdlp_module, "remove_file", lambda path: removed.append(path))
+        monkeypatch.setattr(audio_module, "remove_file", lambda path: removed.append(path))
 
         with pytest.raises(ExternalServiceError):
             await provider._fetch_transcript_with_retry("https://youtu.be/abcde12345")
 
         assert fallback.fetch.await_count == 2
         assert fallback.fetch.await_args_list == [
-            call("https://youtu.be/abcde12345", audio_path=str(audio_file)),
-            call("https://youtu.be/abcde12345", audio_path=str(audio_file)),
+            call(
+                "https://youtu.be/abcde12345",
+                resume_token="",
+                webhook_url="",
+                language="",
+                audio_path=str(audio_file),
+            ),
+            call(
+                "https://youtu.be/abcde12345",
+                resume_token="",
+                webhook_url="",
+                language="",
+                audio_path=str(audio_file),
+            ),
         ]
         assert removed == [str(audio_file)]
 
@@ -445,11 +499,11 @@ class TestFetchTranscriptWithRetry:
         downloads = []
         removed = []
         monkeypatch.setattr(
-            ytdlp_module,
+            audio_module,
             "download_audio",
             lambda url, video_id="", settings=None: downloads.append(url) or str(audio_file),
         )
-        monkeypatch.setattr(ytdlp_module, "remove_file", lambda path: removed.append(path))
+        monkeypatch.setattr(audio_module, "remove_file", lambda path: removed.append(path))
 
         seen: list[str] = []
 
@@ -479,10 +533,10 @@ class TestFetchTranscriptWithRetry:
         audio_file.write_bytes(b"data")
         removed = []
         monkeypatch.setattr(
-            ytdlp_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
+            audio_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
         )
         monkeypatch.setattr(
-            ytdlp_module,
+            audio_module,
             "remove_audio_cache",
             lambda video_id, settings=None: removed.append(video_id),
         )
@@ -515,15 +569,15 @@ class TestFetchTranscriptWithRetry:
         audio_file.write_bytes(b"data")
         removed = []
         monkeypatch.setattr(
-            ytdlp_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
+            audio_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
         )
         monkeypatch.setattr(
-            ytdlp_module,
+            audio_module,
             "remove_audio_cache",
             lambda video_id, settings=None: removed.append(video_id),
         )
 
-        def fail(url, audio_path=""):
+        def fail(url, resume_token="", webhook_url="", language="", audio_path=""):
             raise ExternalServiceError("boom", service="deepgram")
 
         fallback = AsyncMock()
@@ -552,19 +606,19 @@ class TestFetchTranscriptWithRetry:
         downloads = []
         removed = []
         monkeypatch.setattr(
-            ytdlp_module,
+            audio_module,
             "download_audio",
             lambda url, video_id="", settings=None: downloads.append(url)
             or str(tmp_path / "x.webm"),
         )
         monkeypatch.setattr(
-            ytdlp_module,
+            audio_module,
             "remove_audio_cache",
             lambda video_id, settings=None: removed.append(video_id),
         )
         cached_path = str(tmp_path / "cached.webm")
         monkeypatch.setattr(
-            ytdlp_module, "audio_cache_path", lambda video_id, settings=None: Path(cached_path)
+            audio_module, "audio_cache_path", lambda video_id, settings=None: Path(cached_path)
         )
 
         audio = AsyncMock()
@@ -581,7 +635,11 @@ class TestFetchTranscriptWithRetry:
         assert result.text == "Hello, world!"
         assert downloads == []
         audio.fetch.assert_awaited_once_with(
-            "https://youtu.be/abcde12345", resume_token="asm-1", audio_path=cached_path
+            "https://youtu.be/abcde12345",
+            resume_token="asm-1",
+            webhook_url="",
+            language="",
+            audio_path=cached_path,
         )
         # Success on resume settles the job and releases the initial submit's file.
         assert removed == ["abcde12345"]
