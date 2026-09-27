@@ -106,7 +106,12 @@ class YtDlpTranscriptProvider(TranscriptProviderStrategy):
         return self._settings or get_settings()
 
     def _resolve_captions_service(self) -> YouTubeCaptionTranscriptService:
-        return self._captions_service or YouTubeCaptionTranscriptService()
+        # The injected settings are threaded in so the caption download builds
+        # its yt-dlp options (cookie file, socket timeout) from the caller's
+        # config instead of re-reading the process-wide singleton.
+        return self._captions_service or YouTubeCaptionTranscriptService(
+            settings=self._resolve_settings()
+        )
 
     async def fetch(
         self,

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
+from app.core.config import Settings
 from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.integrations.ytdlp import build_ydlp_options, release_temp_cookie
 from app.providers.assembly import (
@@ -19,7 +20,7 @@ from app.providers.assembly import (
     _stream_audio_with_progress,
     get_transcript_provider,
 )
-from app.providers.audio import run_download
+from app.providers.audio import download_audio, run_download
 from app.providers.deepgram import (
     DeepgramTranscriptService,
     _parse_deepgram_transcript,
@@ -131,7 +132,10 @@ class TestAssignmentFetcher:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"fake-audio")
 
-        monkeypatch.setattr("app.providers.assembly.download_audio", lambda url: str(audio_file))
+        monkeypatch.setattr(
+            "app.providers.assembly.download_audio",
+            lambda url, video_id="", settings=None: str(audio_file),
+        )
 
         upload_response = Mock(status_code=200)
         upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/fake"}
@@ -172,7 +176,7 @@ class TestAssignmentFetcher:
         audio_file.write_bytes(b"fake-audio")
         downloads = []
 
-        def must_not_download(url):
+        def must_not_download(url, video_id="", settings=None):
             downloads.append(url)
             raise AssertionError("must not download when audio_path is injected")
 
@@ -374,7 +378,10 @@ class TestAssignmentFetcher:
     async def test_fetch_with_webhook_flags_pending(self, monkeypatch, tmp_path) -> None:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"fake-audio")
-        monkeypatch.setattr("app.providers.assembly.download_audio", lambda url: str(audio_file))
+        monkeypatch.setattr(
+            "app.providers.assembly.download_audio",
+            lambda url, video_id="", settings=None: str(audio_file),
+        )
 
         upload_response = Mock(status_code=200)
         upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/fake"}
@@ -480,7 +487,10 @@ class TestDeepgramFetcher:
     async def test_fetch_posts_audio_and_parses(self, monkeypatch, tmp_path) -> None:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"fake-audio")
-        monkeypatch.setattr("app.providers.deepgram.download_audio", lambda url: str(audio_file))
+        monkeypatch.setattr(
+            "app.providers.deepgram.download_audio",
+            lambda url, video_id="", settings=None: str(audio_file),
+        )
 
         captured = {}
 
@@ -510,7 +520,10 @@ class TestDeepgramFetcher:
     async def test_fetch_omits_language_param_when_empty(self, monkeypatch, tmp_path) -> None:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"data")
-        monkeypatch.setattr("app.providers.deepgram.download_audio", lambda url: str(audio_file))
+        monkeypatch.setattr(
+            "app.providers.deepgram.download_audio",
+            lambda url, video_id="", settings=None: str(audio_file),
+        )
 
         captured = {}
 
@@ -693,7 +706,7 @@ class TestDeepgramFetcher:
         audio_file.write_bytes(b"data")
         downloads = []
 
-        def must_not_download(url):
+        def must_not_download(url, video_id="", settings=None):
             downloads.append(url)
             raise AssertionError("must not download when audio_path is injected")
 
@@ -1020,7 +1033,7 @@ class TestDownloadCaptionMetadataReuse:
         result = _download_caption("https://youtu.be/abcde12345")
 
         assert result is None
-        extract.assert_called_once_with("https://youtu.be/abcde12345")
+        extract.assert_called_once_with("https://youtu.be/abcde12345", None)
 
 
 class TestRunDownload:
@@ -1200,3 +1213,148 @@ class TestYdlpOptions:
         assert options["format"] == "best"
         assert options["noplaylist"] is False
         assert options["cookiefile"] != str(source)
+
+
+class _StopAfterAudio(Exception):
+    """Sentinel raised to end an audio leaf once its download has happened."""
+
+
+class TestInjectedSettingsReachYtDlpOptions:
+    """Every yt-dlp options build must use the caller's settings.
+
+    Regression guard: these paths used to call ``build_ydlp_options()`` with no
+    ``settings``, so the cookie file, socket timeout and POT base URL came from
+    the process-wide singleton even when the composite had injected config — and
+    the tests had to monkeypatch module globals to work around it.
+    """
+
+    _INJECTED_TIMEOUT = 7.5
+    _GLOBAL_TIMEOUT = 99.0
+    _BGUTIL = "https://injected.test"
+    _URL = "https://youtu.be/abcde12345"
+    _INFO = {"id": "abcde12345", "subtitles": {"en": [{}]}, "automatic_captions": {}}
+
+    @staticmethod
+    def _settings(tmp_path) -> Settings:
+        """Real settings: the options builder reads a computed property off them."""
+        return Settings(
+            _env_file=None,
+            live_external_calls=True,
+            ytdlp_socket_timeout=7.5,
+            ytdlp_bgutil_url="https://injected.test",
+            audio_cache_directory=str(tmp_path / "audio-cache"),
+        )
+
+    @staticmethod
+    def _fake_ytdlp(seen: list[dict]):
+        """A ``yt_dlp.YoutubeDL`` stand-in that records options and writes output."""
+
+        class Fake:
+            def __init__(self, options):
+                seen.append(options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=False):
+                return dict(TestInjectedSettingsReachYtDlpOptions._INFO)
+
+            def process_ie_result(self, info, download=True):
+                target = seen[-1]["outtmpl"] % {"id": "abcde12345", "ext": "vtt"}
+                Path(target).write_text("WEBVTT\n", encoding="utf-8")
+
+            def download(self, urls):
+                Path(seen[-1]["outtmpl"]).write_bytes(b"audio")
+
+        return Fake
+
+    def _assert_injected(self, seen: list[dict]) -> None:
+        assert seen, "yt-dlp was never driven, so no options were built"
+        for options in seen:
+            assert options["socket_timeout"] == self._INJECTED_TIMEOUT
+            assert options["extractor_args"] == {
+                "youtubepot-bgutilhttp": {"base_url": [self._BGUTIL]}
+            }
+
+    @pytest.fixture(autouse=True)
+    def _contrasting_singleton(self, monkeypatch, tmp_path):
+        """Make the process-wide singleton disagree with the injected settings."""
+        monkeypatch.setattr(
+            "app.integrations.ytdlp.get_settings",
+            lambda: Settings(
+                _env_file=None,
+                ytdlp_socket_timeout=self._GLOBAL_TIMEOUT,
+                ytdlp_bgutil_url="https://global.test",
+                audio_cache_directory=str(tmp_path / "global-audio-cache"),
+            ),
+        )
+
+    def test_media_fetch_uses_injected_settings(self, monkeypatch, tmp_path) -> None:
+        seen: list[dict] = []
+        monkeypatch.setattr("yt_dlp.YoutubeDL", self._fake_ytdlp(seen))
+
+        get_media_info("abcde12345", self._URL, self._settings(tmp_path))
+
+        self._assert_injected(seen)
+
+    def test_audio_download_uses_injected_settings(self, monkeypatch, tmp_path) -> None:
+        seen: list[dict] = []
+        monkeypatch.setattr("yt_dlp.YoutubeDL", self._fake_ytdlp(seen))
+
+        download_audio(self._URL, video_id="abcde12345", settings=self._settings(tmp_path))
+
+        self._assert_injected(seen)
+
+    async def test_caption_metadata_extract_uses_injected_settings(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """No cached info, so the metadata extract builds the options itself."""
+        seen: list[dict] = []
+        monkeypatch.setattr("yt_dlp.YoutubeDL", self._fake_ytdlp(seen))
+        service = YouTubeCaptionTranscriptService(settings=self._settings(tmp_path))
+
+        await service.fetch(self._URL)
+
+        self._assert_injected(seen)
+
+    async def test_caption_download_uses_injected_settings(self, monkeypatch, tmp_path) -> None:
+        """Cached info, so the caption-track download is the path to check."""
+        seen: list[dict] = []
+        monkeypatch.setattr("yt_dlp.YoutubeDL", self._fake_ytdlp(seen))
+        service = YouTubeCaptionTranscriptService(settings=self._settings(tmp_path))
+
+        await service.fetch(self._URL, info=dict(self._INFO))
+
+        self._assert_injected(seen)
+
+    async def test_deepgram_self_download_uses_injected_settings(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        seen: list[dict] = []
+        monkeypatch.setattr("yt_dlp.YoutubeDL", self._fake_ytdlp(seen))
+        service = DeepgramTranscriptService("dg-key", settings=self._settings(tmp_path))
+        monkeypatch.setattr(
+            service,
+            "_transcribe",
+            AsyncMock(return_value=TranscriptData(language="en", text="", words=[])),
+        )
+
+        await service.fetch(self._URL)
+
+        self._assert_injected(seen)
+
+    async def test_assembly_self_download_uses_injected_settings(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        seen: list[dict] = []
+        monkeypatch.setattr("yt_dlp.YoutubeDL", self._fake_ytdlp(seen))
+        service = AssemblyTranscriptService("key", settings=self._settings(tmp_path))
+        monkeypatch.setattr(service, "_upload", AsyncMock(side_effect=_StopAfterAudio))
+
+        with pytest.raises(_StopAfterAudio):
+            await service.fetch(self._URL)
+
+        self._assert_injected(seen)

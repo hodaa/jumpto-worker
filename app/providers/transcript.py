@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yt_dlp
 
+from app.core.config import Settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.integrations.ytdlp import (
@@ -30,6 +31,11 @@ logger = get_logger(__name__)
 class YouTubeCaptionTranscriptService(TranscriptService):
     """YouTube caption downloader (works for any subtitle language)."""
 
+    def __init__(self, settings: Settings | None = None) -> None:
+        """``settings`` is the caller's resolved config; ``None`` reads the
+        process-wide singleton when the options are actually built."""
+        self._settings = settings
+
     async def fetch(
         self,
         youtube_url: str,
@@ -41,14 +47,18 @@ class YouTubeCaptionTranscriptService(TranscriptService):
         caller can fall back to audio transcription without treating a normal
         caption-less video as an error.
         """
-        caption = await asyncio.to_thread(_download_caption, youtube_url, info)
+        caption = await asyncio.to_thread(_download_caption, youtube_url, info, self._settings)
         if caption is None:
             return None
         vtt_text, language_code = caption
         return _parse_vtt(vtt_text, language_code)
 
 
-def _download_caption(youtube_url: str, info: dict | None = None) -> tuple[str, str] | None:
+def _download_caption(
+    youtube_url: str,
+    info: dict | None = None,
+    settings: Settings | None = None,
+) -> tuple[str, str] | None:
     """
     Download the best available caption track and return its (text, language).
 
@@ -60,12 +70,16 @@ def _download_caption(youtube_url: str, info: dict | None = None) -> tuple[str, 
     yt-dlp downloads captions without re-extracting the video metadata; the
     ``requested_subtitles`` list is recomputed from the cached caption tracks.
 
+    ``settings`` is threaded into every yt-dlp options build, so an injected
+    instance supplies the cookie file and socket timeout instead of the
+    process-wide singleton.
+
     Returns ``None`` when the video has no usable caption tracks — a normal
     outcome for many videos, not an error. Genuine download failures still
     raise ``ExternalServiceError``.
     """
     if info is None:
-        info = _extract_video_info(youtube_url)
+        info = _extract_video_info(youtube_url, settings)
     targets = _caption_targets(info)
     if not targets:
         return None
@@ -73,6 +87,7 @@ def _download_caption(youtube_url: str, info: dict | None = None) -> tuple[str, 
     for target in targets:
         temp_dir = tempfile.mkdtemp(prefix="jumpto-captions-")
         options = build_ydlp_options(
+            settings=settings,
             skip_download=True,
             writesubtitles=True,
             writeautomaticsub=True,
@@ -104,9 +119,9 @@ def _download_caption(youtube_url: str, info: dict | None = None) -> tuple[str, 
     return None
 
 
-def _extract_video_info(youtube_url: str) -> dict:
+def _extract_video_info(youtube_url: str, settings: Settings | None = None) -> dict:
     """Extract full video metadata (including caption tracks) with yt-dlp."""
-    options = build_ydlp_options(skip_download=True)
+    options = build_ydlp_options(settings=settings, skip_download=True)
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             return ydl.extract_info(youtube_url, download=False)

@@ -95,6 +95,7 @@ def download_audio(youtube_url: str, video_id: str = "", settings=None) -> str:
     destination = Path(path)
     destination.unlink(missing_ok=True)
     options = build_ydlp_options(
+        settings=settings,
         format="bestaudio/best",
         outtmpl=path,
     )

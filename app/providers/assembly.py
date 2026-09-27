@@ -31,9 +31,18 @@ _MIB = 1 << 20
 class AssemblyTranscriptService(TranscriptService):
     """Real Assembly.ai transcription client (word-level timestamps)."""
 
-    def __init__(self, api_key: str, base_url: str = _ASSEMBLY_BASE_URL) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = _ASSEMBLY_BASE_URL,
+        settings: Settings | None = None,
+    ) -> None:
+        """``settings`` is the caller's resolved config, used when this leaf has
+        to download its own audio (no caller-owned ``audio_path``); ``None``
+        falls back to the process-wide singleton."""
         self.api_key = api_key
         self.base_url = base_url
+        self._settings = settings
 
     async def fetch(
         self,
@@ -64,7 +73,9 @@ class AssemblyTranscriptService(TranscriptService):
 
         owns_audio = not audio_path
         if owns_audio:
-            audio_path = await asyncio.to_thread(download_audio, youtube_url)
+            audio_path = await asyncio.to_thread(
+                download_audio, youtube_url, settings=self._settings
+            )
         try:
             upload_url = await self._upload(client, headers, audio_path)
             transcript_id = await self._submit(client, headers, upload_url, webhook_url)
@@ -239,7 +250,7 @@ def get_transcript_provider(
     """
     settings = settings or get_settings()
     if settings.live_external_calls and settings.assembly_api_key:
-        return AssemblyTranscriptService(settings.assembly_api_key)
+        return AssemblyTranscriptService(settings.assembly_api_key, settings=settings)
     logger.warning(
         "Audio transcription not configured",
         live_external_calls=settings.live_external_calls,

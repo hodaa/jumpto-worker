@@ -42,10 +42,15 @@ class DeepgramTranscriptService(TranscriptService):
         api_key: str,
         base_url: str = _DEEPGRAM_BASE_URL,
         model: str = "nova-3",
+        settings: Settings | None = None,
     ) -> None:
+        """``settings`` is the caller's resolved config, used when this leaf has
+        to download its own audio (no caller-owned ``audio_path``); ``None``
+        falls back to the process-wide singleton."""
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
+        self._settings = settings
 
     @staticmethod
     def _is_model_language_mismatch(response: httpx.Response) -> bool:
@@ -79,7 +84,9 @@ class DeepgramTranscriptService(TranscriptService):
         """
         owns_audio = not audio_path
         if owns_audio:
-            audio_path = await asyncio.to_thread(download_audio, youtube_url)
+            audio_path = await asyncio.to_thread(
+                download_audio, youtube_url, settings=self._settings
+            )
         try:
             client = get_shared_http_client()
             return await self._transcribe(client, audio_path, language)
@@ -243,6 +250,7 @@ def get_deepgram_provider(settings: Settings | None = None) -> TranscriptService
             settings.deepgram_api_key,
             settings.deepgram_api_url,
             settings.deepgram_model,
+            settings=settings,
         )
     logger.warning(
         "Audio transcription not configured",

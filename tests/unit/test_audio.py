@@ -2,15 +2,16 @@
 
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
+from app.core.config import Settings
 from app.providers import audio
 
 
-def _settings(tmp_path: Path) -> SimpleNamespace:
-    return SimpleNamespace(audio_cache_directory=str(tmp_path / "audio-cache"))
+def _settings(tmp_path: Path) -> Settings:
+    """Real settings, because the download builds yt-dlp options from them."""
+    return Settings(_env_file=None, audio_cache_directory=str(tmp_path / "audio-cache"))
 
 
 def _fake_run_download(filename: str) -> None:
