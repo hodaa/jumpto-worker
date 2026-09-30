@@ -58,3 +58,18 @@ celery_app.conf.update(
 
 celery_app.conf.worker_concurrency = settings.celery_worker_concurrency
 celery_app.conf.worker_max_tasks_per_child = settings.celery_worker_max_tasks_per_child
+
+# CloudAMQP meters `published + delivered` against a monthly quota, and Celery's
+# default event traffic spends several messages per task on top of the task
+# itself. Nothing in this service consumes Celery events, so the whole
+# cluster-message machinery is off; keeping it on can exhaust the quota on a
+# fraction of real traffic. Paired with --without-gossip/--without-mingle/
+# --without-heartbeat in the worker command.
+celery_app.conf.update(
+    worker_send_task_events=False,
+    event_queue_expires=60,
+    # CloudAMQP runs low TCP keep-alive intervals, so AMQP heartbeats are redundant.
+    broker_heartbeat=None,
+    # This worker only consumes; it never publishes, so one pooled connection suffices.
+    broker_pool_limit=1,
+)

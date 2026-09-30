@@ -31,7 +31,13 @@
         - app.tasks.celery_app.celery_app
         - worker
         - --loglevel=info
-        - --hostname=jumpto-worker  
+        - --hostname=jumpto-worker
+        # These must follow `worker`; Celery 5 enforces option order. Each one
+        # stops a stream of cluster messages that CloudAMQP bills against the
+        # monthly quota (gossip/mingle broadcast continuously).
+        - --without-gossip
+        - --without-mingle
+        - --without-heartbeat
     
     chromium:
       build:
