@@ -599,6 +599,91 @@ class TestFetchTranscriptWithRetry:
         assert removed == ["abcde12345"]
 
     @pytest.mark.asyncio
+    async def test_keyed_pending_keeps_shared_audio_for_the_resume(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A job that ends pending must NOT release the shared per-video audio.
+
+        The resume reuses that file instead of re-downloading, so releasing on
+        the pending path would delete the audio the resume depends on. This is
+        the one settle path that must not hand the file back.
+        """
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+        removed = []
+        monkeypatch.setattr(
+            audio_module, "download_audio", lambda url, video_id="", settings=None: str(audio_file)
+        )
+        monkeypatch.setattr(
+            audio_module,
+            "remove_audio_cache",
+            lambda video_id, settings=None: removed.append(video_id),
+        )
+
+        def pending(url, resume_token="", webhook_url="", language="", audio_path=""):
+            raise TranscriptJobPending(
+                message="still processing",
+                provider="assemblyai",
+                resume_token="asm-1",
+                resumable=True,
+            )
+
+        fallback = AsyncMock()
+        fallback.fetch.side_effect = pending
+        captions = AsyncMock()
+        captions.fetch.side_effect = ExternalServiceError("No captions", service="youtube-captions")
+        provider = self._provider(
+            captions_service=captions,
+            speech_to_text_provider=lambda settings: fallback,
+            live_calls=True,
+        )
+
+        with pytest.raises(TranscriptJobPending):
+            await provider._fetch_transcript_with_retry(
+                "https://youtu.be/abcde12345", video_id="abcde12345"
+            )
+
+        assert removed == []
+        assert audio_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_unkeyed_pending_still_cleans_its_owned_temp_audio(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A lease with no keyable video id owns a temp file, and a pending job
+        deletes it anyway — retention is for the shared file only."""
+        temp = tmp_path / "temp.webm"
+        temp.write_bytes(b"data")
+        deleted = []
+        monkeypatch.setattr(
+            audio_module, "download_audio", lambda url, video_id="", settings=None: str(temp)
+        )
+        monkeypatch.setattr(audio_module, "remove_file", lambda path: deleted.append(path))
+
+        def pending(url, resume_token="", webhook_url="", language="", audio_path=""):
+            raise TranscriptJobPending(
+                message="still processing",
+                provider="assemblyai",
+                resume_token="asm-1",
+                resumable=True,
+            )
+
+        fallback = AsyncMock()
+        fallback.fetch.side_effect = pending
+        captions = AsyncMock()
+        captions.fetch.side_effect = ExternalServiceError("No captions", service="youtube-captions")
+        provider = self._provider(
+            captions_service=captions,
+            speech_to_text_provider=lambda settings: fallback,
+            live_calls=True,
+        )
+
+        with pytest.raises(TranscriptJobPending):
+            await provider._fetch_transcript_with_retry("https://youtu.be/abcde12345")
+
+        assert deleted == [str(temp)]
+
+    @pytest.mark.asyncio
     async def test_resume_skips_audio_download(self, monkeypatch, tmp_path) -> None:
         """A resume polls the pending cloud job; the audio is never downloaded."""
         monkeypatch.setattr(ytdlp_module, "_RETRY_ATTEMPTS", 2)

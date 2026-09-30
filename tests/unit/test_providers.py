@@ -8,7 +8,9 @@ from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+import yt_dlp
 
+import app.providers.media as media_module
 from app.core.config import Settings
 from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.integrations.ytdlp import build_ydlp_options, release_temp_cookie
@@ -72,6 +74,213 @@ class TestMediaInfoProvider:
 
         with pytest.raises(ExternalServiceError):
             get_media_info("abcde12345", "https://youtu.be/abcde12345")
+
+
+class TestMediaMetadataRetry:
+    """Transient yt-dlp failures are retried before the job is failed.
+
+    A rate limit or network blip should not cost the whole job, so a
+    ``DownloadError`` that is not a bot check is retried up to the budget with a
+    growing backoff, and only the last failure is surfaced.
+    """
+
+    @staticmethod
+    def _patch_ydlp(monkeypatch, *, side_effect, attempts: list, released: list | None = None):
+        """Drive ``_fetch_from_yt_dlp`` with a fake yt-dlp that records attempts.
+
+        ``released`` records every ``release_temp_cookie`` call so a test can
+        assert the temp cookie file is cleaned up on both the success and the
+        failure path -- an unreleased cookie file is a real disk leak.
+        """
+        monkeypatch.setattr(
+            media_module,
+            "release_temp_cookie",
+            (
+                (lambda options: released.append(options))
+                if released is not None
+                else (lambda options: None)
+            ),
+        )
+        monkeypatch.setattr(media_module, "is_youtube_bot_check", lambda exc: False)
+        monkeypatch.setattr(media_module.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(media_module, "_METADATA_RETRY_ATTEMPTS", 3)
+        monkeypatch.setattr(
+            media_module,
+            "build_ydlp_options",
+            lambda settings=None: {"outtmpl": "unused"},
+        )
+
+        class _FakeYDL:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=False):
+                attempts.append(url)
+                if isinstance(side_effect, Exception):
+                    raise side_effect
+                return side_effect() if callable(side_effect) else side_effect
+
+        monkeypatch.setattr(media_module.yt_dlp, "YoutubeDL", _FakeYDL)
+
+    def test_transient_failure_is_retried_then_succeeds(self, monkeypatch) -> None:
+        attempts: list[str] = []
+        url = "https://youtu.be/abcde12345"
+        results = [yt_dlp.utils.DownloadError("HTTP 429"), {"title": "T", "duration": 42}]
+        state = {"n": 0}
+
+        def extract_side_effect():
+            state["n"] += 1
+            if state["n"] == 1:
+                raise results[0]
+            return results[1]
+
+        self._patch_ydlp(monkeypatch, side_effect=extract_side_effect, attempts=attempts)
+
+        info = media_module._fetch_from_yt_dlp(url, settings=SimpleNamespace())
+
+        assert info["duration"] == 42
+        assert len(attempts) == 2
+
+    def test_retry_budget_exhausted_surfaces_the_last_failure(self, monkeypatch) -> None:
+        attempts: list[str] = []
+        self._patch_ydlp(
+            monkeypatch,
+            side_effect=yt_dlp.utils.DownloadError("HTTP 503"),
+            attempts=attempts,
+        )
+
+        with pytest.raises(ExternalServiceError) as excinfo:
+            media_module._fetch_from_yt_dlp(
+                "https://youtu.be/abcde12345", settings=SimpleNamespace()
+            )
+
+        assert "Could not fetch video metadata" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, yt_dlp.utils.DownloadError)
+        assert len(attempts) == 3
+
+    def test_backoff_grows_between_attempts(self, monkeypatch) -> None:
+        attempts: list[str] = []
+        slept: list[float] = []
+        self._patch_ydlp(
+            monkeypatch,
+            side_effect=yt_dlp.utils.DownloadError("HTTP 503"),
+            attempts=attempts,
+        )
+        monkeypatch.setattr(media_module, "_METADATA_RETRY_DELAY_SECONDS", 2)
+        monkeypatch.setattr(media_module.time, "sleep", lambda seconds: slept.append(seconds))
+
+        with pytest.raises(ExternalServiceError):
+            media_module._fetch_from_yt_dlp(
+                "https://youtu.be/abcde12345", settings=SimpleNamespace()
+            )
+
+        assert slept == [2, 4]
+
+    def test_bot_check_requests_cookies_and_does_not_retry(self, monkeypatch) -> None:
+        """A bot check needs fresh cookies, so retrying the same block is futile."""
+        attempts: list[str] = []
+        refreshed: list[bool] = []
+        self._patch_ydlp(
+            monkeypatch,
+            side_effect=yt_dlp.utils.DownloadError("Sign in to confirm you're not a bot"),
+            attempts=attempts,
+        )
+        monkeypatch.setattr(media_module, "is_youtube_bot_check", lambda exc: True)
+        monkeypatch.setattr(media_module, "request_cookie_refresh", lambda: refreshed.append(True))
+
+        with pytest.raises(ExternalServiceError):
+            media_module._fetch_from_yt_dlp(
+                "https://youtu.be/abcde12345", settings=SimpleNamespace()
+            )
+
+        assert refreshed == [True]
+        assert len(attempts) == 1
+
+    def test_typed_service_error_is_not_rewrapped(self, monkeypatch) -> None:
+        """An already-typed failure must reach the caller untouched.
+
+        ``get_media_info_with_raw`` catches bare ``Exception`` and re-wraps it
+        into a generic "Could not fetch video metadata". A typed error that
+        passes through the re-wrap would come out indistinguishable from a
+        genuine unknown failure, so this asserts the *service* identity
+        survives -- not just the message.
+        """
+        monkeypatch.setattr(
+            media_module,
+            "_fetch_from_yt_dlp",
+            lambda url, settings=None: (_ for _ in ()).throw(
+                ExternalServiceError("cookie jar unreadable", service="transcriptfetch")
+            ),
+        )
+
+        with pytest.raises(ExternalServiceError) as excinfo:
+            get_media_info(
+                "abcde12345",
+                "https://youtu.be/abcde12345",
+                settings=SimpleNamespace(live_external_calls=True),
+            )
+
+        assert excinfo.value.details["service"] == "transcriptfetch"
+        assert "cookie jar unreadable" in str(excinfo.value)
+
+    def test_live_calls_disabled_refuses_before_touching_yt_dlp(self, monkeypatch) -> None:
+        """With live calls off the job must fail loudly, never fabricate metadata.
+
+        The gate has to run *before* yt-dlp is invoked, otherwise a disabled
+        deployment would still make network calls.
+        """
+        attempts: list[str] = []
+        self._patch_ydlp(
+            monkeypatch,
+            side_effect={"title": "T", "duration": 1},
+            attempts=attempts,
+        )
+        monkeypatch.setattr(media_module, "_live_pipeline_enabled", lambda settings: False)
+
+        with pytest.raises(ExternalServiceError, match="Live external calls are disabled"):
+            get_media_info(
+                "abcde12345",
+                "https://youtu.be/abcde12345",
+                settings=SimpleNamespace(live_external_calls=False),
+            )
+
+        assert attempts == []
+
+    def test_temp_cookie_is_released_after_success_and_failure(self, monkeypatch) -> None:
+        """The per-attempt cookie file must be released on both exit paths.
+
+        ``release_temp_cookie`` runs in a ``finally``, so a crash mid-fetch
+        cannot leak the file; this pins that both outcomes actually call it.
+        """
+        url = "https://youtu.be/abcde12345"
+
+        released: list = []
+        self._patch_ydlp(
+            monkeypatch,
+            side_effect={"title": "T", "duration": 7},
+            attempts=[],
+            released=released,
+        )
+        info = media_module._fetch_from_yt_dlp(url, settings=SimpleNamespace())
+        assert info["duration"] == 7
+        assert len(released) == 1
+
+        released.clear()
+        self._patch_ydlp(
+            monkeypatch,
+            side_effect=yt_dlp.utils.DownloadError("HTTP 503"),
+            attempts=[],
+            released=released,
+        )
+        with pytest.raises(ExternalServiceError):
+            media_module._fetch_from_yt_dlp(url, settings=SimpleNamespace())
+        assert len(released) == 1
 
 
 class TestTranscriptProviderSelection:

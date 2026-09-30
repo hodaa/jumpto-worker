@@ -6,14 +6,18 @@ from types import SimpleNamespace
 import pytest
 
 import app.providers.ytdlp as ytdlp_module
+import app.storage.cache as cache_module
 from app.providers.base import VideoTranscriptResult
 from app.providers.models import TranscriptData, TranscriptWordData
 from app.storage.cache import (
+    _NAMESPACE,
     DiskBackedTranscriptCache,
     NoOpTranscriptCache,
+    _cache_namespace,
     _deserialize_result,
     _serialize_result,
     extract_youtube_video_id,
+    get_transcript_cache,
 )
 
 VIDEO_ID = "abc123xyz99"
@@ -203,6 +207,111 @@ class TestDiskBackedTranscriptCache:
         # Both should be readable independently.
         assert cache.get(VIDEO_ID) is not None
         assert cache.get_media(VIDEO_ID) is not None
+
+
+# ---------------------------------------------------------------------------
+# Fail-open semantics — a broken cache backend must never fail a job
+# ---------------------------------------------------------------------------
+
+
+class _ExplodingBackend:
+    """A diskcache stand-in that fails every operation."""
+
+    def get(self, key):
+        raise OSError("cache volume is gone")
+
+    def set(self, key, payload, expire=None):
+        raise OSError("cache volume is read-only")
+
+
+class TestFailOpenSemantics:
+    """The cache is an optimisation: a broken backend degrades to a miss.
+
+    If any of these raised, a full or unmounted cache volume would fail
+    transcription jobs outright instead of just costing a re-transcription.
+    """
+
+    def test_media_read_fails_open_when_backend_errors(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        cache._backend = _ExplodingBackend()
+
+        assert cache.get_media(VIDEO_ID) is None
+
+    def test_media_write_failure_is_swallowed(self, tmp_path) -> None:
+        cache = _disk_cache(tmp_path)
+        cache._backend = _ExplodingBackend()
+
+        cache.set_media(VIDEO_ID, "T", 10)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Factory — the feature-flag seam
+# ---------------------------------------------------------------------------
+
+
+class TestGetTranscriptCacheFactory:
+    """``get_transcript_cache`` is the one place the cache flag is honoured."""
+
+    @staticmethod
+    def _settings(tmp_path, *, enabled: bool):
+        return SimpleNamespace(
+            transcript_cache_enabled=enabled,
+            transcript_cache_directory=str(tmp_path / "cache"),
+            transcript_cache_ttl_seconds=3600,
+        )
+
+    @pytest.fixture(autouse=True)
+    def _clear_lru(self):
+        get_transcript_cache.cache_clear()
+        yield
+        get_transcript_cache.cache_clear()
+
+    def test_disabled_returns_noop_cache(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(
+            cache_module, "get_settings", lambda: self._settings(tmp_path, enabled=False)
+        )
+
+        cache = get_transcript_cache()
+
+        assert isinstance(cache, NoOpTranscriptCache)
+        assert cache.get(VIDEO_ID) is None
+
+    def test_enabled_returns_disk_backed_cache(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(
+            cache_module, "get_settings", lambda: self._settings(tmp_path, enabled=True)
+        )
+
+        cache = get_transcript_cache()
+
+        assert isinstance(cache, DiskBackedTranscriptCache)
+        assert cache.ttl_seconds == 3600
+
+    def test_namespace_is_versioned_and_settings_derived(self, monkeypatch, tmp_path) -> None:
+        """Changing a provider's cache-affecting setting must change the key space.
+
+        The namespace is built from each spec's declared ``cache_config_fields``
+        rather than a hard-coded list, so this also proves the registry-driven
+        part of the contract.
+        """
+        monkeypatch.setattr(
+            cache_module, "get_settings", lambda: self._settings(tmp_path, enabled=False)
+        )
+        first = _cache_namespace(self._settings(tmp_path, enabled=False))
+
+        monkeypatch.setattr(
+            cache_module, "get_settings", lambda: self._settings(tmp_path, enabled=True)
+        )
+        second = _cache_namespace(self._settings(tmp_path, enabled=True))
+
+        assert first == second
+        assert first.startswith(f"{_NAMESPACE}:v3:")
+        assert get_transcript_cache().namespace == first
+
+    def test_namespace_changes_when_cache_affecting_setting_changes(self, tmp_path) -> None:
+        base = self._settings(tmp_path, enabled=True)
+        other = SimpleNamespace(**{**vars(base), "speech_to_text_provider": "deepgram"})
+
+        assert _cache_namespace(base) != _cache_namespace(other)
 
 
 # ---------------------------------------------------------------------------
