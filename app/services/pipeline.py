@@ -11,6 +11,7 @@ import asyncio
 from collections.abc import Callable
 
 from app.client import BackendClient
+from app.core import job_context
 from app.core.config import get_settings
 from app.core.exceptions import (
     ExternalServiceError,
@@ -47,22 +48,23 @@ async def run_pipeline(
     """
     settings = get_settings()
     async with JobService(settings, client_factory=client_factory) as jobs:
-        # Video context is populated once the job loads; the failure handler
-        # includes it even when transcription itself raises. If the load fails
-        # there is no video to report and the dict stays empty.
-        video_context: dict[str, str] = {}
+        # ``job_id`` stays explicit on this module's own log calls because
+        # ``run_pipeline`` can be invoked without the Celery task context;
+        # everything deeper (provider, audio, HTTP client) relies on the bound
+        # context instead of re-deriving identity at each layer.
         try:
             job = await jobs.load(job_id)
-            video_context = {
-                "video_id": job.video_id,
-                "youtube_video_id": job.youtube_video_id,
-                "youtube_url": job.youtube_url,
-            }
-            logger.info(
-                "Transcription job started",
-                job_id=job_id,
-                **video_context,
+            # The video is identifiable from here on, so bind it once for every
+            # record emitted below. If the load fails there is no video to name
+            # and the context keeps just what the task bound.
+            job_context.bind(
+                job_context.current().merged(
+                    video_id=job.video_id,
+                    youtube_video_id=job.youtube_video_id,
+                    youtube_url=job.youtube_url,
+                )
             )
+            logger.info("Transcription job started", job_id=job_id)
             submission = await asyncio.wait_for(
                 perform_transcription(job, resume_token, resume_provider),
                 timeout=pipeline_timeout_seconds(settings),
@@ -82,16 +84,11 @@ async def run_pipeline(
                 "Transcription pipeline failed",
                 job_id=job_id,
                 error=error,
-                **video_context,
             )
             await jobs.fail(job_id, error)
             raise
 
-    logger.info(
-        "Pipeline completed",
-        job_id=job_id,
-        **video_context,
-    )
+    logger.info("Pipeline completed", job_id=job_id)
     return {"status": "completed", "video_id": job.video_id}
 
 

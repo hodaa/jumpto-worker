@@ -3,8 +3,11 @@
 import ssl
 
 from celery import Celery
+from celery.signals import task_postrun, task_prerun
 
+from app.core import job_context
 from app.core.config import get_settings
+from app.core.job_context import JobContext
 from app.core.logging import configure_logging
 from app.core.sentry import init_sentry
 from app.core.timeouts import task_hard_time_limit_seconds, task_soft_time_limit_seconds
@@ -73,3 +76,66 @@ celery_app.conf.update(
     # This worker only consumes; it never publishes, so one pooled connection suffices.
     broker_pool_limit=1,
 )
+
+
+# Worker-wide publishing convention: every task is published with the job id as
+# its first positional argument. Celery's task signals only see the published
+# message, not the resolved call, so the job id has to be read from the wire
+# arguments rather than from a task signature.
+JOB_ID_ARG_INDEX = 0
+
+
+def _published_job_id(task) -> str:
+    """Return the job id a task was invoked with.
+
+    An unrecognised message yields an empty string rather than a guess.
+    """
+    args = getattr(getattr(task, "request", None), "args", None) or ()
+    return str(args[JOB_ID_ARG_INDEX]) if len(args) > JOB_ID_ARG_INDEX else ""
+
+
+def _tag_job_id(job_id: str) -> None:
+    """Mirror the job id onto the Sentry scope so task failures carry it.
+
+    structlog context reaches records that pass through a logger call, but
+    ``CeleryIntegration`` also raises events for failures that never reach one
+    — an exception escaping the task body, or a hard time-limit kill. The tag
+    makes those events filterable by ``job_id:`` in Sentry too. An unrecognised
+    message has no job id, and an empty tag would only add noise.
+    """
+    if not job_id:
+        return
+
+    import sentry_sdk
+
+    sentry_sdk.set_tag("job_id", job_id)
+
+
+def _untag_job_id() -> None:
+    """Drop the Sentry job-id tag; prefork children reuse the process scope.
+
+    ``Scope.remove_tag`` is not re-exported at module level in sentry-sdk, and
+    ``sentry_sdk.set_tag`` targets the isolation scope — so removal has to go
+    through the same scope rather than a module-level helper that does not
+    exist.
+    """
+    import sentry_sdk
+
+    sentry_sdk.get_isolation_scope().remove_tag("job_id")
+
+
+@task_prerun.connect
+def bind_task_context(sender=None, task=None, **kwargs) -> None:
+    """Give the whole task — including Celery's own failure report — a job identity."""
+    job_context.clear()
+    retries = getattr(getattr(task, "request", None), "retries", 0) or 0
+    job_id = _published_job_id(task)
+    job_context.bind(JobContext(job_id=job_id, retry_attempt=retries))
+    _tag_job_id(job_id)
+
+
+@task_postrun.connect
+def unbind_task_context(sender=None, **kwargs) -> None:
+    """Drop the job context so the next task on this reused process starts clean."""
+    job_context.clear()
+    _untag_job_id()

@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
+import structlog
+from structlog.contextvars import get_contextvars
 
 from app.core.config import Settings, _live_pipeline_enabled
 from app.core.exceptions import ExternalServiceError
@@ -87,6 +89,47 @@ class TestBuildSubmission:
 
 class TestRunPipeline:
     """Tests for the full worker pipeline flow."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_log_context(self):
+        """The pipeline binds job-scoped log context; keep tests independent."""
+        structlog.contextvars.clear_contextvars()
+        yield
+        structlog.contextvars.clear_contextvars()
+
+    @pytest.mark.asyncio
+    async def test_binds_video_identity_into_log_context(self, monkeypatch) -> None:
+        """Deep logs (provider, audio, HTTP) must be attributable to the video."""
+        client = _FakeClient()
+        monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
+        settings = _settings(live_calls=False)
+        monkeypatch.setattr(pipeline_module, "get_settings", lambda: settings)
+        monkeypatch.setattr(pipeline_module, "perform_transcription", _perform_mock)
+
+        await run_pipeline("job-1")
+
+        record = structlog.contextvars.merge_contextvars(None, "info", {"event": "x"})
+
+        assert record["video_id"] == "video-1"
+        assert record["youtube_video_id"] == "abcde12345"
+
+    @pytest.mark.asyncio
+    async def test_failed_run_still_identifies_the_video(self, monkeypatch) -> None:
+        """The failure path is the one that has to be diagnosable from a log."""
+        client = _FakeClient()
+        monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
+        settings = _settings(live_calls=False)
+        monkeypatch.setattr(pipeline_module, "get_settings", lambda: settings)
+
+        def boom(job, resume_token="", resume_provider=""):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(pipeline_module, "perform_transcription", boom)
+
+        with pytest.raises(RuntimeError):
+            await run_pipeline("job-1")
+
+        assert get_contextvars()["video_id"] == "video-1"
 
     @pytest.mark.asyncio
     async def test_happy_path_calls_all_steps(self, monkeypatch) -> None:

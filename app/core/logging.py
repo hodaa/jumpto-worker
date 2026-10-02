@@ -1,11 +1,35 @@
-"""Structured logging configuration for the JumpTo worker."""
+"""Structured logging configuration for the JumpTo worker.
+
+Owns only *how* a record renders: processors, renderer and levels. What
+identifies a job inside a record is a separate concern, owned by
+``app.core.job_context``, so that adding an identifier is not a change to the
+render format and vice versa.
+"""
 
 import logging
+import socket
 
 import structlog
 from structlog.stdlib import LoggerFactory
 
 from app.core.config import get_settings
+
+# Resolved once: the worker's hostname is constant for the process, and
+# ``socket.gethostname()`` can block on some container/network setups.
+_HOSTNAME = socket.gethostname()
+
+
+def add_hostname(_logger: object, _method: str, event_dict: dict) -> dict:
+    """Add the worker's hostname to a log record.
+
+    A record attribute rather than job context: the hostname is constant for the
+    process and belongs on every record, including those emitted outside any job
+    (worker startup, broker reconnects). Sentry's ``server_name`` only appears
+    on error *events*, so without this the log record itself cannot say which
+    worker produced it.
+    """
+    event_dict["hostname"] = _HOSTNAME
+    return event_dict
 
 
 def configure_logging() -> None:
@@ -18,6 +42,7 @@ def configure_logging() -> None:
         structlog.stdlib.add_log_level,
         structlog.stdlib.PositionalArgumentsFormatter(),
         structlog.processors.TimeStamper(fmt="iso"),
+        add_hostname,
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
         structlog.processors.UnicodeDecoder(),
