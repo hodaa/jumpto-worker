@@ -42,7 +42,8 @@ Add this line (runs every 1 minute):
 
 ```sh
 cp .env.example .env
-# Edit .env to set BACKEND_URL and INTERNAL_API_KEY
+# Edit .env to set BACKEND_URL, INTERNAL_API_KEY and BLOB_READ_WRITE_TOKEN
+# (the Vercel Blob token the backend uses, so produced MP4s can be uploaded)
 
 docker compose up -d
 ```

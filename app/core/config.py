@@ -48,6 +48,18 @@ class Settings(BaseSettings):
         description="Shared API key for authenticating to the backend internal API",
     )
 
+    # Blob storage (Vercel Blob) for produced video downloads. The SDK reads
+    # BLOB_READ_WRITE_TOKEN from the process environment; Compose passes the
+    # worker .env through env_file, and this setting additionally mirrors the
+    # value into the environment for runs where only pydantic loads the file.
+    blob_read_write_token: str = Field(
+        default="",
+        description=(
+            "Vercel Blob read-write token used to upload produced downloads "
+            "(BLOB_READ_WRITE_TOKEN env var)"
+        ),
+    )
+
     # Celery / broker
     queue_provider: Literal["redis", "rabbitmq"] = Field(
         default="redis",

@@ -176,3 +176,15 @@ class TestSentrySettings:
     def test_rejects_out_of_range_sample_rate(self) -> None:
         with pytest.raises(ValidationError):
             Settings(_env_file=None, sentry_traces_sample_rate=1.5)
+
+
+class TestBlobReadWriteToken:
+    """Tests for the Vercel Blob token setting."""
+
+    def test_defaults_to_empty(self, monkeypatch) -> None:
+        monkeypatch.delenv("BLOB_READ_WRITE_TOKEN", raising=False)
+        assert Settings(_env_file=None).blob_read_write_token == ""
+
+    def test_reads_configured_value_from_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", "vercel_blob_rw_x")
+        assert Settings(_env_file=None).blob_read_write_token == "vercel_blob_rw_x"

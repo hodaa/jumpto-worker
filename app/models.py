@@ -17,6 +17,20 @@ class JobData:
 
 
 @dataclass(frozen=True)
+class DownloadData:
+    """Data for an offloaded video download as returned by the backend."""
+
+    download_id: str
+    video_id: str
+    youtube_video_id: str
+    youtube_url: str
+    status: str
+    start_seconds: int | None = None
+    end_seconds: int | None = None
+    height: int | None = None
+
+
+@dataclass(frozen=True)
 class TranscriptWordData:
     """A single word with timing information for storage."""
 

@@ -333,3 +333,87 @@ async def test_client_error_truncates_many_validation_errors(monkeypatch) -> Non
     message = str(exc_info.value)
     assert "body.words.0.word: String should have at least 1 character" in message
     assert "(+49 more)" in message
+
+
+@pytest.mark.asyncio
+async def test_get_video_download_returns_payload(monkeypatch) -> None:
+    payload = {
+        "download_id": "d-1",
+        "video_id": "video-1",
+        "youtube_video_id": "abcde12345",
+        "youtube_url": "https://www.youtube.com/watch?v=abcde12345",
+        "status": "pending",
+        "start_seconds": 10,
+        "end_seconds": None,
+        "height": 720,
+    }
+    response = _json_response(200, payload)
+    client_context = _client_context(response)
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+
+    client = BackendClient(_BASE, _API_KEY)
+    data = await client.get_video_download("d-1")
+
+    assert data == payload
+    args = client_context.request.await_args.args
+    assert args[0] == "GET"
+    assert args[1].endswith("/internal/downloads/d-1")
+
+
+@pytest.mark.asyncio
+async def test_advance_download_posts(monkeypatch) -> None:
+    response = _json_response(200, {"status": "processing"})
+    client_context = _client_context(response)
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+
+    client = BackendClient(_BASE, _API_KEY)
+    await client.advance_download("d-1")
+
+    args = client_context.request.await_args.args
+    assert args[0] == "POST"
+    assert args[1].endswith("/internal/downloads/d-1/advance")
+
+
+@pytest.mark.asyncio
+async def test_mark_download_ready_sends_blob_url(monkeypatch) -> None:
+    response = _json_response(200, {"status": "ready"})
+    client_context = _client_context(response)
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+
+    client = BackendClient(_BASE, _API_KEY)
+    await client.mark_download_ready("d-1", "https://blob/x.mp4")
+
+    args = client_context.request.await_args.args
+    assert args[0] == "POST"
+    assert args[1].endswith("/internal/downloads/d-1/ready")
+    assert client_context.request.await_args.kwargs["json"] == {"blob_url": "https://blob/x.mp4"}
+
+
+@pytest.mark.asyncio
+async def test_mark_download_failed_sends_error(monkeypatch) -> None:
+    response = _json_response(200, {"status": "failed"})
+    client_context = _client_context(response)
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+
+    client = BackendClient(_BASE, _API_KEY)
+    await client.mark_download_failed("d-1", "could not prepare")
+
+    args = client_context.request.await_args.args
+    assert args[0] == "POST"
+    assert args[1].endswith("/internal/downloads/d-1/failed")
+    assert client_context.request.await_args.kwargs["json"] == {"error": "could not prepare"}
+
+
+@pytest.mark.asyncio
+async def test_store_video_formats_sends_heights(monkeypatch) -> None:
+    response = _json_response(200, {"heights": [1080, 720]})
+    client_context = _client_context(response)
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+
+    client = BackendClient(_BASE, _API_KEY)
+    await client.store_video_formats("abcde12345", [1080, 720])
+
+    args = client_context.request.await_args.args
+    assert args[0] == "POST"
+    assert args[1].endswith("/internal/videos/abcde12345/formats")
+    assert client_context.request.await_args.kwargs["json"] == {"heights": [1080, 720]}
