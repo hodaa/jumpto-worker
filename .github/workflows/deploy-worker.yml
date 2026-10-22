@@ -72,7 +72,7 @@ jobs:
             export APP_VERSION=${{ github.sha }}
 
             # 1. Remember currently running version
-            CURRENT_IMAGE=$(docker inspect jumpto-worker --format '{{.Config.Image}}')
+            CURRENT_IMAGE=$(docker inspect qfza-worker --format '{{.Config.Image}}')
             PREVIOUS_VERSION="${CURRENT_IMAGE##*:}"
 
             echo "Previous version: $PREVIOUS_VERSION"
