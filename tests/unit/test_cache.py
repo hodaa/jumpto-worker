@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import app.providers.ytdlp as ytdlp_module
+import app.providers.youtube as youtube_module
 import app.storage.cache as cache_module
 from app.providers.base import VideoTranscriptResult
 from app.providers.models import TranscriptData, TranscriptWordData
@@ -313,6 +313,12 @@ class TestGetTranscriptCacheFactory:
 
         assert _cache_namespace(base) != _cache_namespace(other)
 
+    def test_namespace_changes_when_the_drive_language_changes(self, tmp_path) -> None:
+        base = self._settings(tmp_path, enabled=True)
+        arabic = SimpleNamespace(**{**vars(base), "drive_stt_language": "ar"})
+
+        assert _cache_namespace(base) != _cache_namespace(arabic)
+
 
 # ---------------------------------------------------------------------------
 # NoOpTranscriptCache
@@ -343,11 +349,11 @@ class TestNoOpTranscriptCache:
 
 
 class TestStrategyCaching:
-    """The yt-dlp strategy must consult and populate the cache only when live."""
+    """The youtube strategy must consult and populate the cache only when live."""
 
     @staticmethod
-    def _provider(cache, *, live_calls: bool) -> ytdlp_module.YtDlpTranscriptProvider:
-        return ytdlp_module.YtDlpTranscriptProvider(
+    def _provider(cache, *, live_calls: bool) -> youtube_module.YouTubeTranscriptProvider:
+        return youtube_module.YouTubeTranscriptProvider(
             settings=SimpleNamespace(live_external_calls=live_calls),
             cache=cache,
         )
@@ -363,7 +369,7 @@ class TestStrategyCaching:
             media_called["n"] += 1
             raise AssertionError("media fetch must not run on cache hit")
 
-        monkeypatch.setattr(ytdlp_module, "get_media_info_with_raw", media_info)
+        monkeypatch.setattr(youtube_module, "get_media_info_with_raw", media_info)
         transcript_called = {"n": 0}
 
         async def fetch_transcript(
@@ -387,7 +393,7 @@ class TestStrategyCaching:
 
         media = type("Media", (), {"title": "T", "duration_seconds": 120})()
         monkeypatch.setattr(
-            ytdlp_module,
+            youtube_module,
             "get_media_info_with_raw",
             lambda video_id, url, settings=None: (media, {}),
         )
@@ -411,7 +417,7 @@ class TestStrategyCaching:
 
         media = type("Media", (), {"title": "T", "duration_seconds": 120})()
         monkeypatch.setattr(
-            ytdlp_module,
+            youtube_module,
             "get_media_info_with_raw",
             lambda video_id, url, settings=None: (media, None),
         )
@@ -442,7 +448,7 @@ class TestStrategyCaching:
             media_called["n"] += 1
             raise AssertionError("get_media_info_with_raw must not run on resume")
 
-        monkeypatch.setattr(ytdlp_module, "get_media_info_with_raw", media_info)
+        monkeypatch.setattr(youtube_module, "get_media_info_with_raw", media_info)
 
         async def fetch_transcript(
             url, info=None, resume_token="", webhook_url="", language="", video_id=""
@@ -470,7 +476,7 @@ class TestStrategyCaching:
 
         media = type("Media", (), {"title": "Fresh Title", "duration_seconds": 60})()
         monkeypatch.setattr(
-            ytdlp_module,
+            youtube_module,
             "get_media_info_with_raw",
             lambda video_id, url, settings=None: (media, {}),
         )

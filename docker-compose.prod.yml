@@ -7,7 +7,7 @@
 
     worker:
       image: ${IMAGE_NAME}:${APP_VERSION}
-      container_name: jumpto-worker
+      container_name: qfza-worker
       restart: unless-stopped
       env_file:
         - .env
@@ -20,7 +20,7 @@
         - ${COOKIE_DIR:-/etc/jumpto}/cookies.txt:/etc/jumpto/cookies.txt:ro
         # Writable marker that requests a host-side cookie refresh. The host
         # bind mount shadows the image-chowned /var/lib/jumpto/state, so the
-        # host dir must be owned by uid/gid 10001 (jumpto): `mkdir -p
+        # host dir must be owned by uid/gid 10001 (qfza): `mkdir -p
         # /etc/jumpto/state && chown 10001:10001 /etc/jumpto/state`.
         - /etc/jumpto/state:/var/lib/jumpto/state
       depends_on:
@@ -31,7 +31,7 @@
         - app.tasks.celery_app.celery_app
         - worker
         - --loglevel=info
-        - --hostname=jumpto-worker
+        - --hostname=qfza-worker
         # These must follow `worker`; Celery 5 enforces option order. Each one
         # stops a stream of cluster messages that CloudAMQP bills against the
         # monthly quota (gossip/mingle broadcast continuously).

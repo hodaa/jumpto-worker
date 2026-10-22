@@ -13,13 +13,13 @@ from app.core.exceptions import DomainError
 class TranscriptJobPending(DomainError):
     """A cloud provider escalated transcription to an async job not yet done.
 
-    Raised by providers that queue work on their side (e.g. Supadata AI
-    generation). ``resume_token`` lets a later attempt resume the same job
+    Raised by providers that queue work on their side (e.g. Assembly audio
+    transcription). ``resume_token`` lets a later attempt resume the same job
     instead of queuing a fresh transcription; the orchestrator routes it back
     to the originating provider via ``provider``. ``resumable`` separates jobs
     the caller may wait on (retry with backoff, carrying the resume token)
-    from providers running a strict one-call policy (e.g. TranscriptFetch),
-    where the job must be failed rather than polled or retried.
+    from providers running a strict one-call policy, where the job must be
+    failed rather than polled or retried.
 
     ``webhook`` marks a job whose completion is expected to arrive via an
     externally wired webhook (the submit already armed it); the pipeline must

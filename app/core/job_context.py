@@ -29,8 +29,8 @@ class JobContext:
     job_id: str = ""
     retry_attempt: int = 0
     video_id: str = ""
-    youtube_video_id: str = ""
-    youtube_url: str = ""
+    video_source_id: str = ""
+    video_url: str = ""
 
     def merged(self, **updates: str) -> "JobContext":
         """Return a copy with ``updates`` applied, ignoring empty values.

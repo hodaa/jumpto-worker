@@ -43,11 +43,11 @@ COPY app ./app
 # world-readable perms from COPY. The marker dir is a host bind mount in
 # docker-compose, so a fixed UID (10001) keeps ownership deterministic for
 # the host-side cookie-refresh cron.
-RUN groupadd --system --gid 10001 jumpto \
-    && useradd --system --create-home --shell /usr/sbin/nologin --uid 10001 --gid 10001 jumpto \
+RUN groupadd --system --gid 10001 qfza \
+    && useradd --system --create-home --shell /usr/sbin/nologin --uid 10001 --gid 10001 qfza \
     && mkdir -p /var/tmp/jumpto-transcript-cache /var/lib/jumpto/state \
-    && chown -R jumpto:jumpto /var/tmp/jumpto-transcript-cache /var/lib/jumpto/state
+    && chown -R qfza:qfza /var/tmp/jumpto-transcript-cache /var/lib/jumpto/state
 
-USER jumpto
+USER qfza
 
 CMD ["celery", "-A", "app.tasks.celery_app.celery_app", "worker", "--loglevel=info"]

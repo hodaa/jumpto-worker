@@ -2,11 +2,11 @@
 
 The backend queues ``video_downloads`` rows (and occasional format probes)
 onto the shared worker queue; this module is the worker-side side of that
-work: resolve the request through the backend API, download and merge the
-asked MP4 with yt-dlp (using the worker's cookies, IP and media tooling),
+work: resolve the request through the backend API, download the asked MP4
+through the URL's video source (yt-dlp for YouTube, an HTTP fetch for Drive),
 upload the artifact to blob storage, and report the blob URL back. The probe
 path reuses the same yt-dlp plumbing to read a video's H.264 quality ladder
-for the backend's formats cache.
+for the backend's formats cache; sources without a ladder report an empty one.
 
 yt-dlp is blocking, so every run is pushed onto a thread. A bot-check
 touches the host's cookie-refresh marker, exactly like the other yt-dlp
@@ -38,6 +38,7 @@ from app.integrations.ytdlp import (
 )
 from app.models import DownloadData
 from app.services.jobs import default_client_factory
+from app.sources import resolve_source
 
 logger = get_logger(__name__)
 
@@ -73,11 +74,37 @@ def fetch_video_file(
     height: int | None = None,
     settings=None,
 ) -> Path:
-    """Download and merge one MP4 into ``directory``; return its path.
+    """Download one MP4 into ``directory``; the URL's source does the fetching.
 
     With ``start_seconds`` set only that section is downloaded, ending at
     ``end_seconds`` or, when omitted, at the end of the video; with ``height``
-    set the H.264 pick is capped at that quality.
+    set the pick is capped at that quality where a ladder exists.
+    """
+    source = resolve_source(youtube_url)
+    return source.download(
+        youtube_url,
+        directory,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+        height=height,
+        settings=settings,
+    )
+
+
+def fetch_video_file_with_ytdlp(
+    youtube_url: str,
+    directory: Path,
+    *,
+    start_seconds: int | None = None,
+    end_seconds: int | None = None,
+    height: int | None = None,
+    settings=None,
+) -> Path:
+    """Download and merge one YouTube MP4 into ``directory``; return its path.
+
+    This is the YouTube implementation behind
+    :class:`~app.sources.youtube.YouTubeSource`; section and quality behavior
+    is unchanged from the days it was the only source.
     """
     options = build_ydlp_options(
         settings=settings,
@@ -95,7 +122,13 @@ def fetch_video_file(
 
 
 def probe_heights(youtube_url: str, *, settings=None) -> list[int]:
-    """Probe a video's H.264 quality ladder (metadata only), tallest first."""
+    """Probe a video's H.264 quality ladder (metadata only), tallest first.
+
+    Only caption-bearing sources (YouTube) have a ladder to report; a Drive
+    file is a single upload, so its probe is an empty ladder without a call.
+    """
+    if not resolve_source(youtube_url).native_captions:
+        return []
     options = build_ydlp_options(settings=settings)
     info = _run_ytdlp(options, lambda ydl: ydl.extract_info(youtube_url, download=False))
     return _ladder_from_info(info or {})

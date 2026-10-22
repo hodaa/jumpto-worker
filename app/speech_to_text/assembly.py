@@ -12,12 +12,12 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import ExternalServiceError
 from app.core.logging import get_logger
 from app.providers.audio import download_audio, remove_file
-from app.providers.base import TranscriptService
 from app.providers.models import (
     TranscriptData,
     TranscriptJobPending,
     TranscriptWordData,
 )
+from app.speech_to_text.base import SpeechToTextProvider
 
 logger = get_logger(__name__)
 
@@ -28,7 +28,7 @@ _UPLOAD_PROGRESS_LOG_BYTES = 10_485_760
 _MIB = 1 << 20
 
 
-class AssemblyTranscriptService(TranscriptService):
+class AssemblyTranscriptService(SpeechToTextProvider):
     """Real Assembly.ai transcription client (word-level timestamps)."""
 
     def __init__(
@@ -238,7 +238,7 @@ def _parse_assembly_transcript(data: dict) -> TranscriptData:
 
 def get_transcript_provider(
     settings: Settings | None = None,
-) -> TranscriptService | None:
+) -> SpeechToTextProvider | None:
     """
     Return the Assembly.ai audio transcription service, or ``None``.
 

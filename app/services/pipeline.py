@@ -1,8 +1,9 @@
 """Transcription pipeline orchestration.
 
-Owns the end-to-end flow: resolve the single configured provider from settings,
-fetch a transcript (resuming pending async jobs when the provider supports it),
-build the submission, and report back through the backend's ``JobService``.
+Owns the end-to-end flow: resolve the provider strategy that serves the job's
+source, fetch a transcript (resuming pending async jobs when the provider
+supports it), build the submission, and report back through the backend's
+``JobService``.
 Provider strategy details, webhook URL building, and submission payload mapping
 live in their own service modules; this module composes them.
 """
@@ -21,7 +22,7 @@ from app.core.logging import get_logger
 from app.core.timeouts import pipeline_timeout_seconds
 from app.models import TranscriptSubmission
 from app.providers import TranscriptJobPending
-from app.providers.registry import resolve_provider
+from app.providers.registry import canonical_provider_name, resolve_provider
 from app.services.jobs import JobService
 from app.services.submissions import build_result_submission
 from app.services.webhooks import build_assembly_webhook_url
@@ -60,8 +61,8 @@ async def run_pipeline(
             job_context.bind(
                 job_context.current().merged(
                     video_id=job.video_id,
-                    youtube_video_id=job.youtube_video_id,
-                    youtube_url=job.youtube_url,
+                    video_source_id=job.youtube_video_id,
+                    video_url=job.youtube_url,
                 )
             )
             logger.info("Transcription job started", job_id=job_id)
@@ -96,14 +97,14 @@ async def perform_transcription(
     job, resume_token: str = "", resume_provider: str = ""
 ) -> TranscriptSubmission:
     settings = get_settings()
-    provider = resolve_provider(settings)
+    provider = resolve_provider(settings, job.youtube_url)
     webhook_url = build_assembly_webhook_url(settings, job.job_id, provider.name)
     result = await try_provider(provider, job, resume_token, resume_provider, webhook_url)
     if result is not None:
         logger.info(
             "Transcript provider used",
             provider=provider.name,
-            youtube_url=job.youtube_url,
+            video_url=job.youtube_url,
         )
         # An empty transcript (silent video, music-only audio) is a normal
         # outcome: it is submitted as-is so the backend can store a null
@@ -135,9 +136,15 @@ async def try_provider(
     ``supports_webhook`` (interface segregation: the pipeline checks the
     provider's declared capability, never a hard-coded name list).
     """
+    # Compare canonical names: a job armed before the yt-dlp -> youtube rename
+    # stored the alias, which must still resume this strategy.
     resume = (
         resume_token
-        if (resume_token and provider.supports_resume and provider.name == resume_provider)
+        if (
+            resume_token
+            and provider.supports_resume
+            and provider.name == canonical_provider_name(resume_provider)
+        )
         else ""
     )
     try:
@@ -151,14 +158,14 @@ async def try_provider(
         logger.exception(
             "Permanent cloud transcript provider failure",
             provider=provider.name,
-            youtube_url=job.youtube_url,
+            video_url=job.youtube_url,
         )
         raise
     except ExternalServiceError:
         logger.exception(
             "Transcript provider failed; falling back",
             provider=provider.name,
-            youtube_url=job.youtube_url,
+            video_url=job.youtube_url,
         )
         return None
 

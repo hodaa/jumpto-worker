@@ -47,9 +47,9 @@ class TestJobContextShape:
         assert set(CONTEXT_KEYS) == {f.name for f in fields(JobContext)}
 
     def test_merged_applies_updates(self) -> None:
-        merged = JobContext(job_id="job-1").merged(video_id="video-9", youtube_url="u")
+        merged = JobContext(job_id="job-1").merged(video_id="video-9", video_url="u")
 
-        assert merged == JobContext(job_id="job-1", video_id="video-9", youtube_url="u")
+        assert merged == JobContext(job_id="job-1", video_id="video-9", video_url="u")
 
     def test_merged_keeps_existing_identity(self) -> None:
         """The video phase must not drop what the Celery phase bound."""
@@ -60,7 +60,7 @@ class TestJobContextShape:
 
     def test_merged_ignores_empty_updates(self) -> None:
         """An unknown video must not overwrite known identity with a blank."""
-        merged = JobContext(job_id="job-1").merged(video_id="", youtube_url="")
+        merged = JobContext(job_id="job-1").merged(video_id="", video_url="")
 
         assert merged == JobContext(job_id="job-1")
 
@@ -91,12 +91,12 @@ class TestBind:
 
     def test_video_identity_is_bound_by_a_later_phase(self) -> None:
         bind(JobContext(job_id="job-1"))
-        bind(current().merged(video_id="video-9", youtube_video_id="yt-9"))
+        bind(current().merged(video_id="video-9", video_source_id="yt-9"))
 
         record = _rendered_record(event="boom")
 
         assert record["video_id"] == "video-9"
-        assert record["youtube_video_id"] == "yt-9"
+        assert record["video_source_id"] == "yt-9"
         assert record["job_id"] == "job-1"
 
     def test_unpopulated_fields_stay_absent(self) -> None:

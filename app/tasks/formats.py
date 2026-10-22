@@ -30,6 +30,6 @@ def probe_video_formats(
             probe_and_store_formats(youtube_video_id, youtube_url, client_factory=client_factory)
         )
     except Exception:
-        logger.exception("Format probe failed", youtube_video_id=youtube_video_id)
+        logger.exception("Format probe failed", video_source_id=youtube_video_id)
         return {"status": "failed"}
     return {"status": "completed", "heights": heights}

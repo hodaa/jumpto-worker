@@ -4,37 +4,35 @@ Architecture and implementation conventions for the jumpto-worker codebase.
 
 ## Transcript provider model
 
-There are exactly **4 registered transcript providers**, all first-class and
-interchangeable at the registry level (`app/providers/registry.py`):
+There are exactly **2 registered transcript strategies**, both first-class at
+the registry level (`app/providers/registry.py`):
 
-| name             | class                                     | module                          |
-| ---------------- | ----------------------------------------- | ------------------------------- |
-| `yt-dlp`         | `YtDlpTranscriptProvider`                 | `app/providers/ytdlp.py`        |
-| `transcriptfetch` | `TranscriptFetchTranscriptProvider`       | `app/providers/transcriptfetch.py` |
-| `supadata`       | `SupadataTranscriptProvider`              | `app/providers/supadata.py`     |
-| `vidwords`       | `VidWordsTranscriptProvider`              | `app/providers/vidwords.py`     |
+| name      | class                       | module                     |
+| --------- | --------------------------- | -------------------------- |
+| `youtube` | `YouTubeTranscriptProvider` | `app/providers/youtube.py` |
+| `drive`   | `DriveTranscriptProvider`   | `app/providers/drive.py`   |
 
-- Every provider implements `TranscriptProviderStrategy` (`app/providers/base.py`):
+- Every strategy implements `TranscriptProviderStrategy` (`app/providers/base.py`):
   it has a stable `name`, `supports_resume` and `supports_webhook` flags, and a
   `fetch()` returning `VideoTranscriptResult | None` (``None`` = soft miss, so
   the pipeline fails the job) or raising `ExternalServiceError`.
   `fetch()` accepts an optional keyword-only `webhook_url` (an opaque public
-  callback URL, consumed only by the Assembly path, which declares
+  callback URL, consumed only by the audio leaves, which declare
   ``supports_webhook``).
-- **All four are providers.** Do not model "cloud vs local" as a first-class
-  concept; whether a provider needs API keys/network access is an internal
-  detail. Exactly one provider runs per job, selected via `VIDEO_PROVIDER`
-  (default `yt-dlp`); there is no fallback chain — an unavailable provider
-  fails the job loudly.
-- A provider doing work in the background (e.g. Assembly) reports in-progress
-  via `TranscriptJobPending`, so the pipeline can resume the same job
+- **Selection is source-driven, not configured.** A captionless source (Drive)
+  resolves to its own same-named strategy; a caption-bearing source (YouTube)
+  resolves to `youtube`. There is no fallback chain — an unavailable strategy
+  fails the job loudly. (A `VIDEO_PROVIDER` knob used to route YouTube jobs to
+  paid cloud transcript APIs; those strategies were removed, so the knob is
+  gone.)
+- A strategy doing work in the background reports in-progress via
+  `TranscriptJobPending`, so the pipeline can resume the same job
   (`resume_token`/`resume_provider`) instead of re-downloading.
-- `supports_resume` marks strategies that can honour a `resume_token` (Supadata,
-  yt-dlp); the pipeline only routes resumes to them. `fetch()` returns `None`
-  on a soft miss for cloud strategies; the terminal yt-dlp strategy never
-  returns `None` — it produces a result or raises. `supports_webhook` marks
-  strategies that consume a completion callback URL; the pipeline only forwards
-  one to strategies that declare it.
+- `supports_resume` marks strategies that can honour a `resume_token`; the
+  pipeline only routes resumes to them. The local strategies never return
+  `None` — they produce a result or raise; only audio leaves can soft-miss.
+  `supports_webhook` marks strategies that consume a completion callback URL;
+  the pipeline only forwards one to strategies that declare it.
 - Deployment metadata that is not transcript behavior (e.g. `uses_cloud` —
   whether the strategy needs live external API calls, or
   `cache_config_fields` — which settings knobs change a provider's output and
@@ -47,35 +45,36 @@ The registry is **closed**: it never imports concrete provider modules at the
 top level. Each provider module owns its own `TranscriptProviderSpec` and calls
 `register_provider()` at import time. Lookup functions (`provider_spec`,
 `ordered_specs`, `build_provider`) lazily trigger `_ensure_registered()` which
-imports the four provider modules once. **Adding a provider** means writing a
+imports the provider modules once. **Adding a provider** means writing a
 new module with a spec, and adding one import line in `_ensure_registered()`.
 
-## The yt-dlp provider is a composite
+## The YouTube strategy is a composite
 
-`YtDlpTranscriptProvider` orchestrates several internal services:
+`YouTubeTranscriptProvider` orchestrates several internal services:
 
 1. Fetch media metadata once (title/duration) — via `app/providers/media.py`.
 2. Prefer existing captions — `YouTubeCaptionTranscriptService`
    (`app/providers/transcript.py`); no captions is a normal outcome, falls through.
-3. Only if captions are unavailable, fall back to **Assembly audio
-   transcription** — `AssemblyTranscriptService` (`app/providers/assembly.py`).
+3. Only if captions are unavailable, fall back to the configured **audio
+   transcription leaf** — `SPEECH_TO_TEXT_PROVIDER` (`deepgram` by default, or
+   `assembly`); see `app/speech_to_text/registry.py`.
 
-`media.py` and Assembly are **internal services of the yt-dlp provider**, not
-registry-level providers. They must stay reusable as services and never be
-duplicated into other providers.
+`media.py` and the speech-to-text leaves are **internal services of the local
+strategies**, not registry-level providers. They must stay reusable as services
+and never be duplicated into other providers.
 
 The registry's `spec.build` injects `settings` into the composite; its leaf
 collaborators are constructor-injectable (`captions_service`,
-`assembly_provider`, `cache`) with lazy concrete defaults so a plain
-`YtDlpTranscriptProvider()` keeps working. Inject collaborators in tests rather
-than monkeypatching module globals.
+`speech_to_text_provider`, `cache`) with lazy concrete defaults so a plain
+`YouTubeTranscriptProvider()` keeps working. Inject collaborators in tests
+rather than monkeypatching module globals.
 
 Provider modules are split by concern:
 
-- `app/providers/base.py` — the two abstract interfaces:
-  `TranscriptProviderStrategy` (registry-level strategies) and
-  `TranscriptService` (internal leaf fetchers). `TranscriptService.fetch`
-  declares only `fetch(url)`; implementation-specific parameters (`info`,
+- `app/providers/base.py` — the registry-level strategy interface,
+  `TranscriptProviderStrategy`. The internal leaf-fetcher interface lives in
+  `app/speech_to_text/base.py` (`SpeechToTextProvider`); its `fetch(url)`
+  declares only the URL, and implementation-specific parameters (`info`,
   `resume_token`) are added by each concrete service.
 - `exceptions.py` taxonomy: `ExternalServiceError` (transient soft miss, moves
   to next provider), `PermanentExternalServiceError` (fails the job),
@@ -88,14 +87,14 @@ Provider modules are split by concern:
 - `app/providers/models.py` — shared domain types: `TranscriptData`,
   `TranscriptWordData`, and the `TranscriptJobPending` signal.
 - `app/providers/transcript.py` — the YouTube caption service + VTT parsing.
-- `app/providers/assembly.py` — the Assembly audio service plus the
+- `app/speech_to_text/assembly.py` — the Assembly audio service plus the
   `get_transcript_provider()` factory that builds it from settings.
 - `app/providers/audio.py` — the audio file itself: download, persisted
   per-video cache paths, stale sweeping, and `AudioFileLease`, the object that
   owns one job's hold on the file (download once, reuse across attempts, release
   when the job settles). The composite holds a lease; it never manages paths or
   temp files itself.
-- `app/providers/deepgram.py` — the Deepgram audio service plus
+- `app/speech_to_text/deepgram.py` — the Deepgram audio service plus
   `get_deepgram_provider()`. Both audio leaves share the composite's
   `fetch(youtube_url, resume_token, webhook_url, language, audio_path)`
   signature, and the composite passes all five **explicitly** — every parameter
@@ -103,8 +102,8 @@ Provider modules are split by concern:
   that call with a `**kwargs` dict: it hides the leaves' signatures, so renaming
   a leaf parameter would silently drop the value instead of failing.
 
-Internal leaf fetchers (captions, Assembly) are `*TranscriptService` subclasses
-of `TranscriptService` (`app/providers/base.py`); registry strategies are
+Internal leaf fetchers (captions, Assembly, Deepgram) are subclasses of
+`SpeechToTextProvider` (`app/speech_to_text/base.py`); registry strategies are
 `*TranscriptProvider` subclasses of `TranscriptProviderStrategy`
 (`app/providers/base.py`).
 
@@ -121,10 +120,11 @@ call sites previously caused a 403 regression — keep it centralized.
 `app/services/pipeline.py` (orchestrated by the thin Celery task
 `app/tasks/transcription.py`) runs in this order:
 
-1. `registry.resolve_provider(settings)` builds the single configured provider
-   from `VIDEO_PROVIDER` (default `yt-dlp`). Unknown or unconfigured providers
-   and cloud providers while live calls are disabled raise instead of being
-   silently skipped — there is no fallback chain.
+1. `registry.resolve_provider(settings, url)` builds the single strategy the
+   job's source resolves to: `drive` for captionless links, `youtube` for
+   caption-bearing ones. Unconfigured strategies and cloud strategies while
+   live calls are disabled raise instead of being silently skipped — there is
+   no fallback chain.
 2. `try_provider()` calls the provider's `fetch()`, routing resume tokens when
    `resume_provider` matches the provider `name`, and returns the result or
    `None` on a soft miss. `fetch()` accepts an optional keyword-only
@@ -166,8 +166,8 @@ Assembly transcription runs ~real-time, far beyond the in-worker retry budget.
 When `ASSEMBLY_WEBHOOK_BASE_URL` is set, the worker stops poller-retrying and
 lets Assembly deliver completion out-of-band:
 
-1. The pipeline builds a callback URL — ``<base>?job_id=<job_id>&provider=yt-dlp``
-   (`app/services/webhooks.py:_build_assembly_webhook_url`) and passes it to
+1. The pipeline builds a callback URL — ``<base>?job_id=<job_id>&provider=youtube``
+   (`app/services/webhooks.py:build_assembly_webhook_url`) and passes it to
    `AssemblyTranscriptService.fetch(..., webhook_url=...)`.
 2. Assembly submits the transcript with that `webhook_url`; a still-processing
    poll raises `TranscriptJobPending(..., webhook=True)`.
@@ -181,8 +181,8 @@ The webhook receiver lives on the **backend** (separate repo). Contract:
 - Assembly posts `{"transcript_id": "...", "status": "completed"|"error", ...}`.
 - On `completed`, the backend must re-enqueue the worker task
   `download_and_transcribe(job_id, resume_token=<transcript_id>,
-  resume_provider="yt-dlp")` (resume must route to provider `"yt-dlp"`, the
-  strategy name, not `assemblyai`).
+  resume_provider="youtube")` (resume must route to the strategy name, not
+  `assemblyai`; the legacy `"yt-dlp"` alias also resolves).
 - On `error`, the backend should fail the job.
 
 Behaviour without a configured webhook base URL is unchanged legacy
@@ -231,7 +231,7 @@ code:
 - **D — Dependency Inversion**: depend on abstractions, not concretions.
   High-level pipeline code depends on the registry/spec and `JobService`, not
   concrete providers or `BackendClient`. Inject collaborators (settings,
-  services, client factories): `YtDlpTranscriptProvider` accepts injected
+  services, client factories): `YouTubeTranscriptProvider` accepts injected
   `settings`, and leaf services (`media.py`, `build_ydlp_options`) accept an
   optional `settings=` override instead of re-reading the singleton, so tests
   inject fakes instead of monkeypatching module globals. `get_settings()`

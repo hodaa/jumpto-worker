@@ -17,18 +17,18 @@ from app.integrations.ytdlp import (
     release_temp_cookie,
     request_cookie_refresh,
 )
-from app.providers.base import TranscriptService
 from app.providers.models import (
     TranscriptData,
     TranscriptWordData,
     _close_word_times,
     _language_base,
 )
+from app.speech_to_text.base import SpeechToTextProvider
 
 logger = get_logger(__name__)
 
 
-class YouTubeCaptionTranscriptService(TranscriptService):
+class YouTubeCaptionTranscriptService(SpeechToTextProvider):
     """YouTube caption downloader (works for any subtitle language)."""
 
     def __init__(self, settings: Settings | None = None) -> None:
@@ -247,14 +247,19 @@ def _parse_vtt(vtt_text: str, language_code: str) -> TranscriptData:
         start = hours * 3600 + minutes * 60 + seconds + millis / 1000.0
         words.append(TranscriptWordData(word=raw, start_time=start, end_time=start))
     if not words:
-        words = _parse_vtt_lines(vtt_text)
+        words = parse_vtt_cues(vtt_text)
     _close_word_times(words)
     text = " ".join(word.word for word in words)
     return TranscriptData(language=_language_base(language_code), text=text, words=words)
 
 
-def _parse_vtt_lines(vtt_text: str) -> list[TranscriptWordData]:
-    """Parse line-level VTT captions when per-word timestamps are absent."""
+def parse_vtt_cues(vtt_text: str) -> list[TranscriptWordData]:
+    """Parse line-level VTT captions into timestamped words.
+
+    Cue text carries no per-word timing, so every word in a cue shares the
+    cue's start; :func:`_close_word_times` later closes each word on the next
+    one's start. Shared by the YouTube parser and the Drive caption path.
+    """
     words: list[TranscriptWordData] = []
     lines = vtt_text.splitlines()
     i = 0

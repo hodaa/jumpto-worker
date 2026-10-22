@@ -9,19 +9,17 @@ import structlog
 from structlog.contextvars import get_contextvars
 
 from app.core.config import Settings, _live_pipeline_enabled
-from app.core.exceptions import ExternalServiceError
+from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.models import JobData, TranscriptSubmission
 from app.providers import (
     TranscriptData,
     TranscriptJobPending,
-    TranscriptWordData,
     VideoTranscriptResult,
-    VidWordsResult,
 )
 from app.providers import audio as audio_module
-from app.providers import ytdlp as ytdlp_module
+from app.providers import audio_jobs as audio_jobs_module
+from app.providers import youtube as youtube_module
 from app.providers.registry import resolve_provider as provider_resolve
-from app.providers.vidwords import VidWordsPermanentError
 from app.services import jobs as jobs_module
 from app.services import pipeline as pipeline_module
 from app.services.pipeline import (
@@ -111,7 +109,7 @@ class TestRunPipeline:
         record = structlog.contextvars.merge_contextvars(None, "info", {"event": "x"})
 
         assert record["video_id"] == "video-1"
-        assert record["youtube_video_id"] == "abcde12345"
+        assert record["video_source_id"] == "abcde12345"
 
     @pytest.mark.asyncio
     async def test_failed_run_still_identifies_the_video(self, monkeypatch) -> None:
@@ -211,7 +209,7 @@ class TestRunPipeline:
         monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
 
         def pending(job, resume_token="", resume_provider=""):
-            raise TranscriptJobPending(provider="supadata", resume_token="job-x")
+            raise TranscriptJobPending(provider="youtube", resume_token="job-x")
 
         monkeypatch.setattr(pipeline_module, "perform_transcription", pending)
 
@@ -227,12 +225,12 @@ class TestRunPipeline:
         monkeypatch.setattr(jobs_module, "BackendClient", lambda base, key: client)
 
         def pending(job, resume_token="", resume_provider=""):
-            raise TranscriptJobPending(provider="supadata", resume_token="job-x")
+            raise TranscriptJobPending(provider="youtube", resume_token="job-x")
 
         monkeypatch.setattr(pipeline_module, "perform_transcription", pending)
 
         with pytest.raises(TranscriptJobPending):
-            await run_pipeline("job-1", resume_token="job-x", resume_provider="supadata")
+            await run_pipeline("job-1", resume_token="job-x", resume_provider="youtube")
 
         assert client.calls == ["get_job"]
         assert client.failed is False
@@ -249,7 +247,7 @@ class TestFetchTranscriptWithRetry:
 
     @staticmethod
     def _provider(captions_service=None, speech_to_text_provider=None, *, live_calls=True):
-        return ytdlp_module.YtDlpTranscriptProvider(
+        return youtube_module.YouTubeTranscriptProvider(
             settings=_settings(live_calls=live_calls),
             captions_service=captions_service,
             speech_to_text_provider=speech_to_text_provider,
@@ -257,10 +255,10 @@ class TestFetchTranscriptWithRetry:
 
     @staticmethod
     def _patch_audio(monkeypatch, tmp_path):
-        """Stub the composite's audio download/cleanup with a fake file.
+        """Stub the strategy's audio download/cleanup with a fake file.
 
-        The composite owns the audio download now, so tests must never reach
-        the real yt-dlp downloader.
+        The strategy owns the audio download now, so tests must never reach the
+        real yt-dlp downloader.
         """
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"data")
@@ -269,6 +267,17 @@ class TestFetchTranscriptWithRetry:
         )
         monkeypatch.setattr(audio_module, "remove_file", lambda path: None)
         return audio_file
+
+    @pytest.mark.asyncio
+    async def test_rejects_captionless_sources(self, monkeypatch) -> None:
+        source = SimpleNamespace(name="drive", native_captions=False)
+        monkeypatch.setattr(youtube_module, "resolve_source", lambda url: source)
+        provider = self._provider()
+
+        with pytest.raises(PermanentExternalServiceError):
+            await provider.fetch(
+                "https://drive.google.com/file/d/1DOoJhC6NHpLSu2nAvaWy3HukVimEyyhE/view"
+            )
 
     @pytest.mark.asyncio
     async def test_uses_captions_fast_path_when_live(self) -> None:
@@ -382,7 +391,7 @@ class TestFetchTranscriptWithRetry:
     async def test_pending_audio_job_bubbles_as_strategy_provider(
         self, monkeypatch, tmp_path
     ) -> None:
-        """A pending Assembly job from the first attempt must route as yt-dlp
+        """A pending Assembly job from the first attempt must route as youtube
         so the retry resumes the same transcript instead of re-downloading."""
 
         def no_captions(url, info=None):
@@ -408,7 +417,7 @@ class TestFetchTranscriptWithRetry:
         with pytest.raises(TranscriptJobPending) as excinfo:
             await provider._fetch_transcript_with_retry("https://youtu.be/abcde12345")
 
-        assert excinfo.value.provider == "yt-dlp"
+        assert excinfo.value.provider == "youtube"
         assert excinfo.value.resume_token == "asm-1"
         assert excinfo.value.resumable is True
         assert audio.fetch.await_count == 1
@@ -447,7 +456,7 @@ class TestFetchTranscriptWithRetry:
                 webhook_url="https://backend.test/api/webhooks/assembly?job_id=job-1",
             )
 
-        assert excinfo.value.provider == "yt-dlp"
+        assert excinfo.value.provider == "youtube"
         assert excinfo.value.webhook is True
         assert excinfo.value.resume_token == "asm-1"
 
@@ -470,7 +479,7 @@ class TestFetchTranscriptWithRetry:
         )
         audio_file = self._patch_audio(monkeypatch, tmp_path)
 
-        webhook = "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=yt-dlp"
+        webhook = "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=youtube"
         result = await provider._fetch_transcript_with_retry(
             "https://youtu.be/abcde12345", webhook_url=webhook
         )
@@ -487,8 +496,8 @@ class TestFetchTranscriptWithRetry:
 
     @pytest.mark.asyncio
     async def test_raises_after_retries_exhausted(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setattr(ytdlp_module, "_RETRY_ATTEMPTS", 2)
-        monkeypatch.setattr(ytdlp_module, "_RETRY_DELAY_SECONDS", 0)
+        monkeypatch.setattr(audio_jobs_module, "_RETRY_ATTEMPTS", 2)
+        monkeypatch.setattr(audio_jobs_module, "_RETRY_DELAY_SECONDS", 0)
 
         def fail(url, resume_token="", webhook_url="", language="", audio_path=""):
             raise ExternalServiceError("boom", service="assemblyai")
@@ -534,8 +543,8 @@ class TestFetchTranscriptWithRetry:
     @pytest.mark.asyncio
     async def test_reuses_same_audio_file_across_retries(self, monkeypatch, tmp_path) -> None:
         """A speech-to-text failure must re-submit the same file, not re-download."""
-        monkeypatch.setattr(ytdlp_module, "_RETRY_ATTEMPTS", 3)
-        monkeypatch.setattr(ytdlp_module, "_RETRY_DELAY_SECONDS", 0)
+        monkeypatch.setattr(audio_jobs_module, "_RETRY_ATTEMPTS", 3)
+        monkeypatch.setattr(audio_jobs_module, "_RETRY_DELAY_SECONDS", 0)
 
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"data")
@@ -606,8 +615,8 @@ class TestFetchTranscriptWithRetry:
         self, monkeypatch, tmp_path
     ) -> None:
         """Exhausting the retry budget also releases the persisted audio."""
-        monkeypatch.setattr(ytdlp_module, "_RETRY_ATTEMPTS", 2)
-        monkeypatch.setattr(ytdlp_module, "_RETRY_DELAY_SECONDS", 0)
+        monkeypatch.setattr(audio_jobs_module, "_RETRY_ATTEMPTS", 2)
+        monkeypatch.setattr(audio_jobs_module, "_RETRY_DELAY_SECONDS", 0)
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"data")
         removed = []
@@ -729,8 +738,8 @@ class TestFetchTranscriptWithRetry:
     @pytest.mark.asyncio
     async def test_resume_skips_audio_download(self, monkeypatch, tmp_path) -> None:
         """A resume polls the pending cloud job; the audio is never downloaded."""
-        monkeypatch.setattr(ytdlp_module, "_RETRY_ATTEMPTS", 2)
-        monkeypatch.setattr(ytdlp_module, "_RETRY_DELAY_SECONDS", 0)
+        monkeypatch.setattr(audio_jobs_module, "_RETRY_ATTEMPTS", 2)
+        monkeypatch.setattr(audio_jobs_module, "_RETRY_DELAY_SECONDS", 0)
         downloads = []
         removed = []
         monkeypatch.setattr(
@@ -787,32 +796,32 @@ class TestPerformTranscription:
     """Tests for the single configured provider flow."""
 
     @staticmethod
-    def _ytdlp() -> SimpleNamespace:
+    def _local() -> SimpleNamespace:
         return SimpleNamespace(
-            name="yt-dlp", supports_resume=True, fetch=AsyncMock(return_value=_ytdlp_result())
+            name="youtube", supports_resume=True, fetch=AsyncMock(return_value=_local_result())
         )
 
     @pytest.mark.asyncio
-    async def test_configured_provider_used_when_it_returns_result(self, monkeypatch) -> None:
+    async def test_provider_result_is_submitted_with_its_name(self, monkeypatch) -> None:
         provider = SimpleNamespace(
-            name="vidwords", supports_resume=False, fetch=AsyncMock(return_value=_cloud_result())
+            name="youtube", supports_resume=True, fetch=AsyncMock(return_value=_local_result())
         )
-        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings: provider)
+        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings, url="": provider)
 
         submission = await perform_transcription(_job())
 
-        assert submission.title == "Me at the zoo"
-        assert submission.duration_seconds == 19
+        assert submission.title == "Fallback Video"
+        assert submission.duration_seconds == 240
         assert submission.language == "en"
-        assert submission.provider == "vidwords"
+        assert submission.provider == "youtube"
         provider.fetch.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_provider_miss_raises_external_error(self, monkeypatch) -> None:
         provider = SimpleNamespace(
-            name="vidwords", supports_resume=False, fetch=AsyncMock(return_value=None)
+            name="youtube", supports_resume=True, fetch=AsyncMock(return_value=None)
         )
-        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings: provider)
+        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings, url="": provider)
 
         with pytest.raises(ExternalServiceError):
             await perform_transcription(_job())
@@ -820,29 +829,29 @@ class TestPerformTranscription:
     @pytest.mark.asyncio
     async def test_permanent_provider_error_is_not_swallowed(self, monkeypatch) -> None:
         provider = SimpleNamespace(
-            name="vidwords",
-            supports_resume=False,
+            name="youtube",
+            supports_resume=True,
             fetch=AsyncMock(
-                side_effect=VidWordsPermanentError("invalid credentials", service="vidwords")
+                side_effect=PermanentExternalServiceError("invalid credentials", service="youtube")
             ),
         )
-        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings: provider)
+        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings, url="": provider)
 
-        with pytest.raises(VidWordsPermanentError):
+        with pytest.raises(PermanentExternalServiceError):
             await perform_transcription(_job())
 
     @pytest.mark.asyncio
     async def test_resume_token_routes_to_its_provider(self, monkeypatch) -> None:
         provider = SimpleNamespace(
-            name="supadata", supports_resume=True, fetch=AsyncMock(return_value=_cloud_result())
+            name="youtube", supports_resume=True, fetch=AsyncMock(return_value=_local_result())
         )
-        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings: provider)
+        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings, url="": provider)
 
         submission = await perform_transcription(
-            _job(), resume_token="job-x", resume_provider="supadata"
+            _job(), resume_token="job-x", resume_provider="youtube"
         )
 
-        assert submission.provider == "supadata"
+        assert submission.provider == "youtube"
         provider.fetch.assert_awaited_once_with(
             "https://www.youtube.com/watch?v=abcde12345", "abcde12345", resume_token="job-x"
         )
@@ -850,11 +859,11 @@ class TestPerformTranscription:
     @pytest.mark.asyncio
     async def test_provider_error_raises_external_error(self, monkeypatch) -> None:
         provider = SimpleNamespace(
-            name="vidwords",
-            supports_resume=False,
-            fetch=AsyncMock(side_effect=ExternalServiceError("oops", service="vidwords")),
+            name="youtube",
+            supports_resume=True,
+            fetch=AsyncMock(side_effect=ExternalServiceError("oops", service="youtube")),
         )
-        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings: provider)
+        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings, url="": provider)
 
         with pytest.raises(ExternalServiceError):
             await perform_transcription(_job())
@@ -863,86 +872,91 @@ class TestPerformTranscription:
     async def test_empty_transcript_submitted_normally(self, monkeypatch) -> None:
         """An empty (no-speech) transcript yields a normal empty submission."""
         provider = SimpleNamespace(
-            name="yt-dlp",
+            name="youtube",
             supports_resume=True,
             fetch=AsyncMock(return_value=_no_speech_result()),
         )
-        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings: provider)
+        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings, url="": provider)
 
         submission = await perform_transcription(_job())
 
-        assert submission.provider == "yt-dlp"
+        assert submission.provider == "youtube"
         assert submission.transcript_text == ""
         assert submission.words == []
 
     @pytest.mark.asyncio
-    async def test_default_ytdlp_provider_used(self, monkeypatch) -> None:
-        ytdlp = self._ytdlp()
-        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings: ytdlp)
+    async def test_default_youtube_provider_used(self, monkeypatch) -> None:
+        local = self._local()
+        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings, url="": local)
 
         submission = await perform_transcription(_job())
 
-        assert submission.provider == "yt-dlp"
-        ytdlp.fetch.assert_awaited_once()
+        assert submission.provider == "youtube"
+        local.fetch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_legacy_alias_resume_routes_to_canonical_provider(self, monkeypatch) -> None:
+        """A job armed as ``yt-dlp`` must resume the renamed youtube strategy."""
+        local = self._local()
+        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings, url="": local)
+
+        await perform_transcription(_job(), resume_token="asm-1", resume_provider="yt-dlp")
+
+        local.fetch.assert_awaited_once_with(
+            "https://www.youtube.com/watch?v=abcde12345",
+            "abcde12345",
+            resume_token="asm-1",
+        )
 
     @pytest.mark.asyncio
     async def test_resume_token_routed_only_to_its_provider(self, monkeypatch) -> None:
         provider = SimpleNamespace(
-            name="vidwords", supports_resume=True, fetch=AsyncMock(return_value=_cloud_result())
+            name="drive", supports_resume=True, fetch=AsyncMock(return_value=_local_result())
         )
-        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings: provider)
+        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings, url="": provider)
 
         submission = await perform_transcription(
-            _job(), resume_token="job-x", resume_provider="yt-dlp"
+            _job(), resume_token="job-x", resume_provider="youtube"
         )
 
-        assert submission.provider == "vidwords"
+        assert submission.provider == "drive"
         provider.fetch.assert_awaited_once_with(
             "https://www.youtube.com/watch?v=abcde12345", "abcde12345", resume_token=""
         )
 
     @pytest.mark.asyncio
     async def test_all_soft_miss_raises_external_error(self, monkeypatch) -> None:
-        ytdlp = SimpleNamespace(
-            name="yt-dlp", supports_resume=True, fetch=AsyncMock(return_value=None)
+        local = SimpleNamespace(
+            name="youtube", supports_resume=True, fetch=AsyncMock(return_value=None)
         )
-        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings: ytdlp)
+        monkeypatch.setattr(pipeline_module, "resolve_provider", lambda settings, url="": local)
 
         with pytest.raises(ExternalServiceError):
             await perform_transcription(_job())
 
 
+_DRIVE_ID = "1DOoJhC6NHpLSu2nAvaWy3HukVimEyyhE"
+_DRIVE_URL = f"https://drive.google.com/file/d/{_DRIVE_ID}/view"
+_YOUTUBE_URL = "https://www.youtube.com/watch?v=abcde12345"
+
+
 class TestResolveProvider:
-    """Tests for the single configured provider resolution."""
+    """Tests for source-aware provider resolution."""
 
-    def test_ytdlp_alone_when_unset(self) -> None:
-        assert provider_resolve(_full_settings()).name == "yt-dlp"
+    def test_youtube_for_caption_bearing_sources(self) -> None:
+        assert provider_resolve(_full_settings(), _YOUTUBE_URL).name == "youtube"
 
-    def test_ytdlp_alone_when_empty(self) -> None:
-        assert provider_resolve(_full_settings(video_provider="")).name == "yt-dlp"
+    def test_drive_for_captionless_sources(self) -> None:
+        assert provider_resolve(_full_settings(), _DRIVE_URL).name == "drive"
 
-    def test_configured_cloud_provider_is_built(self) -> None:
-        assert provider_resolve(_full_settings(video_provider="vidwords")).name == "vidwords"
-
-    def test_value_is_case_insensitive(self) -> None:
-        assert provider_resolve(_full_settings(video_provider="VidWords")).name == "vidwords"
-
-    def test_explicit_ytdlp(self) -> None:
-        assert provider_resolve(_full_settings(video_provider="yt-dlp")).name == "yt-dlp"
-
-    def test_cloud_provider_raises_when_not_live(self) -> None:
-        settings = _full_settings(video_provider="vidwords", live_external_calls=False)
+    def test_captionless_source_requires_live_calls(self) -> None:
+        settings = _full_settings(live_external_calls=False)
         with pytest.raises(ValueError):
-            provider_resolve(settings)
+            provider_resolve(settings, _DRIVE_URL)
 
-    def test_unconfigured_provider_raises(self) -> None:
-        settings = _full_settings(video_provider="vidwords", vidwords_api_key="")
-        with pytest.raises(ValueError):
-            provider_resolve(settings)
-
-    def test_unknown_provider_raises(self) -> None:
-        with pytest.raises(ValueError):
-            provider_resolve(_full_settings(video_provider="bogus"))
+    def test_unsupported_url_raises_permanent_error(self) -> None:
+        with pytest.raises(PermanentExternalServiceError):
+            provider_resolve(_full_settings(), "https://example.com/video.mp4")
 
 
 class TestFailureMarking:
@@ -981,7 +995,7 @@ class TestDownloadAndTranscribe:
         resume_provider: str = "",
         client_factory=None,
     ) -> None:
-        raise TranscriptJobPending(provider="supadata", resume_token="job-x")
+        raise TranscriptJobPending(provider="youtube", resume_token="job-x")
 
     async def _non_resumable_pending_pipeline(
         self,
@@ -990,9 +1004,7 @@ class TestDownloadAndTranscribe:
         resume_provider: str = "",
         client_factory=None,
     ) -> None:
-        raise TranscriptJobPending(
-            provider="transcriptfetch", resume_token="job-x", resumable=False
-        )
+        raise TranscriptJobPending(provider="youtube", resume_token="job-x", resumable=False)
 
     def test_retries_pending_job_with_backoff(self, monkeypatch) -> None:
         monkeypatch.setattr(transcription_module, "run_pipeline", self._pending_pipeline)
@@ -1004,7 +1016,7 @@ class TestDownloadAndTranscribe:
         max_retries, countdown, args = stub.retry_call
         assert max_retries == transcription_module._CLOUD_JOB_ATTEMPTS
         assert countdown == 2
-        assert args == ["job-1", "job-x", "supadata"]
+        assert args == ["job-1", "job-x", "youtube"]
 
     def test_escapes_successfully_when_job_completes(self, monkeypatch) -> None:
         async def completed(
@@ -1018,7 +1030,7 @@ class TestDownloadAndTranscribe:
         monkeypatch.setattr(transcription_module, "run_pipeline", completed)
         stub = _StubTask(retries=3)
 
-        result = download_and_transcribe.run.__func__(stub, "job-1", "job-x", "supadata")
+        result = download_and_transcribe.run.__func__(stub, "job-1", "job-x", "youtube")
 
         assert result == {"status": "completed"}
         assert stub.retry_call is None
@@ -1033,7 +1045,7 @@ class TestDownloadAndTranscribe:
 
         stub = _StubTask(retries=transcription_module._CLOUD_JOB_ATTEMPTS - 1)
         with pytest.raises(TranscriptJobPending):
-            download_and_transcribe.run.__func__(stub, "job-1", "job-x", "supadata")
+            download_and_transcribe.run.__func__(stub, "job-1", "job-x", "youtube")
 
         assert stub.retry_call is None
         assert client.failed is True
@@ -1068,14 +1080,14 @@ class TestDownloadAndTranscribe:
         ) -> dict:
             captured["resume_token"] = resume_token
             captured["resume_provider"] = resume_provider
-            raise TranscriptJobPending(provider="supadata", resume_token="job-x")
+            raise TranscriptJobPending(provider="youtube", resume_token="job-x")
 
         monkeypatch.setattr(transcription_module, "run_pipeline", routed_pipeline)
         stub = _StubTask(retries=1)
         with pytest.raises(_RetryRaised):
-            download_and_transcribe.run.__func__(stub, "job-1", "job-x", "supadata")
+            download_and_transcribe.run.__func__(stub, "job-1", "job-x", "youtube")
 
-        assert captured == {"resume_token": "job-x", "resume_provider": "supadata"}
+        assert captured == {"resume_token": "job-x", "resume_provider": "youtube"}
 
     def test_job_retry_countdown_caps_at_max(self) -> None:
         assert _job_retry_countdown(0) == 2
@@ -1090,7 +1102,7 @@ class TestDownloadAndTranscribe:
             client_factory=None,
         ) -> None:
             raise TranscriptJobPending(
-                provider="yt-dlp", resume_token="asm-1", resumable=True, webhook=True
+                provider="youtube", resume_token="asm-1", resumable=True, webhook=True
             )
 
         monkeypatch.setattr(transcription_module, "run_pipeline", webhook_pending)
@@ -1117,22 +1129,22 @@ class TestWebhookRouting:
         return SimpleNamespace(assembly_webhook_base_url=base)
 
     def test_empty_when_webhooks_not_configured(self) -> None:
-        assert build_assembly_webhook_url(_settings(live_calls=True), "job-1", "yt-dlp") == ""
+        assert build_assembly_webhook_url(_settings(live_calls=True), "job-1", "youtube") == ""
 
     def test_empty_without_job_id(self) -> None:
         settings = self._settings("https://backend.test/api/webhooks/assembly")
-        assert build_assembly_webhook_url(settings, "", "yt-dlp") == ""
+        assert build_assembly_webhook_url(settings, "", "youtube") == ""
 
     def test_appends_job_context(self) -> None:
         settings = self._settings("https://backend.test/api/webhooks/assembly")
-        url = build_assembly_webhook_url(settings, "job-1", "yt-dlp")
-        assert url == "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=yt-dlp"
+        url = build_assembly_webhook_url(settings, "job-1", "youtube")
+        assert url == "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=youtube"
 
     def test_joins_existing_query_string(self) -> None:
         settings = self._settings("https://backend.test/api/webhooks/assembly?src=asm")
-        url = build_assembly_webhook_url(settings, "job-1", "yt-dlp")
+        url = build_assembly_webhook_url(settings, "job-1", "youtube")
         assert url == (
-            "https://backend.test/api/webhooks/assembly?src=asm&job_id=job-1&provider=yt-dlp"
+            "https://backend.test/api/webhooks/assembly?src=asm&job_id=job-1&provider=youtube"
         )
 
     @pytest.mark.asyncio
@@ -1140,12 +1152,12 @@ class TestWebhookRouting:
         self, monkeypatch
     ) -> None:
         provider = SimpleNamespace(
-            name="yt-dlp",
+            name="youtube",
             supports_resume=True,
             supports_webhook=True,
-            fetch=AsyncMock(return_value=_ytdlp_result()),
+            fetch=AsyncMock(return_value=_local_result()),
         )
-        webhook = "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=yt-dlp"
+        webhook = "https://backend.test/api/webhooks/assembly?job_id=job-1&provider=youtube"
 
         await try_provider(provider, _job(), webhook_url=webhook)
 
@@ -1161,7 +1173,7 @@ class TestWebhookRouting:
             provider,
             _job(),
             resume_token="asm-1",
-            resume_provider="yt-dlp",
+            resume_provider="youtube",
             webhook_url=webhook,
         )
 
@@ -1242,23 +1254,8 @@ def _transcript():
     )
 
 
-def _cloud_result(title: str = "Me at the zoo") -> VidWordsResult:
-    """Build a fake cloud-provider result."""
-    return VidWordsResult(
-        title=title,
-        author="jawed",
-        duration_seconds=19,
-        is_generated=False,
-        transcript=TranscriptData(
-            language="en",
-            text="All right, so here we are.",
-            words=[TranscriptWordData(word="All", start_time=0.0, end_time=0.5)],
-        ),
-    )
-
-
-def _ytdlp_result() -> VideoTranscriptResult:
-    """Build a fake yt-dlp strategy result."""
+def _local_result() -> VideoTranscriptResult:
+    """Build a fake youtube strategy result."""
     return VideoTranscriptResult(
         title="Fallback Video",
         author="",
@@ -1295,23 +1292,11 @@ def _settings(*, live_calls: bool) -> SimpleNamespace:
         internal_api_key="key",
         job_timeout_seconds=600,
         live_external_calls=live_calls,
-        vidwords_api_key="",
     )
 
 
 def _full_settings(**overrides) -> Settings:
-    """Build real worker settings with every cloud provider configured."""
-    values = {
-        "live_external_calls": True,
-        "transcriptfetch_api_key": "tf-key",
-        "transcriptfetch_lang": "en",
-        "transcriptfetch_mode": "auto",
-        "supadata_api_key": "sp-key",
-        "supadata_lang": "en",
-        "supadata_mode": "auto",
-        "vidwords_api_key": "vw-key",
-        "vidwords_lang": "en",
-        "vidwords_api_url": "https://vidwords.com",
-    }
+    """Build real worker settings with live calls enabled."""
+    values = {"live_external_calls": True}
     values.update(overrides)
     return Settings(_env_file=None, **values)

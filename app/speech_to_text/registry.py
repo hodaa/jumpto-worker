@@ -1,17 +1,18 @@
 """Factory for the audio-transcription leaf selected by SPEECH_TO_TEXT_PROVIDER.
 
-The yt-dlp composite falls back to a single audio-transcription service when no
-captions exist. Which service that is (Deepgram by default, or Assembly) comes
-from the ``speech_to_text_provider`` setting; this module is the one place that
-maps the setting to a concrete :class:`TranscriptService`, so adding a new
-audio provider requires no changes in the composite.
+The local strategies fall back to a single audio-transcription service when no
+captions exist (or the source has none at all). Which service that is (Deepgram
+by default, or Assembly) comes from the ``speech_to_text_provider`` setting;
+this module is the one place that maps the setting to a concrete
+:class:`SpeechToTextProvider`, so adding a new audio provider requires no changes
+in the strategies.
 """
 
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
-from app.providers.assembly import get_transcript_provider
-from app.providers.base import TranscriptService
-from app.providers.deepgram import get_deepgram_provider
+from app.speech_to_text.assembly import get_transcript_provider
+from app.speech_to_text.base import SpeechToTextProvider
+from app.speech_to_text.deepgram import get_deepgram_provider
 
 logger = get_logger(__name__)
 
@@ -21,7 +22,7 @@ _SPEECH_TO_TEXT_PROVIDERS = {
 }
 
 
-def get_speech_to_text_provider(settings: Settings | None = None) -> TranscriptService | None:
+def get_speech_to_text_provider(settings: Settings | None = None) -> SpeechToTextProvider | None:
     """
     Return the configured audio-transcription leaf service, or ``None``.
 

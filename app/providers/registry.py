@@ -6,8 +6,13 @@ from dataclasses import dataclass
 from app.core.config import Settings, _live_pipeline_enabled
 from app.core.logging import get_logger
 from app.providers.base import TranscriptProviderStrategy
+from app.sources import resolve_source
 
 logger = get_logger(__name__)
+
+# The strategy every caption-bearing (YouTube) job runs. The worker has no
+# other transcript provider: sources resolve to their own strategy.
+DEFAULT_PROVIDER = "youtube"
 
 
 @dataclass(frozen=True)
@@ -33,6 +38,7 @@ class TranscriptProviderSpec:
 
 
 _REGISTRY: dict[str, TranscriptProviderSpec] = {}
+_ALIASES: dict[str, str] = {}
 _PROVIDERS_LOADED = False
 
 
@@ -49,10 +55,8 @@ def _ensure_registered() -> None:
         return
     _PROVIDERS_LOADED = True
     from app.providers import (
-        supadata,  # noqa: F401
-        transcriptfetch,  # noqa: F401
-        vidwords,  # noqa: F401
-        ytdlp,  # noqa: F401
+        drive,  # noqa: F401
+        youtube,  # noqa: F401
     )
 
 
@@ -61,10 +65,30 @@ def register_provider(spec: TranscriptProviderSpec) -> None:
     _REGISTRY[spec.name] = spec
 
 
-def provider_spec(name: str) -> TranscriptProviderSpec | None:
-    """Return the registered spec for ``name`` or ``None``."""
+def register_alias(alias: str, canonical: str) -> None:
+    """Register ``alias`` as another lookup name for the ``canonical`` provider.
+
+    Aliases exist for deploy compatibility: an armed webhook naming a
+    strategy's former id must keep resolving to the renamed strategy
+    (``yt-dlp`` → ``youtube``).
+    """
+    _ALIASES[alias] = canonical
+
+
+def canonical_provider_name(name: str) -> str:
+    """Resolve an alias to its canonical provider name (identity otherwise)."""
     _ensure_registered()
-    return _REGISTRY.get(name)
+    return _ALIASES.get(name, name)
+
+
+def provider_spec(name: str) -> TranscriptProviderSpec | None:
+    """Return the registered spec for ``name`` (or an alias) or ``None``."""
+    _ensure_registered()
+    spec = _REGISTRY.get(name)
+    if spec is None:
+        canonical = _ALIASES.get(name)
+        spec = _REGISTRY.get(canonical) if canonical is not None else None
+    return spec
 
 
 def ordered_specs() -> list[TranscriptProviderSpec]:
@@ -85,15 +109,18 @@ def build_provider(name: str, settings: Settings) -> TranscriptProviderStrategy 
     return spec.build(settings)
 
 
-def resolve_provider(settings: Settings) -> TranscriptProviderStrategy:
-    """Build and return the single configured transcript provider.
+def resolve_provider(settings: Settings, url: str = "") -> TranscriptProviderStrategy:
+    """Build and return the transcript provider that serves this job.
 
-    Exactly one provider runs per job (``VIDEO_PROVIDER``, default ``yt-dlp``).
-    There is no fallback chain: an unknown name, an unconfigured provider, or a
-    cloud provider while live calls are disabled raises a :class:`ValueError`
-    so the job fails loudly instead of silently switching strategies.
+    Exactly one provider runs per job, chosen by the URL's source: a captionless
+    source (Drive) resolves to the same-named strategy, and a caption-bearing
+    source (YouTube) resolves to the ``youtube`` strategy. There is no fallback
+    chain: an unconfigured provider, a cloud provider while live calls are
+    disabled, or a URL no source claims raises (``ValueError`` or a permanent
+    service error) so the job fails loudly instead of silently switching
+    strategies.
     """
-    name = (getattr(settings, "video_provider", "") or "yt-dlp").strip().lower()
+    name = _provider_name_for(url)
     spec = provider_spec(name)
     if spec is None:
         raise ValueError(f"Unknown transcript provider: {name}")
@@ -105,3 +132,12 @@ def resolve_provider(settings: Settings) -> TranscriptProviderStrategy:
     if provider is None:
         raise ValueError(f"Transcript provider {name!r} is not configured")
     return provider
+
+
+def _provider_name_for(url: str) -> str:
+    """The strategy serving ``url``: source-named for captionless, else YouTube."""
+    if url:
+        source = resolve_source(url)
+        if not source.native_captions:
+            return source.name
+    return DEFAULT_PROVIDER

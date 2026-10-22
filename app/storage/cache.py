@@ -25,29 +25,11 @@ from app.core.logging import get_logger
 from app.providers.base import VideoTranscriptResult
 from app.providers.media import MediaInfo
 from app.providers.models import TranscriptData, TranscriptWordData
+from app.utils.video import extract_youtube_video_id as extract_youtube_video_id
 
 logger = get_logger(__name__)
 
 _NAMESPACE = "jumpto:transcript"
-
-# YouTube video id extraction from common URL shapes (watch, youtu.be, shorts,
-# embed). The id is 11 chars of [A-Za-z0-9_-].
-_VIDEO_ID_PATTERNS = (
-    re.compile(r"[?&]v=([A-Za-z0-9_-]{6,})"),
-    re.compile(r"youtu\.be/([A-Za-z0-9_-]{6,})"),
-    re.compile(r"/(?:shorts|embed|live)/([A-Za-z0-9_-]{6,})"),
-)
-
-
-def extract_youtube_video_id(youtube_url: str) -> str:
-    """Best-effort YouTube video id from a URL, or '' when it cannot be parsed."""
-    if not youtube_url:
-        return ""
-    for pattern in _VIDEO_ID_PATTERNS:
-        match = pattern.search(youtube_url)
-        if match:
-            return match.group(1)
-    return ""
 
 
 def _cache_namespace(settings) -> str:
@@ -57,13 +39,18 @@ def _cache_namespace(settings) -> str:
     returns (language, mode, etc.) via ``cache_config_fields``. The namespace
     iterates specs in their canonical priority order and reads those attributes,
     so adding a new provider's cache-affecting settings never requires editing
-    the cache module itself.
+    the cache module itself. A field shared by several specs is read once, so
+    two strategies depending on the same knob keep one stable suffix.
     """
     from app.providers.registry import ordered_specs
 
     values = []
+    seen: set[str] = set()
     for spec in ordered_specs():
         for name in spec.cache_config_fields:
+            if name in seen:
+                continue
+            seen.add(name)
             values.append(getattr(settings, name, "") or "")
     suffix = ":".join(re.sub(r"[^A-Za-z0-9_.-]", "_", str(v)) for v in values)
     return f"{_NAMESPACE}:v3:{suffix}"
@@ -124,7 +111,7 @@ class TranscriptCache(ABC):
     :class:`NoOpTranscriptCache`) are selected by :func:`get_transcript_cache`
     based on configuration.
 
-    The interface is exactly what the one client — the yt-dlp composite — calls:
+    The interface is exactly what the local strategies (youtube, drive) call:
     :meth:`get`, :meth:`set`, and the optional metadata pair
     (:meth:`get_media` / :meth:`set_media`, which default to a quiet no-op so a
     cache that cannot store metadata still satisfies the interface).

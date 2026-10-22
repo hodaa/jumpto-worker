@@ -18,9 +18,10 @@ from app.tasks.celery_app import celery_app
 
 logger = get_logger(__name__)
 
-# Waiting budget for resumable async cloud jobs (e.g. Supadata AI generation).
-# Each Celery attempt makes one provider call; the task retries on an
-# exponential backoff until the job completes or the budget is exhausted.
+# Waiting budget for resumable async cloud jobs (e.g. Assembly audio
+# transcription). Each Celery attempt makes one provider call; the task
+# retries on an exponential backoff until the job completes or the budget is
+# exhausted.
 _CLOUD_JOB_ATTEMPTS = 9
 _CLOUD_JOB_RETRY_BASE_SECONDS = 2
 _CLOUD_JOB_RETRY_MAX_SECONDS = 60

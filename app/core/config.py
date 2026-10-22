@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import AliasChoices, BeforeValidator, Field, field_validator
+from pydantic import BeforeValidator, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -119,13 +119,33 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Audio transcription fallback selection (yt-dlp provider)
+    # Audio transcription fallback selection (local strategies)
     speech_to_text_provider: str = Field(
         default="deepgram",
         description=(
             "Audio transcript provider used when captions are missing "
             "(SPEECH_TO_TEXT_PROVIDER env var): deepgram (default) or assembly"
         ),
+    )
+    drive_stt_language: str = Field(
+        default="",
+        description=(
+            "Speech-to-text language forced for Google Drive sources "
+            "(DRIVE_STT_LANGUAGE; empty keeps the title heuristic)"
+        ),
+    )
+
+    # Google Drive media downloads
+    google_api_key: str = Field(
+        default="",
+        description=(
+            "Google API key for public Drive media downloads; when empty the "
+            "browser download endpoint is used (GOOGLE_API_KEY env var)"
+        ),
+    )
+    google_drive_api_url: str = Field(
+        default="https://www.googleapis.com/drive/v3",
+        description="Google Drive API base URL (GOOGLE_DRIVE_API_URL env var)",
     )
 
     # Deepgram
@@ -140,55 +160,6 @@ class Settings(BaseSettings):
     deepgram_model: str = Field(
         default="nova-3",
         description="Deepgram batch transcription model (DEEPGRAM_MODEL env var)",
-    )
-
-    # VidWords (YouTube transcripts API)
-    vidwords_api_key: str = Field(
-        default="",
-        description="VidWords API token for fetch transcripts/title via their API",
-    )
-    vidwords_lang: str = Field(
-        default="en",
-        description="Preferred caption language for VidWords (VIDWORDS_LANG env var)",
-    )
-    vidwords_api_url: str = Field(
-        default="https://vidwords.com",
-        description="VidWords API base URL (VIDWORDS_API_URL env var)",
-    )
-
-    # Supadata (YouTube transcripts/metadata API)
-    supadata_api_key: str = Field(
-        default="",
-        description="Supadata API key (SUPADATA_API_KEY env var)",
-    )
-    supadata_lang: str = Field(
-        default="en",
-        description="Preferred transcript language for Supadata (SUPADATA_LANG env var)",
-    )
-    supadata_mode: str = Field(
-        default="auto",
-        description="Supadata transcript mode: native, generate or auto (SUPADATA_MODE env var)",
-    )
-
-    # TranscriptFetch (YouTube transcripts/metadata API)
-    transcriptfetch_api_key: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "transcriptfetch_api_key",
-            "TRANSCRIPTFETCH_API_KEY",
-            # The user's .env has an extra "s" ("transscriptfetch"); accept the
-            # typo so the key is picked up regardless of spelling.
-            "TRANSSCRIPTFETCH_API_KEY",
-        ),
-        description="TranscriptFetch API key (TRANSCRIPTFETCH_API_KEY env var)",
-    )
-    transcriptfetch_lang: str = Field(
-        default="en",
-        description="Preferred caption language for TranscriptFetch (TRANSCRIPTFETCH_LANG env var)",
-    )
-    transcriptfetch_mode: str = Field(
-        default="auto",
-        description="TranscriptFetch mode: captions, audio or auto (TRANSCRIPTFETCH_MODE env var)",
     )
 
     # Environment
@@ -207,17 +178,6 @@ class Settings(BaseSettings):
         ge=0.0,
         le=1.0,
         description="Sentry performance traces sample rate 0..1 (SENTRY_TRACES_SAMPLE_RATE)",
-    )
-
-    # The single transcript provider strategy. Exactly one provider runs per
-    # job; unknown, unconfigured, or cloud providers while live calls are
-    # disabled raise instead of silently falling through.
-    video_provider: str = Field(
-        default="yt-dlp",
-        description=(
-            "The single transcript provider used for every job (VIDEO_PROVIDER "
-            "env var); empty uses yt-dlp. e.g. VIDEO_PROVIDER=vidwords"
-        ),
     )
 
     # External calls

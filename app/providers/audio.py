@@ -1,4 +1,4 @@
-"""Audio stream download helpers for the yt-dlp provider tree.
+"""Audio stream download helpers for the local YouTube strategy.
 
 Both audio-transcription leaves (Assembly, Deepgram) transcribe the same
 downloaded audio stream. This module is the single place that knows how to

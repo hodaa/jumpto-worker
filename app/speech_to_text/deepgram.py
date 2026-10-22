@@ -6,6 +6,7 @@ never raises ``TranscriptJobPending``, arms no webhook, and accepts no resume.
 """
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -19,8 +20,8 @@ from app.core.exceptions import (
 )
 from app.core.logging import get_logger
 from app.providers.audio import download_audio, remove_file
-from app.providers.base import TranscriptService
 from app.providers.models import TranscriptData, TranscriptWordData
+from app.speech_to_text.base import SpeechToTextProvider
 
 logger = get_logger(__name__)
 
@@ -34,7 +35,7 @@ _RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 _MODEL_LANGUAGE_MISMATCH_HINT = "No such model/language/tier combination"
 
 
-class DeepgramTranscriptService(TranscriptService):
+class DeepgramTranscriptService(SpeechToTextProvider):
     """Deepgram audio transcription client (synchronous, word-level timestamps)."""
 
     def __init__(
@@ -125,6 +126,7 @@ class DeepgramTranscriptService(TranscriptService):
             language=language or "auto",
             model=self.model,
         )
+        started = time.monotonic()
         try:
             response = await client.post(
                 f"{self.base_url}/listen",
@@ -146,6 +148,7 @@ class DeepgramTranscriptService(TranscriptService):
                     tier=fallback_params.get("tier", ""),
                     status_code=response.status_code,
                 )
+                started = time.monotonic()
                 response = await client.post(
                     f"{self.base_url}/listen",
                     headers={
@@ -158,7 +161,12 @@ class DeepgramTranscriptService(TranscriptService):
                     timeout=_TRANSCRIBE_TIMEOUT_SECONDS,
                 )
         except httpx.HTTPError as exc:
-            logger.error("Deepgram request failed", error=str(exc))
+            logger.error(
+                "Deepgram request failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                elapsed_seconds=round(time.monotonic() - started, 1),
+            )
             raise ExternalServiceError(
                 "Transcription service was unreachable", service="deepgram"
             ) from exc
@@ -183,7 +191,7 @@ class DeepgramTranscriptService(TranscriptService):
                 service="deepgram",
                 details={"status_code": response.status_code},
             )
-        transcript = _parse_deepgram_transcript(response.json())
+        transcript = _parse_deepgram_transcript(response.json(), language)
         logger.info(
             "Deepgram transcription completed",
             size_mib=round(total_bytes / (1024 * 1024), 1),
@@ -205,11 +213,13 @@ async def _stream_file(path: str) -> AsyncIterator[bytes]:
             yield chunk
 
 
-def _parse_deepgram_transcript(data: dict) -> TranscriptData:
+def _parse_deepgram_transcript(data: dict, requested_language: str = "") -> TranscriptData:
     """Convert a Deepgram /listen response into TranscriptData.
 
     Deepgram reports word times in seconds already (unlike Assembly, which
-    reports milliseconds), so start/end values are used as-is.
+    reports milliseconds), so start/end values are used as-is. When the caller
+    pins ``language``, Deepgram omits ``detected_language``; the pinned tag is
+    used instead of assuming English.
     """
     channels = data.get("results", {}).get("channels", [])
     if not channels:
@@ -226,7 +236,12 @@ def _parse_deepgram_transcript(data: dict) -> TranscriptData:
         )
         for raw in alternative.get("words", [])
     ]
-    language = channels[0].get("detected_language") or alternative.get("detected_language") or "en"
+    language = (
+        channels[0].get("detected_language")
+        or alternative.get("detected_language")
+        or requested_language
+        or "en"
+    )
     return TranscriptData(
         language=str(language),
         text=str(alternative.get("transcript") or ""),
@@ -234,7 +249,7 @@ def _parse_deepgram_transcript(data: dict) -> TranscriptData:
     )
 
 
-def get_deepgram_provider(settings: Settings | None = None) -> TranscriptService | None:
+def get_deepgram_provider(settings: Settings | None = None) -> SpeechToTextProvider | None:
     """
     Return the Deepgram audio transcription service, or ``None``.
 

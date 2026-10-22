@@ -14,23 +14,9 @@ import app.providers.media as media_module
 from app.core.config import Settings
 from app.core.exceptions import ExternalServiceError, PermanentExternalServiceError
 from app.integrations.ytdlp import build_ydlp_options, release_temp_cookie
-from app.providers.assembly import (
-    _UPLOAD_CHUNK_BYTES,
-    AssemblyTranscriptService,
-    _log_upload_finished,
-    _parse_assembly_transcript,
-    _stream_audio_with_progress,
-    get_transcript_provider,
-)
 from app.providers.audio import download_audio, run_download
-from app.providers.deepgram import (
-    DeepgramTranscriptService,
-    _parse_deepgram_transcript,
-    get_deepgram_provider,
-)
 from app.providers.media import get_media_info
 from app.providers.models import TranscriptData, TranscriptJobPending
-from app.providers.speech_to_text import get_speech_to_text_provider
 from app.providers.transcript import (
     YouTubeCaptionTranscriptService,
     _caption_language,
@@ -39,6 +25,20 @@ from app.providers.transcript import (
     _parse_vtt,
     _preferred_vtt_file,
 )
+from app.speech_to_text.assembly import (
+    _UPLOAD_CHUNK_BYTES,
+    AssemblyTranscriptService,
+    _log_upload_finished,
+    _parse_assembly_transcript,
+    _stream_audio_with_progress,
+    get_transcript_provider,
+)
+from app.speech_to_text.deepgram import (
+    DeepgramTranscriptService,
+    _parse_deepgram_transcript,
+    get_deepgram_provider,
+)
+from app.speech_to_text.registry import get_speech_to_text_provider
 from app.utils.text import detect_language_from_title
 
 
@@ -215,7 +215,7 @@ class TestMediaMetadataRetry:
             media_module,
             "_fetch_from_yt_dlp",
             lambda url, settings=None: (_ for _ in ()).throw(
-                ExternalServiceError("cookie jar unreadable", service="transcriptfetch")
+                ExternalServiceError("cookie jar unreadable", service="captions")
             ),
         )
 
@@ -226,7 +226,7 @@ class TestMediaMetadataRetry:
                 settings=SimpleNamespace(live_external_calls=True),
             )
 
-        assert excinfo.value.details["service"] == "transcriptfetch"
+        assert excinfo.value.details["service"] == "captions"
         assert "cookie jar unreadable" in str(excinfo.value)
 
     def test_live_calls_disabled_refuses_before_touching_yt_dlp(self, monkeypatch) -> None:
@@ -288,7 +288,7 @@ class TestTranscriptProviderSelection:
 
     def test_returns_none_when_live_not_configured(self, monkeypatch) -> None:
         settings = _settings(live=False, api_key="")
-        monkeypatch.setattr("app.providers.assembly.get_settings", lambda: settings)
+        monkeypatch.setattr("app.speech_to_text.assembly.get_settings", lambda: settings)
 
         provider = get_transcript_provider()
 
@@ -296,7 +296,7 @@ class TestTranscriptProviderSelection:
 
     def test_returns_none_when_no_api_key(self, monkeypatch) -> None:
         settings = _settings(live=True, api_key="")
-        monkeypatch.setattr("app.providers.assembly.get_settings", lambda: settings)
+        monkeypatch.setattr("app.speech_to_text.assembly.get_settings", lambda: settings)
 
         provider = get_transcript_provider()
 
@@ -304,7 +304,7 @@ class TestTranscriptProviderSelection:
 
     def test_returns_assembly_when_fully_configured(self, monkeypatch) -> None:
         settings = _settings(live=True, api_key="key-123")
-        monkeypatch.setattr("app.providers.assembly.get_settings", lambda: settings)
+        monkeypatch.setattr("app.speech_to_text.assembly.get_settings", lambda: settings)
 
         provider = get_transcript_provider()
 
@@ -342,7 +342,7 @@ class TestAssignmentFetcher:
         audio_file.write_bytes(b"fake-audio")
 
         monkeypatch.setattr(
-            "app.providers.assembly.download_audio",
+            "app.speech_to_text.assembly.download_audio",
             lambda url, video_id="", settings=None: str(audio_file),
         )
 
@@ -367,7 +367,7 @@ class TestAssignmentFetcher:
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
 
-        monkeypatch.setattr("app.providers.assembly.httpx.AsyncClient", lambda: client)
+        monkeypatch.setattr("app.speech_to_text.assembly.httpx.AsyncClient", lambda: client)
 
         provider = AssemblyTranscriptService("key")
         transcript = await provider.fetch("https://youtu.be/abcde12345")
@@ -389,7 +389,7 @@ class TestAssignmentFetcher:
             downloads.append(url)
             raise AssertionError("must not download when audio_path is injected")
 
-        monkeypatch.setattr("app.providers.assembly.download_audio", must_not_download)
+        monkeypatch.setattr("app.speech_to_text.assembly.download_audio", must_not_download)
 
         upload_response = Mock(status_code=200)
         upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/fake"}
@@ -412,7 +412,7 @@ class TestAssignmentFetcher:
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
 
-        monkeypatch.setattr("app.providers.assembly.httpx.AsyncClient", lambda: client)
+        monkeypatch.setattr("app.speech_to_text.assembly.httpx.AsyncClient", lambda: client)
 
         provider = AssemblyTranscriptService("key")
         transcript = await provider.fetch("https://youtu.be/abcde12345", audio_path=str(audio_file))
@@ -499,10 +499,12 @@ class TestAssignmentFetcher:
         """Progress must be logged when each MiB boundary is crossed while
         streaming, so a slow upload is not silent."""
         boundary_bytes = 3
-        monkeypatch.setattr("app.providers.assembly._UPLOAD_PROGRESS_LOG_BYTES", boundary_bytes)
+        monkeypatch.setattr(
+            "app.speech_to_text.assembly._UPLOAD_PROGRESS_LOG_BYTES", boundary_bytes
+        )
         audit: list[str] = []
         monkeypatch.setattr(
-            "app.providers.assembly.logger.info",
+            "app.speech_to_text.assembly.logger.info",
             lambda event, **kwargs: audit.append(event),
         )
 
@@ -521,7 +523,7 @@ class TestAssignmentFetcher:
         """A zero-duration upload must not crash the throughput logging line."""
         audit: list[str] = []
         monkeypatch.setattr(
-            "app.providers.assembly.logger.info",
+            "app.speech_to_text.assembly.logger.info",
             lambda event, **kwargs: audit.append(event),
         )
 
@@ -535,7 +537,7 @@ class TestAssignmentFetcher:
         poll_response.json.return_value = {"status": "processing"}
         client = AsyncMock()
         client.get.return_value = poll_response
-        monkeypatch.setattr("app.providers.assembly.httpx.AsyncClient", lambda: client)
+        monkeypatch.setattr("app.speech_to_text.assembly.httpx.AsyncClient", lambda: client)
 
         provider = AssemblyTranscriptService("key")
         with pytest.raises(TranscriptJobPending) as excinfo:
@@ -588,7 +590,7 @@ class TestAssignmentFetcher:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"fake-audio")
         monkeypatch.setattr(
-            "app.providers.assembly.download_audio",
+            "app.speech_to_text.assembly.download_audio",
             lambda url, video_id="", settings=None: str(audio_file),
         )
 
@@ -604,7 +606,7 @@ class TestAssignmentFetcher:
         client.get.return_value = poll_response
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
-        monkeypatch.setattr("app.providers.assembly.httpx.AsyncClient", lambda: client)
+        monkeypatch.setattr("app.speech_to_text.assembly.httpx.AsyncClient", lambda: client)
 
         provider = AssemblyTranscriptService("key")
         with pytest.raises(TranscriptJobPending) as excinfo:
@@ -666,6 +668,21 @@ class TestDeepgramParser:
         assert parsed.language == "en"
         assert parsed.text == "hi there"
 
+    def test_parse_uses_the_requested_language_when_detection_is_omitted(self) -> None:
+        data = {
+            "results": {
+                "channels": [
+                    {
+                        "alternatives": [{"transcript": "مرحبا", "words": []}],
+                    }
+                ]
+            }
+        }
+
+        parsed = _parse_deepgram_transcript(data, requested_language="ar")
+
+        assert parsed.language == "ar"
+
     def test_parse_raises_without_channels(self) -> None:
         with pytest.raises(ExternalServiceError):
             _parse_deepgram_transcript({"results": {}})
@@ -697,7 +714,7 @@ class TestDeepgramFetcher:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"fake-audio")
         monkeypatch.setattr(
-            "app.providers.deepgram.download_audio",
+            "app.speech_to_text.deepgram.download_audio",
             lambda url, video_id="", settings=None: str(audio_file),
         )
 
@@ -710,10 +727,10 @@ class TestDeepgramFetcher:
             return httpx.Response(200, json=self._body())
 
         monkeypatch.setattr(
-            "app.providers.deepgram.get_shared_http_client",
+            "app.speech_to_text.deepgram.get_shared_http_client",
             lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         )
-        monkeypatch.setattr("app.providers.deepgram._TRANSCRIBE_TIMEOUT_SECONDS", 5)
+        monkeypatch.setattr("app.speech_to_text.deepgram._TRANSCRIBE_TIMEOUT_SECONDS", 5)
 
         provider = DeepgramTranscriptService("dg-key", base_url="https://api.deepgram.test/v1")
         transcript = await provider.fetch("https://youtu.be/abcde12345", language="ar")
@@ -730,7 +747,7 @@ class TestDeepgramFetcher:
         audio_file = tmp_path / "audio.webm"
         audio_file.write_bytes(b"data")
         monkeypatch.setattr(
-            "app.providers.deepgram.download_audio",
+            "app.speech_to_text.deepgram.download_audio",
             lambda url, video_id="", settings=None: str(audio_file),
         )
 
@@ -741,7 +758,7 @@ class TestDeepgramFetcher:
             return httpx.Response(200, json=self._body())
 
         monkeypatch.setattr(
-            "app.providers.deepgram.get_shared_http_client",
+            "app.speech_to_text.deepgram.get_shared_http_client",
             lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         )
 
@@ -749,6 +766,28 @@ class TestDeepgramFetcher:
         await provider.fetch("https://youtu.be/abcde12345", language="")
 
         assert "language=" not in captured["path"]
+
+    @pytest.mark.asyncio
+    async def test_transport_error_logs_type_and_elapsed(self, monkeypatch, tmp_path) -> None:
+        audio_file = tmp_path / "audio.webm"
+        audio_file.write_bytes(b"data")
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            "app.speech_to_text.deepgram.logger.error",
+            lambda event, **kwargs: calls.append({"event": event, **kwargs}),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("")
+
+        provider = DeepgramTranscriptService("key", base_url="https://api.deepgram.test/v1")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(ExternalServiceError):
+                await provider._transcribe(client, str(audio_file))
+
+        assert calls[0]["event"] == "Deepgram request failed"
+        assert calls[0]["error_type"] == "ReadTimeout"
+        assert calls[0]["elapsed_seconds"] >= 0
 
     @pytest.mark.asyncio
     async def test_transcribe_raises_on_non_200(self, tmp_path) -> None:
@@ -919,7 +958,7 @@ class TestDeepgramFetcher:
             downloads.append(url)
             raise AssertionError("must not download when audio_path is injected")
 
-        monkeypatch.setattr("app.providers.deepgram.download_audio", must_not_download)
+        monkeypatch.setattr("app.speech_to_text.deepgram.download_audio", must_not_download)
 
         captured = {}
 
@@ -928,7 +967,7 @@ class TestDeepgramFetcher:
             return httpx.Response(200, json=self._body())
 
         monkeypatch.setattr(
-            "app.providers.deepgram.get_shared_http_client",
+            "app.speech_to_text.deepgram.get_shared_http_client",
             lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         )
 
@@ -961,19 +1000,19 @@ class TestSpeechToTextSelection:
 
     def test_returns_none_when_live_not_configured(self, monkeypatch) -> None:
         settings = self._settings(live=False, provider="deepgram", deepgram_key="k")
-        monkeypatch.setattr("app.providers.speech_to_text.get_settings", lambda: settings)
+        monkeypatch.setattr("app.speech_to_text.registry.get_settings", lambda: settings)
 
         assert get_speech_to_text_provider() is None
 
     def test_returns_none_when_deepgram_no_key(self, monkeypatch) -> None:
         settings = self._settings(live=True, provider="deepgram")
-        monkeypatch.setattr("app.providers.speech_to_text.get_settings", lambda: settings)
+        monkeypatch.setattr("app.speech_to_text.registry.get_settings", lambda: settings)
 
         assert get_speech_to_text_provider() is None
 
     def test_returns_deepgram_when_configured(self, monkeypatch) -> None:
         settings = self._settings(live=True, provider="deepgram", deepgram_key="dg-key")
-        monkeypatch.setattr("app.providers.speech_to_text.get_settings", lambda: settings)
+        monkeypatch.setattr("app.speech_to_text.registry.get_settings", lambda: settings)
 
         provider = get_speech_to_text_provider()
 
@@ -982,7 +1021,7 @@ class TestSpeechToTextSelection:
 
     def test_returns_assembly_when_selected(self, monkeypatch) -> None:
         settings = self._settings(live=True, provider="assembly", assembly_key="asm-key")
-        monkeypatch.setattr("app.providers.speech_to_text.get_settings", lambda: settings)
+        monkeypatch.setattr("app.speech_to_text.registry.get_settings", lambda: settings)
 
         provider = get_speech_to_text_provider()
 
@@ -991,7 +1030,7 @@ class TestSpeechToTextSelection:
 
     def test_returns_none_for_unknown_provider(self, monkeypatch) -> None:
         settings = self._settings(live=True, provider="bogus", deepgram_key="dg-key")
-        monkeypatch.setattr("app.providers.speech_to_text.get_settings", lambda: settings)
+        monkeypatch.setattr("app.speech_to_text.registry.get_settings", lambda: settings)
 
         assert get_speech_to_text_provider() is None
 

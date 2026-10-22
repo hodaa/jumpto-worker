@@ -15,7 +15,7 @@ def init_sentry() -> None:
     Sentry stays off unless ``SENTRY_DSN`` is set. With it set:
 
     - Console/structlog records at INFO+ are captured as queryable Sentry
-      logs; structlog keyword fields (e.g. ``youtube_url``, ``job_id``) are
+      logs; structlog keyword fields (e.g. ``video_url``, ``job_id``) are
       promoted to top-level searchable attributes.
     - ERROR-level records additionally raise Sentry error events.
     - Celery task errors are captured by the Celery integration; performance
