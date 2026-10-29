@@ -9,6 +9,7 @@ SDK reads, once.
 
 from __future__ import annotations
 
+import io
 import os
 from pathlib import Path
 
@@ -21,8 +22,10 @@ logger = get_logger(__name__)
 
 _TOKEN_ENV = "BLOB_READ_WRITE_TOKEN"
 _UPLOAD_PREFIX = "downloads"
+_NOTES_PREFIX = "notes"
 _PUBLIC_ACCESS = "public"
 _MP4_CONTENT_TYPE = "video/mp4"
+_PDF_CONTENT_TYPE = "application/pdf"
 
 
 def _ensure_token_in_environment() -> None:
@@ -51,4 +54,19 @@ def upload_mp4(path: Path) -> str:
             add_random_suffix=True,
         )
     logger.info("Uploaded video download to blob storage", path=str(path))
+    return result.url
+
+
+def upload_pdf(document: bytes, *, name: str = "lecture-notes.pdf") -> str:
+    """Upload a generated lecture-notes PDF and return its public URL."""
+    _ensure_token_in_environment()
+    result = blob.put_blob(
+        f"{_NOTES_PREFIX}/{name}",
+        io.BytesIO(document),
+        access=_PUBLIC_ACCESS,
+        content_length=len(document),
+        content_type=_PDF_CONTENT_TYPE,
+        add_random_suffix=True,
+    )
+    logger.info("Uploaded lecture notes to blob storage", name=name)
     return result.url

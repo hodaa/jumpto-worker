@@ -184,6 +184,8 @@ def main(out_path: str | None = None) -> int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export YouTube cookies from Chromium.")
-    parser.add_argument("--out", default="/etc/jumpto/fresh-cookies.txt", help="Netscape cookiejar output path")
+    parser.add_argument(
+        "--out", default="/etc/jumpto/fresh-cookies.txt", help="Netscape cookiejar output path"
+    )
     args = parser.parse_args()
     sys.exit(main(args.out))

@@ -31,6 +31,41 @@ class DownloadData:
 
 
 @dataclass(frozen=True)
+class NoteBlock:
+    """One rendered block of a lecture-notes document."""
+
+    kind: str
+    text: str = ""
+    latex: str = ""
+    evidence: str = ""
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class NotesLineData:
+    """One timestamped transcript line sent to the notes worker."""
+
+    seconds: float
+    text: str
+
+
+@dataclass(frozen=True)
+class NotesData:
+    """Data for one lecture-notes request as returned by the backend."""
+
+    note_id: str
+    video_id: str
+    youtube_video_id: str
+    youtube_url: str
+    title: str
+    status: str
+    duration_seconds: int | None = None
+    language: str | None = None
+    is_rtl: bool = False
+    transcript_lines: list[NotesLineData] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class TranscriptWordData:
     """A single word with timing information for storage."""
 

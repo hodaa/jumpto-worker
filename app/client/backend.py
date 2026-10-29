@@ -155,6 +155,30 @@ class BackendClient:
             json_body={"error": error},
         )
 
+    async def get_video_notes(self, note_id: str) -> dict[str, Any]:
+        """Fetch one lecture-notes request's data for production."""
+        return await self._request("GET", f"/internal/notes/{note_id}")
+
+    async def advance_notes(self, note_id: str) -> None:
+        """Mark a lecture-notes request as processing."""
+        await self._request("POST", f"/internal/notes/{note_id}/advance")
+
+    async def mark_notes_ready(self, note_id: str, blob_url: str) -> None:
+        """Report the uploaded lecture-notes PDF URL."""
+        await self._request(
+            "POST",
+            f"/internal/notes/{note_id}/ready",
+            json_body={"blob_url": blob_url},
+        )
+
+    async def mark_notes_failed(self, note_id: str, error: str) -> None:
+        """Mark a lecture-notes request as failed with a user-safe message."""
+        await self._request(
+            "POST",
+            f"/internal/notes/{note_id}/failed",
+            json_body={"error": error},
+        )
+
     async def store_video_formats(self, youtube_video_id: str, heights: list[int]) -> None:
         """Cache the probed H.264 quality ladder for a video."""
         await self._request(

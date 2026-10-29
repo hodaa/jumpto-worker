@@ -70,6 +70,50 @@ async def test_advance_job_sends_post(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_video_notes_returns_payload(monkeypatch) -> None:
+    response = _json_response(
+        200,
+        {
+            "note_id": "note-1",
+            "video_id": "video-1",
+            "youtube_video_id": "abcde12345",
+            "youtube_url": "https://www.youtube.com/watch?v=abcde12345",
+            "title": "Lecture",
+            "status": "pending",
+            "transcript_lines": [],
+        },
+    )
+    client_context = _client_context(response)
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+
+    payload = await BackendClient(_BASE, _API_KEY).get_video_notes("note-1")
+
+    assert payload["note_id"] == "note-1"
+    assert client_context.request.await_args.args[1].endswith("/internal/notes/note-1")
+
+
+@pytest.mark.asyncio
+async def test_notes_callbacks_send_expected_bodies(monkeypatch) -> None:
+    response = _json_response(200, {"status": "processing"})
+    client_context = _client_context(response)
+    monkeypatch.setattr("app.client.backend.httpx.AsyncClient", lambda **kw: client_context)
+    client = BackendClient(_BASE, _API_KEY)
+
+    await client.advance_notes("note-1")
+    await client.mark_notes_ready("note-1", "https://blob/notes.pdf")
+    await client.mark_notes_failed("note-1", "failed")
+
+    urls = [call.args[1] for call in client_context.request.await_args_list]
+    assert [url.removeprefix(_BASE) for url in urls] == [
+        "/internal/notes/note-1/advance",
+        "/internal/notes/note-1/ready",
+        "/internal/notes/note-1/failed",
+    ]
+    bodies = [call.kwargs["json"] for call in client_context.request.await_args_list[1:]]
+    assert bodies == [{"blob_url": "https://blob/notes.pdf"}, {"error": "failed"}]
+
+
+@pytest.mark.asyncio
 async def test_store_transcript_sends_words(monkeypatch) -> None:
     response = _json_response(200, {"status": "pending"})
     client_context = _client_context(response)

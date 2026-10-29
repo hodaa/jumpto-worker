@@ -358,6 +358,25 @@ class TestDriveDownload:
         assert cuts[0][5:7] == ["-t", "45"]
         assert "-c" in cuts[0] and "copy" in cuts[0]
 
+    def test_section_from_an_mp4_input_gets_its_own_output_path(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        media = tmp_path / "video.mp4"
+        media.write_bytes(b"data")
+        cuts: list[list[str]] = []
+        monkeypatch.setattr(drive_module, "download_media", lambda file_id, directory: media)
+        monkeypatch.setattr(
+            drive_module,
+            "_run_ffmpeg",
+            lambda args, failure_message: (cuts.append(args), Path(args[-1]).write_bytes(b"x")),
+        )
+
+        produced = DriveSource().download(DRIVE_FILE_URL, tmp_path, start_seconds=5)
+
+        assert produced == tmp_path / "video-section.mp4"
+        assert produced != media
+        assert cuts[0][-1] == str(produced)
+
     def test_open_section_runs_to_the_end_of_the_file(self, monkeypatch, tmp_path: Path) -> None:
         media = tmp_path / "movie.mkv"
         media.write_bytes(b"data")

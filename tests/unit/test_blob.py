@@ -7,7 +7,7 @@ import pytest
 
 from app.core.config import Settings
 from app.integrations import blob as blob_module
-from app.integrations.blob import upload_mp4
+from app.integrations.blob import upload_mp4, upload_pdf
 
 _TOKEN_ENV = "BLOB_READ_WRITE_TOKEN"
 
@@ -75,6 +75,24 @@ class TestUploadMp4:
         upload_mp4(_write_video(tmp_path))
 
         assert blob_module.os.environ[_TOKEN_ENV] == "tok-env"
+
+
+class TestUploadPdf:
+    """upload_pdf sends the generated document under the notes prefix."""
+
+    def test_uploads_pdf_bytes(self, monkeypatch) -> None:
+        monkeypatch.delenv(_TOKEN_ENV, raising=False)
+        monkeypatch.setattr(blob_module, "get_settings", lambda: _settings_with_token(""))
+        calls = _install_fake_put(monkeypatch)
+
+        url = upload_pdf(b"%PDF-notes", name="note-1.pdf")
+
+        assert url == "https://blob.example/downloads/video.mp4"
+        call = calls[0]
+        assert call["pathname"] == "notes/note-1.pdf"
+        assert call["content"] == b"%PDF-notes"
+        assert call["content_type"] == "application/pdf"
+        assert call["access"] == "public"
 
 
 def _write_video(tmp_path: Path) -> Path:

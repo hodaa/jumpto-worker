@@ -49,6 +49,7 @@ _DEFAULT_TITLE = "Google Drive video"
 _AUDIO_FILENAME = "audio.m4a"
 _AUDIO_BITRATE = "128k"
 _SECTION_SUFFIX = ".mp4"
+_SECTION_LABEL = "-section"
 _MIN_SECTION_SECONDS = 1
 
 _FFMPEG = "ffmpeg"
@@ -346,8 +347,14 @@ def _response_filename(response: httpx.Response) -> str:
 def _cut_section(
     media_path: Path, directory: Path, start_seconds: int, end_seconds: int | None
 ) -> Path:
-    """Cut one section out of a fetched file with ffmpeg, stream-copying."""
+    """Cut one section out of a fetched file with ffmpeg, stream-copying.
+
+    The output must never be the input path: ffmpeg refuses to write over its
+    own source, and an uploaded ``.mp4`` already has the section suffix.
+    """
     output = directory / f"{media_path.stem}{_SECTION_SUFFIX}"
+    if output == media_path:
+        output = directory / f"{media_path.stem}{_SECTION_LABEL}{_SECTION_SUFFIX}"
     args = ["-y", "-ss", str(start_seconds), "-i", str(media_path)]
     if end_seconds is not None:
         end = max(end_seconds - start_seconds, _MIN_SECTION_SECONDS)

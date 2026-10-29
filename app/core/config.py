@@ -148,6 +148,30 @@ class Settings(BaseSettings):
         description="Google Drive API base URL (GOOGLE_DRIVE_API_URL env var)",
     )
 
+    # Lecture notes (transcript cleanup)
+    openai_api_key: str = Field(
+        default="",
+        description="OpenAI API key for lecture-notes cleanup (OPENAI_API_KEY env var)",
+    )
+    openai_api_url: str = Field(
+        default="https://api.openai.com/v1",
+        description="OpenAI API base URL (OPENAI_API_URL env var)",
+    )
+    openai_model: str = Field(
+        default="gpt-4o-mini",
+        description="OpenAI model used for transcript cleanup (OPENAI_MODEL)",
+    )
+    notes_chunk_seconds: int = Field(
+        default=600,
+        ge=60,
+        description="Transcript window cleaned per AI call (NOTES_CHUNK_SECONDS)",
+    )
+    notes_timeout_seconds: int = Field(
+        default=1800,
+        ge=60,
+        description="Maximum seconds a lecture-notes task may run (NOTES_TIMEOUT_SECONDS)",
+    )
+
     # Deepgram
     deepgram_api_key: str = Field(
         default="",
