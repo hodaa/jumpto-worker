@@ -179,6 +179,30 @@ class BackendClient:
             json_body={"error": error},
         )
 
+    async def get_video_summary(self, summary_id: str) -> dict[str, Any]:
+        """Fetch one original-footage summary request's data for production."""
+        return await self._request("GET", f"/internal/summaries/{summary_id}")
+
+    async def advance_summary(self, summary_id: str) -> None:
+        """Mark an original-footage summary as processing."""
+        await self._request("POST", f"/internal/summaries/{summary_id}/advance")
+
+    async def mark_summary_ready(self, summary_id: str, blob_url: str) -> None:
+        """Report the uploaded summary MP4 URL."""
+        await self._request(
+            "POST",
+            f"/internal/summaries/{summary_id}/ready",
+            json_body={"blob_url": blob_url},
+        )
+
+    async def mark_summary_failed(self, summary_id: str, error: str) -> None:
+        """Mark an original-footage summary as failed with a user-safe message."""
+        await self._request(
+            "POST",
+            f"/internal/summaries/{summary_id}/failed",
+            json_body={"error": error},
+        )
+
     async def store_video_formats(self, youtube_video_id: str, heights: list[int]) -> None:
         """Cache the probed H.264 quality ladder for a video."""
         await self._request(

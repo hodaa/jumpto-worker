@@ -172,6 +172,48 @@ class Settings(BaseSettings):
         description="Maximum seconds a lecture-notes task may run (NOTES_TIMEOUT_SECONDS)",
     )
 
+    # Original-footage video summaries
+    summary_target_ratio: float = Field(
+        default=0.25,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Fraction of the source duration a summary targets when the backend "
+            "does not send target_seconds (SUMMARY_TARGET_RATIO)"
+        ),
+    )
+    summary_min_seconds: int = Field(
+        default=0,
+        ge=0,
+        description="Optional lower bound for a summary's target duration (SUMMARY_MIN_SECONDS)",
+    )
+    summary_max_seconds: int = Field(
+        default=600,
+        ge=30,
+        description="Upper bound for a summary's target duration (SUMMARY_MAX_SECONDS)",
+    )
+    summary_clip_seconds: int = Field(
+        default=75,
+        ge=15,
+        description="Preferred transcript segment length in seconds (SUMMARY_CLIP_SECONDS)",
+    )
+    summary_min_clip_seconds: int = Field(
+        default=20,
+        ge=5,
+        description="Segments shorter than this are merged (SUMMARY_MIN_CLIP_SECONDS)",
+    )
+    summary_pad_seconds: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=2.0,
+        description="Seconds of lead-in/lead-out added around every cut (SUMMARY_PAD_SECONDS)",
+    )
+    summary_height: int = Field(
+        default=720,
+        ge=144,
+        description="Maximum source video height downloaded for cutting (SUMMARY_HEIGHT)",
+    )
+
     # Deepgram
     deepgram_api_key: str = Field(
         default="",

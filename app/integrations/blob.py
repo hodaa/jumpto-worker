@@ -23,6 +23,7 @@ logger = get_logger(__name__)
 _TOKEN_ENV = "BLOB_READ_WRITE_TOKEN"
 _UPLOAD_PREFIX = "downloads"
 _NOTES_PREFIX = "notes"
+_SUMMARIES_PREFIX = "summaries"
 _PUBLIC_ACCESS = "public"
 _MP4_CONTENT_TYPE = "video/mp4"
 _PDF_CONTENT_TYPE = "application/pdf"
@@ -43,17 +44,27 @@ def upload_mp4(path: Path) -> str:
     suffix keeps two downloads of the same name from overwriting each other's
     blobs.
     """
+    return _upload_mp4(path, _UPLOAD_PREFIX, "video download")
+
+
+def upload_summary_mp4(path: Path) -> str:
+    """Upload an original-footage summary MP4 and return its public URL."""
+    return _upload_mp4(path, _SUMMARIES_PREFIX, "video summary")
+
+
+def _upload_mp4(path: Path, prefix: str, label: str) -> str:
+    """Stream one MP4 under ``prefix`` and return its public URL."""
     _ensure_token_in_environment()
     with path.open("rb") as body:
         result = blob.put_blob(
-            f"{_UPLOAD_PREFIX}/{path.name}",
+            f"{prefix}/{path.name}",
             body,
             access=_PUBLIC_ACCESS,
             content_length=path.stat().st_size,
             content_type=_MP4_CONTENT_TYPE,
             add_random_suffix=True,
         )
-    logger.info("Uploaded video download to blob storage", path=str(path))
+    logger.info("Uploaded MP4 to blob storage", label=label, path=str(path))
     return result.url
 
 

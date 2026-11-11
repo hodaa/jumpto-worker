@@ -7,7 +7,7 @@ import pytest
 
 from app.core.config import Settings
 from app.integrations import blob as blob_module
-from app.integrations.blob import upload_mp4, upload_pdf
+from app.integrations.blob import upload_mp4, upload_pdf, upload_summary_mp4
 
 _TOKEN_ENV = "BLOB_READ_WRITE_TOKEN"
 
@@ -75,6 +75,25 @@ class TestUploadMp4:
         upload_mp4(_write_video(tmp_path))
 
         assert blob_module.os.environ[_TOKEN_ENV] == "tok-env"
+
+
+class TestUploadSummaryMp4:
+    """upload_summary_mp4 stores summaries under their own prefix."""
+
+    def test_uploads_under_the_summaries_prefix(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv(_TOKEN_ENV, raising=False)
+        monkeypatch.setattr(blob_module, "get_settings", lambda: _settings_with_token(""))
+        calls = _install_fake_put(monkeypatch)
+        path = _write_video(tmp_path)
+
+        url = upload_summary_mp4(path)
+
+        assert url == "https://blob.example/downloads/video.mp4"
+        call = calls[0]
+        assert call["pathname"] == "summaries/video.mp4"
+        assert call["content"] == b"video-bytes"
+        assert call["content_type"] == "video/mp4"
+        assert call["access"] == "public"
 
 
 class TestUploadPdf:

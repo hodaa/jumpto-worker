@@ -4,6 +4,7 @@ from app.tasks.celery_app import celery_app
 from app.tasks.downloads import download_video
 from app.tasks.formats import probe_video_formats
 from app.tasks.notes import generate_lecture_notes
+from app.tasks.summaries import generate_video_summary
 from app.tasks.transcription import download_and_transcribe, run_pipeline
 
 __all__ = [
@@ -11,6 +12,7 @@ __all__ = [
     "download_and_transcribe",
     "download_video",
     "generate_lecture_notes",
+    "generate_video_summary",
     "probe_video_formats",
     "run_pipeline",
 ]
